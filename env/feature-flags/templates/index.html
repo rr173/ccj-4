@@ -102,8 +102,24 @@
       <div class="row">
         <input id="checkIdentity" type="text" placeholder="身份 identity" style="max-width:240px">
         <button onclick="checkIdentity()">查询当前开关</button>
+        <button onclick="checkBundle()">查询整包</button>
       </div>
       <div id="checkResult" class="check-result"></div>
+      <div id="bundleResult" class="check-result"></div>
+      <div class="row" style="margin-top:8px">
+        <input id="bundleVersion" type="text" placeholder="手中的整包版本" style="max-width:240px">
+        <button onclick="validateBundle()">校验版本是否还有效</button>
+      </div>
+      <div id="bundleValid" class="check-result"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h2>整包失效记录 <span class="muted" style="font-weight:normal">谁改了什么、让哪些人的整包过期了</span>
+        <button style="float:right" onclick="loadInvalidations()">刷新</button></h2>
+      <table>
+        <thead><tr><th>时间</th><th>操作人</th><th>变更</th><th>整包失效的身份</th></tr></thead>
+        <tbody id="invBody"></tbody>
+      </table>
     </div>
 
     <div class="card">
@@ -153,7 +169,7 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
-async function loadAll() { await loadFlags(); await loadGroups(); await loadAudit(); }
+async function loadAll() { await loadFlags(); await loadGroups(); await loadAudit(); await loadInvalidations(); }
 
 async function loadFlags() {
   try {
@@ -311,6 +327,69 @@ async function checkIdentity() {
   $('checkResult').innerHTML = r.error ? esc(r.error)
     : `结果：<b style="color:${r.enabled ? 'var(--ok)' : 'var(--danger)'}">${r.enabled ? '开' : '关'}</b>
        <span class="muted">（由「${layerNames[r.reason] || r.reason}」层决定）</span>`;
+}
+
+// ---------------------------------------------------------------- 整包
+
+async function fetchBundle(id, version) {
+  let url = `/api/bundle?identity=${encodeURIComponent(id)}`;
+  if (version) url += `&version=${encodeURIComponent(version)}`;
+  return fetch(url).then(r => r.json());
+}
+
+function renderBundle(r) {
+  if (r.error) return esc(r.error);
+  const rows = Object.entries(r.flags).map(([name, v]) =>
+    `<div>${esc(name)}：<b style="color:${v.enabled ? 'var(--ok)' : 'var(--danger)'}">` +
+    `${v.enabled ? '开' : '关'}</b> <span class="muted">(${esc(v.reason)})</span></div>`).join('');
+  return `<div>整包版本：<b>${esc(r.version)}</b></div>` +
+         (rows || '<div class="muted">（还没有开关）</div>');
+}
+
+async function checkBundle() {
+  const id = $('checkIdentity').value.trim();
+  if (!id) return toast('请填写身份', true);
+  const r = await fetchBundle(id);
+  if (!r.error) $('bundleVersion').value = r.version;
+  $('bundleResult').innerHTML = renderBundle(r);
+  $('bundleValid').innerHTML = '';
+}
+
+async function validateBundle() {
+  const id = $('checkIdentity').value.trim();
+  const v = $('bundleVersion').value.trim();
+  if (!id || !v) return toast('请填写身份与手中的整包版本', true);
+  const r = await fetchBundle(id, v);
+  if (r.error) { $('bundleValid').innerHTML = esc(r.error); return; }
+  $('bundleValid').innerHTML = r.valid
+    ? `<span style="color:var(--ok)">✔ 版本 ${esc(v)} 仍然有效，包内容可继续用</span>`
+    : `<span style="color:var(--danger)">✘ 版本 ${esc(v)} 已过期</span>` +
+      `，当前版本：<b>${esc(r.version)}</b> <span class="muted">（结果区已按新规则重算）</span>`;
+  if (!r.valid) $('bundleResult').innerHTML = renderBundle(r);
+}
+
+async function loadInvalidations() {
+  try {
+    const rows = await api('/api/bundles/invalidations?limit=200');
+    const grouped = [];
+    const byKey = new Map();
+    for (const r of rows) {
+      const key = r.actor + '|' + r.change + '|' + r.created_at;
+      if (!byKey.has(key)) {
+        const g = { ...r, identities: [] };
+        byKey.set(key, g);
+        grouped.push(g);
+      }
+      byKey.get(key).identities.push(r.identity);
+    }
+    $('invBody').innerHTML = grouped.map(g => `<tr>
+      <td>${new Date(g.created_at * 1000).toLocaleString()}</td>
+      <td>${esc(g.actor)}</td><td>${esc(g.change)}</td>
+      <td>${g.identities.map(esc).join('、')}</td></tr>`).join('')
+      || '<tr><td colspan="4" class="muted">暂无记录</td></tr>';
+  } catch (e) {
+    $('invBody').innerHTML = `<tr><td colspan="4" class="muted">加载失败：${esc(e.message)}</td></tr>`;
+  }
 }
 
 // ---------------------------------------------------------------- 互斥组

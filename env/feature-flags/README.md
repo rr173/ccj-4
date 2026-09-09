@@ -37,6 +37,34 @@
 > 注意：对组内开关的 `check` 查询可能在首次判开时写入落定记录（GET 有写副作用），
 > 这是"同一人结果恒定"的实现基础。
 
+## 整包（bundle）
+
+调用方可以一次只带身份，把这个身份此刻**所有开关**的开/关结果连同**整包版本**一次拿走：
+
+```bash
+GET /api/bundle?identity=<用户身份>
+# => {"identity":"u123","version":"9f2c…","flags":{"new-checkout":{"enabled":true,"reason":"rollout"}, …}}
+```
+
+- **版本恒定**：版本是对「会影响此身份求值的全部输入」（所有开关的求值字段、
+  此人的单人强制、互斥组成员关系、此人的组内落定记录）的确定性摘要。
+  配置没变时，同一人多次来拿，每个开关的结果和版本都不变。
+- **变了必新版本**：管理端改了任何会影响此人的一层（开关配置、对此人的强制、
+  互斥组变动），他再来拿一定是新版本、按改完后的规则重算。
+  与他无关的改动（如给别人的单人强制、改描述）不影响他的版本。
+- **过期校验**：拿着旧版本来问，会明确告知是否已过期，并附带按当前规则重算的新包：
+
+```bash
+GET /api/bundle?identity=<用户身份>&version=<手中的版本>
+# => {…, "valid": false}   # valid=false 即已过期，响应里是新版本与新结果
+```
+
+- **失效可见**：已发出的整包落库（`bundles` 表）。管理端每次变更配置后，
+  系统重算每个已发整包的版本，版本变了的身份记入 `bundle_invalidations`，
+  管理端可查到「谁、何时、改了什么、让哪些人的整包失效了」。
+
+> 与单开关 `check` 一样，整包查询对组内开关可能写入落定记录（GET 有写副作用）。
+
 ## 快速开始
 
 ```bash
@@ -61,6 +89,10 @@ GET /api/flags/<name>/check?identity=<用户身份>
 # => {"flag":"new-checkout","identity":"u123","enabled":true,"reason":"rollout"}
 #    reason ∈ kill_switch | override | group | rollout | default，表示结果由哪一层决定
 #    identity 需 URL 编码；允许包含斜杠、空格、引号等任意字符
+
+GET /api/bundle?identity=<用户身份>[&version=<手中的整包版本>]
+# => {"identity":"u123","version":"9f2c…","flags":{"new-checkout":{"enabled":true,"reason":"rollout"}, …}}
+#    带 version 时响应多一个 valid 字段：false 即该版本已过期，响应里是新版本与新结果
 ```
 
 ### 管理端（需请求头 `X-Admin-Token`，可选 `X-Actor` 记录操作人）
@@ -83,6 +115,8 @@ GET /api/flags/<name>/check?identity=<用户身份>
 > identity 一律放在 JSON body / 查询参数里，不进 URL 路径，
 > 因此含 `/`、空格、`"`、`'` 等字符的身份都能正常设置、查询、移除。
 | GET | `/api/audit?limit=100` | 最近操作记录（谁、何时、改了哪一层） |
+| GET | `/api/bundles` | 已发出的整包（身份、版本、是否已过期 stale） |
+| GET | `/api/bundles/invalidations?limit=100` | 整包失效记录：谁改了什么、让哪些身份的整包从哪个版本变成哪个版本 |
 
 示例：
 

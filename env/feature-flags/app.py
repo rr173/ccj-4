@@ -15,9 +15,17 @@
 
 放量分桶：sha256("{flag_name}:{identity}") % 100，同一身份对同一开关
 永远落在同一侧，与进程、机器、重启无关。
+
+整包（bundle）：调用方只带身份，一次拿走所有开关的开/关结果与整包版本。
+版本是对「会影响此身份求值的全部输入」的确定性摘要：配置不变时同一身份
+反复来拿，结果与版本都不变；管理端改动任何会影响此身份的一层后，版本必变。
+带 version 参数来问可校验手中的包是否过期。已发出的整包落库，管理端每次
+变更后重算各整包版本，版本变了的身份记入 bundle_invalidations，
+管理端可看到「谁改了什么、让哪些人的整包失效了」。
 """
 
 import hashlib
+import json
 import os
 import sqlite3
 import time
@@ -80,6 +88,23 @@ CREATE TABLE IF NOT EXISTS group_assignments (
     flag_id    INTEGER NOT NULL REFERENCES flags(id) ON DELETE CASCADE,
     created_at REAL NOT NULL,
     PRIMARY KEY (group_id, identity)
+);
+-- 已发出的整包：身份 -> 最近一次整包的版本与结果
+CREATE TABLE IF NOT EXISTS bundles (
+    identity   TEXT PRIMARY KEY,
+    version    TEXT NOT NULL,
+    results    TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+-- 整包失效记录：哪次变更（谁、改了什么）让哪个身份的整包过期了
+CREATE TABLE IF NOT EXISTS bundle_invalidations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor       TEXT NOT NULL,
+    change      TEXT NOT NULL,
+    identity    TEXT NOT NULL,
+    old_version TEXT NOT NULL,
+    new_version TEXT NOT NULL,
+    created_at  REAL NOT NULL
 );
 """
 
@@ -195,6 +220,78 @@ def evaluate(db, flag, identity):
     return winner["flag_id"] == flag["id"], "group"
 
 
+# ---------------------------------------------------------------- bundle
+
+def bundle_version(db, identity):
+    """整包版本：对「会影响此身份求值结果的全部输入」做确定性摘要。
+
+    覆盖：所有开关的求值相关字段、此身份的单人强制、互斥组成员关系、
+    此身份在组内的落定记录。任一变化都会改变版本；与求值无关的字段
+    （如描述、时间戳）不影响版本；只与别人相关的改动（如给他人的
+    单人强制）也不影响此身份的版本。
+    """
+    flags = db.execute(
+        "SELECT name, default_enabled, rollout_percent, kill_switch"
+        " FROM flags ORDER BY name"
+    ).fetchall()
+    overrides = db.execute(
+        "SELECT f.name, o.enabled FROM overrides o"
+        " JOIN flags f ON f.id = o.flag_id WHERE o.identity=? ORDER BY f.name",
+        (identity,),
+    ).fetchall()
+    members = db.execute(
+        "SELECT g.name AS g, f.name AS f FROM group_members m"
+        " JOIN mutex_groups g ON g.id = m.group_id"
+        " JOIN flags f ON f.id = m.flag_id ORDER BY g.name, f.name"
+    ).fetchall()
+    assignments = db.execute(
+        "SELECT g.name AS g, f.name AS f FROM group_assignments a"
+        " JOIN mutex_groups g ON g.id = a.group_id"
+        " JOIN flags f ON f.id = a.flag_id WHERE a.identity=? ORDER BY g.name",
+        (identity,),
+    ).fetchall()
+    payload = {
+        "identity": identity,
+        "flags": [[r["name"], bool(r["default_enabled"]), r["rollout_percent"],
+                   bool(r["kill_switch"])] for r in flags],
+        "overrides": [[r["name"], bool(r["enabled"])] for r in overrides],
+        "groups": [[r["g"], r["f"]] for r in members],
+        "assignments": [[r["g"], r["f"]] for r in assignments],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_bundle(db, identity):
+    """求出此身份所有开关的结果与整包版本。先求值（可能写入组落定记录），
+    再取版本，保证版本覆盖了本次求值产生的落定记录，之后重拿版本不变。"""
+    flags = db.execute("SELECT * FROM flags ORDER BY name").fetchall()
+    results = {}
+    for flag in flags:
+        enabled, reason = evaluate(db, flag, identity)
+        results[flag["name"]] = {"enabled": enabled, "reason": reason}
+    return results, bundle_version(db, identity)
+
+
+def record_invalidations(db, actor_name, change):
+    """配置变更后调用：重算每个已发整包的版本，版本变了的身份记一条
+    失效记录（谁改的、哪次变更、让谁的整包从哪个版本变成哪个版本）。"""
+    rows = db.execute("SELECT identity, version FROM bundles").fetchall()
+    if not rows:
+        return
+    now = time.time()
+    for r in rows:
+        current = bundle_version(db, r["identity"])
+        if current != r["version"]:
+            db.execute(
+                "INSERT INTO bundle_invalidations"
+                " (actor, change, identity, old_version, new_version, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (actor_name, change, r["identity"], r["version"], current, now),
+            )
+    db.commit()
+
+
 # ---------------------------------------------------------------- admin auth
 
 def require_admin(fn):
@@ -234,6 +331,33 @@ def check(name):
         "enabled": enabled,
         "reason": reason,
     })
+
+
+@app.get("/api/bundle")
+def bundle():
+    """调用方整包接口：只带身份，一次拿走所有开关的开/关与整包版本。
+
+    配置不变时，同一身份多次来拿，每个开关的结果与版本都不变。
+    带上 version 参数可校验手中的包是否仍然有效：valid=false 即已过期，
+    响应里同时附带按当前规则重算的新版本与新结果。
+    """
+    identity = request.args.get("identity")
+    if not identity:
+        return jsonify({"error": "identity is required"}), 400
+    db = get_db()
+    results, version = compute_bundle(db, identity)
+    db.execute(
+        "INSERT INTO bundles (identity, version, results, updated_at) VALUES (?,?,?,?)"
+        " ON CONFLICT(identity) DO UPDATE SET version=excluded.version,"
+        " results=excluded.results, updated_at=excluded.updated_at",
+        (identity, version, json.dumps(results, ensure_ascii=False), time.time()),
+    )
+    db.commit()
+    body = {"identity": identity, "version": version, "flags": results}
+    held = request.args.get("version")
+    if held is not None:
+        body["valid"] = held == version
+    return jsonify(body)
 
 
 @app.get("/healthz")
@@ -288,6 +412,7 @@ def create_flag():
     audit(actor(), name, "default", "create_flag",
           f"default_enabled={bool(default_enabled)}")
     db.commit()
+    record_invalidations(db, actor(), f"create_flag {name}")
     return jsonify({"ok": True}), 201
 
 
@@ -331,6 +456,10 @@ def update_flag(name):
     for layer, action, detail in changes:
         audit(actor(), name, layer, action, detail)
     db.commit()
+    desc = f"update_flag {name}"
+    if changes:
+        desc += ": " + ", ".join(d for _, _, d in changes)
+    record_invalidations(db, actor(), desc)
     return jsonify({"ok": True, "changed": len(changes)})
 
 
@@ -343,6 +472,7 @@ def delete_flag(name):
         return jsonify({"error": "flag not found"}), 404
     audit(actor(), name, "default", "delete_flag")
     db.commit()
+    record_invalidations(db, actor(), f"delete_flag {name}")
     return jsonify({"ok": True})
 
 
@@ -388,6 +518,8 @@ def put_override(name):
     audit(actor(), name, "override", "set_override",
           f"identity={identity} enabled={bool(enabled)}")
     db.commit()
+    record_invalidations(db, actor(),
+                         f"set_override {name} identity={identity}")
     return jsonify({"ok": True})
 
 
@@ -407,6 +539,8 @@ def delete_override(name):
                (flag["id"], identity))
     audit(actor(), name, "override", "remove_override", f"identity={identity}")
     db.commit()
+    record_invalidations(db, actor(),
+                         f"remove_override {name} identity={identity}")
     return jsonify({"ok": True})
 
 
@@ -460,6 +594,7 @@ def create_group():
     )
     audit(actor(), name, "group", "create_group")
     db.commit()
+    record_invalidations(db, actor(), f"create_group {name}")
     return jsonify({"ok": True}), 201
 
 
@@ -473,6 +608,7 @@ def delete_group(name):
     # 成员关系与落定记录随组级联删除，组内开关恢复按原规则求值
     audit(actor(), name, "group", "delete_group")
     db.commit()
+    record_invalidations(db, actor(), f"delete_group {name}")
     return jsonify({"ok": True})
 
 
@@ -502,6 +638,7 @@ def add_flag_to_group(name):
     touch_group(db, group["id"])
     audit(actor(), name, "group", "add_flag", f"flag={flag_name}")
     db.commit()
+    record_invalidations(db, actor(), f"add_flag_to_group {name} flag={flag_name}")
     return jsonify({"ok": True})
 
 
@@ -529,6 +666,7 @@ def remove_flag_from_group(name):
     touch_group(db, group["id"])
     audit(actor(), name, "group", "remove_flag", f"flag={flag_name}")
     db.commit()
+    record_invalidations(db, actor(), f"remove_flag_from_group {name} flag={flag_name}")
     return jsonify({"ok": True})
 
 
@@ -539,6 +677,35 @@ def list_audit():
     rows = get_db().execute(
         "SELECT actor, flag_name, layer, action, detail, created_at"
         " FROM audit_log ORDER BY id DESC LIMIT ?", (limit,),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.get("/api/bundles")
+@require_admin
+def list_bundles():
+    """管理端：已发出的整包清单，stale=true 表示配置已变、此人还没来拿新包。"""
+    db = get_db()
+    rows = db.execute(
+        "SELECT identity, version, updated_at FROM bundles"
+        " ORDER BY updated_at DESC LIMIT 500"
+    ).fetchall()
+    return jsonify([
+        {"identity": r["identity"], "version": r["version"],
+         "stale": bundle_version(db, r["identity"]) != r["version"],
+         "updated_at": r["updated_at"]}
+        for r in rows
+    ])
+
+
+@app.get("/api/bundles/invalidations")
+@require_admin
+def list_bundle_invalidations():
+    """管理端：整包失效记录——谁改了什么、让哪些人的整包过期了。"""
+    limit = min(int(request.args.get("limit", 100)), 500)
+    rows = get_db().execute(
+        "SELECT actor, change, identity, old_version, new_version, created_at"
+        " FROM bundle_invalidations ORDER BY id DESC LIMIT ?", (limit,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
