@@ -17,11 +17,13 @@
 永远落在同一侧，与进程、机器、重启无关。
 
 整包（bundle）：调用方只带身份，一次拿走所有开关的开/关结果与整包版本。
-版本是对「会影响此身份求值的全部输入」的确定性摘要：配置不变时同一身份
-反复来拿，结果与版本都不变；管理端改动任何会影响此身份的一层后，版本必变。
-带 version 参数来问可校验手中的包是否过期。已发出的整包落库，管理端每次
-变更后重算各整包版本，版本变了的身份记入 bundle_invalidations，
-管理端可看到「谁改了什么、让哪些人的整包失效了」。
+版本 = 求值输入摘要（会影响此身份求值的全部输入）+ 单调递增的内容序号：
+配置不变时同一身份反复来拿，结果与版本都不变；管理端改动任何会影响此
+身份的一层后，序号 +1，版本必变；配置改回去摘要虽复原，但序号不回头，
+旧版本永远不会再有效。带 version 参数来问可校验手中的包是否过期。
+已发出的整包落库，管理端每次变更后用与调用方来拿时完全相同的求值重算
+各整包，内容变了的身份记入 bundle_invalidations——记下的新版本与本人
+再来拿时拿到的是同一个。管理端可看到「谁改了什么、让哪些人的整包失效了」。
 """
 
 import hashlib
@@ -91,10 +93,12 @@ CREATE TABLE IF NOT EXISTS group_assignments (
 );
 -- 已发出的整包：身份 -> 最近一次整包的版本与结果
 CREATE TABLE IF NOT EXISTS bundles (
-    identity   TEXT PRIMARY KEY,
-    version    TEXT NOT NULL,
-    results    TEXT NOT NULL,
-    updated_at REAL NOT NULL
+    identity     TEXT PRIMARY KEY,
+    version      TEXT NOT NULL,              -- 最近一次发出的整包版本
+    content_hash TEXT NOT NULL DEFAULT '',   -- 当前求值输入的内容摘要
+    generation   INTEGER NOT NULL DEFAULT 0, -- 内容变化序号，只增不减
+    results      TEXT NOT NULL,
+    updated_at   REAL NOT NULL
 );
 -- 整包失效记录：哪次变更（谁、改了什么）让哪个身份的整包过期了
 CREATE TABLE IF NOT EXISTS bundle_invalidations (
@@ -135,6 +139,12 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    # 老库迁移：bundles 增加 content_hash / generation（旧行下次来拿时按新规则重算）
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(bundles)")}
+    if "content_hash" not in cols:
+        conn.execute("ALTER TABLE bundles ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+    if "generation" not in cols:
+        conn.execute("ALTER TABLE bundles ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -222,13 +232,13 @@ def evaluate(db, flag, identity):
 
 # ---------------------------------------------------------------- bundle
 
-def bundle_version(db, identity):
-    """整包版本：对「会影响此身份求值结果的全部输入」做确定性摘要。
+def bundle_content_hash(db, identity):
+    """求值输入摘要：对「会影响此身份求值结果的全部输入」做确定性摘要。
 
     覆盖：所有开关的求值相关字段、此身份的单人强制、互斥组成员关系、
-    此身份在组内的落定记录。任一变化都会改变版本；与求值无关的字段
-    （如描述、时间戳）不影响版本；只与别人相关的改动（如给他人的
-    单人强制）也不影响此身份的版本。
+    此身份在组内的落定记录。任一变化都会改变摘要；与求值无关的字段
+    （如描述、时间戳）不影响摘要；只与别人相关的改动（如给他人的
+    单人强制）也不影响此身份的摘要。
     """
     flags = db.execute(
         "SELECT name, default_enabled, rollout_percent, kill_switch"
@@ -262,33 +272,61 @@ def bundle_version(db, identity):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+def make_version(content_hash, generation):
+    """整包版本 = 求值输入摘要 + 单调递增的内容序号。
+
+    序号只增不减：配置改回去，摘要会复原，但序号不回头，
+    因此改过一次之后旧版本就永远不会再有效。
+    """
+    return hashlib.sha256(
+        f"{content_hash}:{generation}".encode("utf-8")
+    ).hexdigest()[:16]
+
+
 def compute_bundle(db, identity):
-    """求出此身份所有开关的结果与整包版本。先求值（可能写入组落定记录），
-    再取版本，保证版本覆盖了本次求值产生的落定记录，之后重拿版本不变。"""
+    """求出此身份所有开关的结果与求值输入摘要。先求值（可能写入组落定
+    记录），再取摘要，保证摘要覆盖本次求值产生的落定记录——管理端失效
+    扫描与调用方来拿走同一套求值，记下的版本与本人来拿时拿到的才一致。"""
     flags = db.execute("SELECT * FROM flags ORDER BY name").fetchall()
     results = {}
     for flag in flags:
         enabled, reason = evaluate(db, flag, identity)
         results[flag["name"]] = {"enabled": enabled, "reason": reason}
-    return results, bundle_version(db, identity)
+    return results, bundle_content_hash(db, identity)
 
 
 def record_invalidations(db, actor_name, change):
-    """配置变更后调用：重算每个已发整包的版本，版本变了的身份记一条
-    失效记录（谁改的、哪次变更、让谁的整包从哪个版本变成哪个版本）。"""
-    rows = db.execute("SELECT identity, version FROM bundles").fetchall()
+    """配置变更后调用：用与调用方来拿时完全相同的求值重算每个已发整包。
+
+    求值输入变了的身份：内容序号 +1、记一条失效记录（谁改的、哪次变更、
+    让谁的整包从哪个版本变成哪个版本），并把 bundles 行推进到新摘要与
+    新序号——记下的新版本与本人再来拿时拿到的是同一个。序号只增不减，
+    配置改回去旧版本也不会复活。与求值无关的改动（如描述）不会改变任何
+    人的摘要，自然不会产生记录。
+    """
+    rows = db.execute(
+        "SELECT identity, content_hash, generation FROM bundles"
+    ).fetchall()
     if not rows:
         return
     now = time.time()
     for r in rows:
-        current = bundle_version(db, r["identity"])
-        if current != r["version"]:
-            db.execute(
-                "INSERT INTO bundle_invalidations"
-                " (actor, change, identity, old_version, new_version, created_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (actor_name, change, r["identity"], r["version"], current, now),
-            )
+        _, content_hash = compute_bundle(db, r["identity"])
+        if content_hash == r["content_hash"]:
+            continue
+        new_generation = r["generation"] + 1
+        db.execute(
+            "INSERT INTO bundle_invalidations"
+            " (actor, change, identity, old_version, new_version, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (actor_name, change, r["identity"],
+             make_version(r["content_hash"], r["generation"]),
+             make_version(content_hash, new_generation), now),
+        )
+        db.execute(
+            "UPDATE bundles SET content_hash=?, generation=? WHERE identity=?",
+            (content_hash, new_generation, r["identity"]),
+        )
     db.commit()
 
 
@@ -345,12 +383,29 @@ def bundle():
     if not identity:
         return jsonify({"error": "identity is required"}), 400
     db = get_db()
-    results, version = compute_bundle(db, identity)
+    results, content_hash = compute_bundle(db, identity)
+    row = db.execute(
+        "SELECT content_hash, generation FROM bundles WHERE identity=?",
+        (identity,),
+    ).fetchone()
+    if row is None:
+        generation = 1
+    elif row["content_hash"] == content_hash:
+        generation = row["generation"]
+    else:
+        # 兜底：内容变了但没经过 record_invalidations 推进（不应发生），
+        # 仍保证版本向前、不与任何已发版本重复
+        generation = row["generation"] + 1
+    version = make_version(content_hash, generation)
     db.execute(
-        "INSERT INTO bundles (identity, version, results, updated_at) VALUES (?,?,?,?)"
+        "INSERT INTO bundles"
+        " (identity, version, content_hash, generation, results, updated_at)"
+        " VALUES (?,?,?,?,?,?)"
         " ON CONFLICT(identity) DO UPDATE SET version=excluded.version,"
+        " content_hash=excluded.content_hash, generation=excluded.generation,"
         " results=excluded.results, updated_at=excluded.updated_at",
-        (identity, version, json.dumps(results, ensure_ascii=False), time.time()),
+        (identity, version, content_hash, generation,
+         json.dumps(results, ensure_ascii=False), time.time()),
     )
     db.commit()
     body = {"identity": identity, "version": version, "flags": results}
@@ -687,12 +742,12 @@ def list_bundles():
     """管理端：已发出的整包清单，stale=true 表示配置已变、此人还没来拿新包。"""
     db = get_db()
     rows = db.execute(
-        "SELECT identity, version, updated_at FROM bundles"
+        "SELECT identity, version, content_hash, generation, updated_at FROM bundles"
         " ORDER BY updated_at DESC LIMIT 500"
     ).fetchall()
     return jsonify([
         {"identity": r["identity"], "version": r["version"],
-         "stale": bundle_version(db, r["identity"]) != r["version"],
+         "stale": make_version(r["content_hash"], r["generation"]) != r["version"],
          "updated_at": r["updated_at"]}
         for r in rows
     ])

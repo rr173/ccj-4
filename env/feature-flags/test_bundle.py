@@ -179,5 +179,53 @@ b = bundle("u1")
 check("删开关后版本变化", b["version"] != v1)
 check("删掉的开关不再出现在包里", "epsilon" not in b["flags"])
 
+print("== 12. 管理端记下的新版本 == 本人再来拿拿到的 ==")
+# 构造"来拿时才写落定记录"的场景：组内开关原本默认关，失效扫描时此人
+# 组内还没有落定记录；管理端把开关默认开后，求值才会落定——记下的版本
+# 必须覆盖这次落定，与本人再来拿时拿到的完全一致。
+c.post("/api/flags", headers=H, json={"name": "mx-a"})
+c.post("/api/flags", headers=H, json={"name": "mx-b"})
+c.post("/api/groups", headers=H, json={"name": "mx-g"})
+c.put("/api/groups/mx-g/flags", headers=H, json={"flag": "mx-a"})
+c.put("/api/groups/mx-g/flags", headers=H, json={"flag": "mx-b"})
+v0 = bundle("u9")["version"]
+c.patch("/api/flags/mx-a", headers=H, json={"default_enabled": True})
+inv = [r for r in c.get("/api/bundles/invalidations", headers=H).get_json()
+       if r["identity"] == "u9"]
+check("失效记录里 u9 的旧版本是他手里的", inv[-1]["old_version"] == v0)
+b = bundle("u9")
+check("记下的新版本与再来拿拿到的一致", b["version"] == inv[-1]["new_version"])
+check("u9 的 mx-a 按新规则开", b["flags"]["mx-a"]["enabled"] is True)
+check("再拿版本不变", bundle("u9")["version"] == b["version"])
+
+print("== 13. 改完又改回：旧包不复活 ==")
+r1 = bundle("u9")
+v1 = r1["version"]
+c.patch("/api/flags/mx-a", headers=H, json={"kill_switch": True})
+v2 = bundle("u9")["version"]
+c.patch("/api/flags/mx-a", headers=H, json={"kill_switch": False})
+r3 = bundle("u9")
+v3 = r3["version"]
+check("改走后版本变了", v2 != v1)
+check("改回后是又一个新版本，不回到旧版本", v3 != v1 and v3 != v2)
+check("配置改回后求值结果与当初一致", r3["flags"] == r1["flags"])
+check("旧版本 v1 不再有效", bundle("u9", version=v1)["valid"] is False)
+check("旧版本 v2 也不再有效", bundle("u9", version=v2)["valid"] is False)
+check("当前版本有效", bundle("u9", version=v3)["valid"] is True)
+
+print("== 14. 连续改动：失效记录链与最终来拿一致 ==")
+v_a = bundle("u8")["version"]
+c.patch("/api/flags/alpha", headers=H, json={"rollout_percent": 33})
+c.patch("/api/flags/alpha", headers=H, json={"rollout_percent": 66})
+inv = [r for r in c.get("/api/bundles/invalidations", headers=H).get_json()
+       if r["identity"] == "u8"]
+check("第一次改动从他手里的版本出发", inv[1]["old_version"] == v_a)
+check("两次记录首尾相接", inv[1]["new_version"] == inv[0]["old_version"])
+b = bundle("u8")
+check("最终来拿拿到最后一次记下的新版本", b["version"] == inv[0]["new_version"])
+check("手里最初的版本已失效", bundle("u8", version=v_a)["valid"] is False)
+check("中间版本也已失效",
+      bundle("u8", version=inv[1]["new_version"])["valid"] is False)
+
 print(f"\n{passed} passed, {failed} failed")
 raise SystemExit(1 if failed else 0)
