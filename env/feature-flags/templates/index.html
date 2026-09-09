@@ -199,7 +199,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>③ 比例放量 <span class="prio">命中放量区间的身份为开；同一身份结果恒定</span></h3>
+      <h3>③ 比例放量 <span class="prio">比例 &gt; 0 时此层定论：命中开、未命中关；同一身份结果恒定</span></h3>
       <div class="row">
         <input type="range" min="0" max="100" value="${f.rollout_percent}"
                oninput="$('pctLabel').textContent=this.value+'%'"
@@ -209,7 +209,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>④ 默认值 <span class="prio">以上各层都未决定时兜底</span></h3>
+      <h3>④ 默认值 <span class="prio">仅当放量比例为 0 时兜底</span></h3>
       <label><input type="checkbox" ${f.default_enabled ? 'checked' : ''}
         onchange="setDefault(this.checked)"> 默认开</label>
     </div>`;
@@ -223,9 +223,17 @@ async function loadOverrides() {
   body.innerHTML = list.length ? '' : '<tr><td colspan="3" class="muted">无</td></tr>';
   for (const o of list) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${esc(o.identity)}</td>
-      <td>${o.enabled ? '<span class="badge on">开</span>' : '<span class="badge off">关</span>'}</td>
-      <td><button onclick="removeOverride('${esc(o.identity)}')">移除</button></td>`;
+    const tdId = document.createElement('td');
+    tdId.textContent = o.identity;  // textContent 不做 HTML 解析，任意字符安全
+    const tdState = document.createElement('td');
+    tdState.innerHTML = o.enabled
+      ? '<span class="badge on">开</span>' : '<span class="badge off">关</span>';
+    const tdBtn = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.textContent = '移除';
+    btn.addEventListener('click', () => removeOverride(o.identity));
+    tdBtn.appendChild(btn);
+    tr.append(tdId, tdState, tdBtn);
     body.appendChild(tr);
   }
 }
@@ -259,17 +267,17 @@ const setDefault  = v  => patch({ default_enabled: v });
 const setRollout  = v  => patch({ rollout_percent: parseInt(v, 10) });
 
 async function setOverride(enabled) {
-  const id = $('ovIdentity').value.trim();
+  const id = $('ovIdentity').value;  // 不 trim：首尾空格也是身份的一部分
   if (!id) return toast('请填写身份', true);
-  await api(`/api/flags/${encodeURIComponent(selected)}/overrides/${encodeURIComponent(id)}`,
-            { method: 'PUT', body: JSON.stringify({ enabled }) });
+  await api(`/api/flags/${encodeURIComponent(selected)}/overrides`,
+            { method: 'PUT', body: JSON.stringify({ identity: id, enabled }) });
   $('ovIdentity').value = '';
   toast('已设置'); loadAll();
 }
 
 async function removeOverride(identity) {
-  await api(`/api/flags/${encodeURIComponent(selected)}/overrides/${encodeURIComponent(identity)}`,
-            { method: 'DELETE' });
+  await api(`/api/flags/${encodeURIComponent(selected)}/overrides`,
+            { method: 'DELETE', body: JSON.stringify({ identity }) });
   toast('已移除'); loadAll();
 }
 

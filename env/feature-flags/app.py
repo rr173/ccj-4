@@ -3,8 +3,8 @@
 求值优先级（固定，不可配置）：
     1. 全关（kill switch）        -> 一律关
     2. 单人强制（override）        -> 强制开 / 强制关
-    3. 比例放量（rollout_percent） -> 命中放量区间则开
-    4. 默认值（default_enabled）   -> 以上都未决定时兜底
+    3. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关
+    4. 默认值（default_enabled）   -> 仅当放量比例为 0（未启用放量）时兜底
 
 放量分桶：sha256("{flag_name}:{identity}") % 100，同一身份对同一开关
 永远落在同一侧，与进程、机器、重启无关。
@@ -124,9 +124,9 @@ def evaluate(db, flag, identity):
     if override is not None:
         return bool(override["enabled"]), "override"
 
+    # 放量比例 > 0 时这一层直接定论：命中开、未命中关，不再落到默认值
     if flag["rollout_percent"] > 0:
-        if bucket_of(flag["name"], identity) < flag["rollout_percent"]:
-            return True, "rollout"
+        return bucket_of(flag["name"], identity) < flag["rollout_percent"], "rollout"
 
     return bool(flag["default_enabled"]), "default"
 
@@ -151,8 +151,12 @@ def actor():
 
 @app.get("/api/flags/<name>/check")
 def check(name):
-    """调用方接口：只带身份，得到 开/关。"""
-    identity = request.args.get("identity", "").strip()
+    """调用方接口：只带身份，得到 开/关。
+
+    identity 走查询参数（调用方需做 URL 编码），允许包含斜杠、空格、
+    引号等任意字符；不做 strip，首尾空格也是身份的一部分。
+    """
+    identity = request.args.get("identity")
     if not identity:
         return jsonify({"error": "identity is required"}), 400
     db = get_db()
@@ -288,10 +292,15 @@ def list_overrides(name):
     ])
 
 
-@app.put("/api/flags/<name>/overrides/<identity>")
+@app.put("/api/flags/<name>/overrides")
 @require_admin
-def put_override(name, identity):
-    body = request.get_json(force=True)
+def put_override(name):
+    """设置单人强制。identity 放在 JSON body 里，因此可以包含
+    斜杠、空格、引号等任意字符，不受 URL 路径限制。"""
+    body = request.get_json(force=True, silent=True) or {}
+    identity = body.get("identity")
+    if not isinstance(identity, str) or identity == "":
+        return jsonify({"error": "identity is required (non-empty string)"}), 400
     if "enabled" not in body:
         return jsonify({"error": "enabled is required"}), 400
     db = get_db()
@@ -310,9 +319,14 @@ def put_override(name, identity):
     return jsonify({"ok": True})
 
 
-@app.delete("/api/flags/<name>/overrides/<identity>")
+@app.delete("/api/flags/<name>/overrides")
 @require_admin
-def delete_override(name, identity):
+def delete_override(name):
+    """移除单人强制。identity 放在 JSON body 里。"""
+    body = request.get_json(force=True, silent=True) or {}
+    identity = body.get("identity")
+    if not isinstance(identity, str) or identity == "":
+        return jsonify({"error": "identity is required (non-empty string)"}), 400
     db = get_db()
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:

@@ -10,10 +10,11 @@
 
 - **全关**：打开后所有身份一律为关，覆盖一切。
 - **单人强制**：对指定 identity 强制开/关，覆盖放量与默认值。
-- **比例放量**：`sha256("{flag}:{identity}") % 100 < percent` 则开。
+- **比例放量**：`sha256("{flag}:{identity}") % 100 < percent` 则开，未命中则关。
+  只要比例 > 0，这一层就给出定论，不再落到默认值；比例为 0 表示未启用放量。
   同一身份对同一开关永远落在同一侧，与进程、机器、重启无关；
   调高比例只会**新增**命中者，已命中者不会掉出。
-- **默认值**：以上各层都未决定时兜底。
+- **默认值**：仅当放量比例为 0 时兜底。
 
 ## 快速开始
 
@@ -38,6 +39,7 @@ docker run -d -p 8000:8000 -e ADMIN_TOKEN=你的强随机串 \
 GET /api/flags/<name>/check?identity=<用户身份>
 # => {"flag":"new-checkout","identity":"u123","enabled":true,"reason":"rollout"}
 #    reason ∈ kill_switch | override | rollout | default，表示结果由哪一层决定
+#    identity 需 URL 编码；允许包含斜杠、空格、引号等任意字符
 ```
 
 ### 管理端（需请求头 `X-Admin-Token`，可选 `X-Actor` 记录操作人）
@@ -49,8 +51,11 @@ GET /api/flags/<name>/check?identity=<用户身份>
 | PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, kill_switch, description}` |
 | DELETE | `/api/flags/<name>` | 删除开关 |
 | GET | `/api/flags/<name>/overrides` | 列出单人强制 |
-| PUT | `/api/flags/<name>/overrides/<identity>` | 设置 `{enabled: true/false}` |
-| DELETE | `/api/flags/<name>/overrides/<identity>` | 移除单人强制 |
+| PUT | `/api/flags/<name>/overrides` | 设置 `{identity, enabled}` |
+| DELETE | `/api/flags/<name>/overrides` | 移除，body `{identity}` |
+
+> identity 一律放在 JSON body / 查询参数里，不进 URL 路径，
+> 因此含 `/`、空格、`"`、`'` 等字符的身份都能正常设置、查询、移除。
 | GET | `/api/audit?limit=100` | 最近操作记录（谁、何时、改了哪一层） |
 
 示例：
@@ -65,9 +70,9 @@ curl -X PATCH http://localhost:8000/api/flags/new-checkout \
 curl -X PATCH http://localhost:8000/api/flags/new-checkout \
   -H "X-Admin-Token: $TOKEN" -d '{"rollout_percent": 50}'
 
-# 单人强制开
-curl -X PUT http://localhost:8000/api/flags/new-checkout/overrides/u123 \
-  -H "X-Admin-Token: $TOKEN" -d '{"enabled": true}'
+# 单人强制开（identity 在 body 里，特殊字符无需转义）
+curl -X PUT http://localhost:8000/api/flags/new-checkout/overrides \
+  -H "X-Admin-Token: $TOKEN" -d '{"identity": "u/123 x", "enabled": true}'
 ```
 
 ## 环境变量
