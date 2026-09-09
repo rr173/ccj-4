@@ -33,6 +33,8 @@
   .badge.roll{ color:var(--accent); border-color:var(--accent); }
   input[type=text], input[type=number], textarea { width:100%; padding:6px 8px;
         border:1px solid var(--border); border-radius:6px; font-size:14px; }
+  select { padding:5px 6px; border:1px solid var(--border); border-radius:6px;
+           font-size:13px; max-width:100%; }
   button { padding:6px 14px; border:1px solid var(--border); border-radius:6px;
            background:#fff; cursor:pointer; font-size:14px; }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
@@ -52,6 +54,10 @@
            background:#24292f; color:#fff; opacity:0; transition:opacity .2s; }
   #toast.err { background:var(--danger); }
   .check-result { font-family:ui-monospace, monospace; font-size:13px; margin-top:6px; }
+  .group-block { border:1px solid var(--border); border-radius:6px; padding:8px 10px;
+                 margin-top:8px; }
+  .group-block .members { display:flex; gap:4px; flex-wrap:wrap; margin:6px 0; }
+  .group-block .badge a { color:inherit; text-decoration:none; margin-left:4px; }
 </style>
 </head>
 <body>
@@ -59,7 +65,7 @@
   <h1>🚩 特性开关管理</h1>
   <input id="token" type="password" placeholder="管理 Token">
   <input id="actor" type="text" placeholder="操作人（记入审计）">
-  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 单人强制 &gt; 比例放量 &gt; 默认值</span>
+  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 单人强制 &gt; 互斥组 &gt; 比例放量 &gt; 默认值</span>
 </header>
 
 <main>
@@ -72,6 +78,13 @@
         <label><input type="checkbox" id="newDefault"> 默认开</label>
         <button class="primary" onclick="createFlag()">创建</button>
       </div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>互斥组 <span class="muted" style="font-weight:normal">同一人组内最多一个开，先开者恒定</span></h2>
+      <div class="row"><input id="newGroupName" type="text" placeholder="组名，如 exp-homepage"></div>
+      <div class="row"><input id="newGroupDesc" type="text" placeholder="描述（可选）"></div>
+      <div class="row"><button class="primary" onclick="createGroup()">创建组</button></div>
+      <div id="groupList"></div>
     </div>
     <div class="card">
       <h2>开关列表 <button style="float:right" onclick="loadAll()">刷新</button></h2>
@@ -108,6 +121,7 @@
 <script>
 const $ = id => document.getElementById(id);
 let flags = [];
+let groups = [];
 let selected = null;
 
 $('token').value = localStorage.getItem('ff_token') || '';
@@ -139,7 +153,7 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
-async function loadAll() { await loadFlags(); await loadAudit(); }
+async function loadAll() { await loadFlags(); await loadGroups(); await loadAudit(); }
 
 async function loadFlags() {
   try {
@@ -160,6 +174,7 @@ async function loadFlags() {
     badges.push(f.default_enabled
       ? '<span class="badge on">默认开</span>' : '<span class="badge">默认关</span>');
     if (f.override_count) badges.push(`<span class="badge">${f.override_count} 人强制</span>`);
+    if (f.group) badges.push(`<span class="badge roll">组:${esc(f.group)}</span>`);
     div.innerHTML = `<span class="name">${esc(f.name)}</span><span class="badges">${badges.join('')}</span>`;
     div.onclick = () => { selected = f.name; loadFlags(); renderDetail(); };
     el.appendChild(div);
@@ -179,6 +194,11 @@ async function renderDetail() {
       <button class="danger" style="float:right" onclick="deleteFlag()">删除开关</button>
     </h2>
     <div class="muted" style="margin-bottom:12px">${esc(f.description || '（无描述）')}</div>
+
+    ${f.group ? `<div class="layer">
+      <h3>互斥组 <span class="prio">同一人组内最多一个开，先开者恒定；优先级低于全关与单人强制</span></h3>
+      本开关属于 <b>${esc(f.group)}</b>，组内成员：${esc((groups.find(g => g.name === f.group) || {flags:[]}).flags.join('、') || '—')}
+    </div>` : ''}
 
     <div class="layer kill">
       <h3>① 全关 <span class="prio">最高优先级：打开后所有人均为关</span></h3>
@@ -286,9 +306,128 @@ async function checkIdentity() {
   if (!selected || !id) return toast('先选开关并填写身份', true);
   const r = await fetch(`/api/flags/${encodeURIComponent(selected)}/check?identity=${encodeURIComponent(id)}`)
     .then(r => r.json());
+  const layerNames = { kill_switch: '全关', override: '单人强制', group: '互斥组',
+                       rollout: '比例放量', default: '默认值' };
   $('checkResult').innerHTML = r.error ? esc(r.error)
     : `结果：<b style="color:${r.enabled ? 'var(--ok)' : 'var(--danger)'}">${r.enabled ? '开' : '关'}</b>
-       <span class="muted">（由「${r.reason}」层决定）</span>`;
+       <span class="muted">（由「${layerNames[r.reason] || r.reason}」层决定）</span>`;
+}
+
+// ---------------------------------------------------------------- 互斥组
+
+async function loadGroups() {
+  try {
+    groups = await api('/api/groups');
+  } catch (e) {
+    $('groupList').innerHTML = '<span class="muted">加载失败：' + esc(e.message) + '</span>';
+    return;
+  }
+  renderGroups();
+}
+
+function renderGroups() {
+  const el = $('groupList');
+  if (!groups.length) { el.innerHTML = '<span class="muted">还没有互斥组</span>'; return; }
+  el.innerHTML = '';
+  const grouped = new Set(groups.flatMap(g => g.flags));
+  const free = flags.filter(f => !grouped.has(f.name));
+  for (const g of groups) {
+    const div = document.createElement('div');
+    div.className = 'group-block';
+
+    const head = document.createElement('div');
+    head.className = 'row';
+    head.style.marginBottom = '2px';
+    const title = document.createElement('b');
+    title.textContent = g.name;
+    const desc = document.createElement('span');
+    desc.className = 'muted';
+    desc.textContent = g.description || '';
+    const del = document.createElement('button');
+    del.className = 'danger';
+    del.style.cssText = 'margin-left:auto;padding:2px 10px';
+    del.textContent = '解散';
+    del.addEventListener('click', () => deleteGroup(g.name));
+    head.append(title, desc, del);
+    div.appendChild(head);
+
+    const meta = document.createElement('div');
+    meta.className = 'muted';
+    meta.textContent = `最近修改：${g.updated_by || '—'} · ${new Date(g.updated_at * 1000).toLocaleString()}`;
+    div.appendChild(meta);
+
+    const members = document.createElement('div');
+    members.className = 'members';
+    if (!g.flags.length) members.innerHTML = '<span class="muted">（空组）</span>';
+    for (const fname of g.flags) {
+      const chip = document.createElement('span');
+      chip.className = 'badge';
+      chip.textContent = fname;
+      const x = document.createElement('a');
+      x.href = 'javascript:void(0)';
+      x.textContent = '✕';
+      x.title = '移出此组';
+      x.addEventListener('click', () => removeFromGroup(g.name, fname));
+      chip.appendChild(x);
+      members.appendChild(chip);
+    }
+    div.appendChild(members);
+
+    const addRow = document.createElement('div');
+    addRow.className = 'row';
+    addRow.style.marginBottom = '0';
+    const sel = document.createElement('select');
+    if (!free.length) {
+      const o = document.createElement('option');
+      o.textContent = '（所有开关都已进组）';
+      sel.appendChild(o);
+      sel.disabled = true;
+    }
+    for (const f of free) {
+      const o = document.createElement('option');
+      o.value = f.name;
+      o.textContent = f.name;
+      sel.appendChild(o);
+    }
+    const btn = document.createElement('button');
+    btn.textContent = '加入此组';
+    btn.disabled = !free.length;
+    btn.addEventListener('click', () => addToGroup(g.name, sel.value));
+    addRow.append(sel, btn);
+    div.appendChild(addRow);
+
+    el.appendChild(div);
+  }
+}
+
+async function createGroup() {
+  try {
+    await api('/api/groups', { method: 'POST', body: JSON.stringify({
+      name: $('newGroupName').value, description: $('newGroupDesc').value }) });
+    $('newGroupName').value = ''; $('newGroupDesc').value = '';
+    toast('已创建'); loadAll();
+  } catch (e) { toast('创建失败：' + e.message, true); }
+}
+
+async function deleteGroup(name) {
+  if (!confirm(`确定解散互斥组 ${name}？组内开关恢复按原规则求值，落定记录一并清除。`)) return;
+  await api(`/api/groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  toast('已解散'); loadAll();
+}
+
+async function addToGroup(gname, fname) {
+  if (!fname) return;
+  try {
+    await api(`/api/groups/${encodeURIComponent(gname)}/flags`,
+              { method: 'PUT', body: JSON.stringify({ flag: fname }) });
+    toast('已加入'); loadAll();
+  } catch (e) { toast('操作失败：' + e.message, true); }
+}
+
+async function removeFromGroup(gname, fname) {
+  await api(`/api/groups/${encodeURIComponent(gname)}/flags`,
+            { method: 'DELETE', body: JSON.stringify({ flag: fname }) });
+  toast('已移出'); loadAll();
 }
 
 async function loadAudit() {

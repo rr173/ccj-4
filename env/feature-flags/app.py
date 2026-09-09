@@ -6,6 +6,13 @@
     3. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关
     4. 默认值（default_enabled）   -> 仅当放量比例为 0（未启用放量）时兜底
 
+互斥组（mutex group）：管理端可把多个开关编入同一组，一个开关最多进一组。
+对同一身份，组内最多一个开关为开：第 3/4 层判开后，若开关在组内，则由
+组规则裁决——该身份在组内已落定过别的开关则判关，否则落定为本开关并
+写库；之后身份不变，落定的开关不变。全关与单人强制优先于组规则
+（强制开不受组内已有人开着的限制，全关仍然全关）；未进组的开关按原
+规则求值，不参与组规则。
+
 放量分桶：sha256("{flag_name}:{identity}") % 100，同一身份对同一开关
 永远落在同一侧，与进程、机器、重启无关。
 """
@@ -51,9 +58,32 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail     TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mutex_groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    updated_by  TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL REFERENCES mutex_groups(id) ON DELETE CASCADE,
+    flag_id  INTEGER NOT NULL REFERENCES flags(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, flag_id)
+);
+-- 一个开关最多进一个组
+CREATE UNIQUE INDEX IF NOT EXISTS idx_group_members_flag ON group_members(flag_id);
+-- (组, 身份) 的落定记录：该身份在组内唯一开着的开关，先到先得，不再更换
+CREATE TABLE IF NOT EXISTS group_assignments (
+    group_id   INTEGER NOT NULL REFERENCES mutex_groups(id) ON DELETE CASCADE,
+    identity   TEXT NOT NULL,
+    flag_id    INTEGER NOT NULL REFERENCES flags(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (group_id, identity)
+);
 """
 
-LAYERS = ("kill_switch", "override", "rollout", "default")
+LAYERS = ("kill_switch", "override", "group", "rollout", "default")
 
 
 # ---------------------------------------------------------------- db helpers
@@ -112,6 +142,14 @@ def bucket_of(flag_name, identity):
     return int(digest, 16) % 100
 
 
+def group_of(db, flag_id):
+    """开关所在的互斥组 id；未进组返回 None。"""
+    row = db.execute(
+        "SELECT group_id FROM group_members WHERE flag_id=?", (flag_id,),
+    ).fetchone()
+    return row["group_id"] if row else None
+
+
 def evaluate(db, flag, identity):
     """按固定优先级求值，返回 (enabled, reason)。"""
     if flag["kill_switch"]:
@@ -126,9 +164,35 @@ def evaluate(db, flag, identity):
 
     # 放量比例 > 0 时这一层直接定论：命中开、未命中关，不再落到默认值
     if flag["rollout_percent"] > 0:
-        return bucket_of(flag["name"], identity) < flag["rollout_percent"], "rollout"
+        natural = bucket_of(flag["name"], identity) < flag["rollout_percent"]
+        reason = "rollout"
+    else:
+        natural = bool(flag["default_enabled"])
+        reason = "default"
 
-    return bool(flag["default_enabled"]), "default"
+    group_id = group_of(db, flag["id"])
+    if group_id is None or not natural:
+        return natural, reason
+
+    # 互斥组裁决：仅当自然结果为开才参与。组内同一身份最多一个开，
+    # 先到先得；落定写库后，身份不变，开着的那个不换。
+    winner = db.execute(
+        "SELECT flag_id FROM group_assignments WHERE group_id=? AND identity=?",
+        (group_id, identity),
+    ).fetchone()
+    if winner is None:
+        # INSERT OR IGNORE + 重读：并发请求下也只有一个人能落定成功
+        db.execute(
+            "INSERT OR IGNORE INTO group_assignments"
+            " (group_id, identity, flag_id, created_at) VALUES (?,?,?,?)",
+            (group_id, identity, flag["id"], time.time()),
+        )
+        db.commit()
+        winner = db.execute(
+            "SELECT flag_id FROM group_assignments WHERE group_id=? AND identity=?",
+            (group_id, identity),
+        ).fetchone()
+    return winner["flag_id"] == flag["id"], "group"
 
 
 # ---------------------------------------------------------------- admin auth
@@ -184,12 +248,20 @@ def healthz():
 def list_flags():
     db = get_db()
     rows = db.execute("SELECT * FROM flags ORDER BY name").fetchall()
+    groups = {
+        r["flag_id"]: r["name"]
+        for r in db.execute(
+            "SELECT m.flag_id, g.name FROM group_members m"
+            " JOIN mutex_groups g ON g.id = m.group_id"
+        )
+    }
     result = []
     for row in rows:
         item = flag_to_dict(row)
         item["override_count"] = db.execute(
             "SELECT COUNT(*) c FROM overrides WHERE flag_id=?", (row["id"],)
         ).fetchone()["c"]
+        item["group"] = groups.get(row["id"])
         result.append(item)
     return jsonify(result)
 
@@ -334,6 +406,128 @@ def delete_override(name):
     db.execute("DELETE FROM overrides WHERE flag_id=? AND identity=?",
                (flag["id"], identity))
     audit(actor(), name, "override", "remove_override", f"identity={identity}")
+    db.commit()
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- mutex groups
+
+def group_to_dict(db, row):
+    members = db.execute(
+        "SELECT f.name FROM group_members m JOIN flags f ON f.id = m.flag_id"
+        " WHERE m.group_id=? ORDER BY f.name", (row["id"],),
+    ).fetchall()
+    return {
+        "name": row["name"],
+        "description": row["description"],
+        "flags": [r["name"] for r in members],
+        "updated_by": row["updated_by"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def touch_group(db, group_id):
+    db.execute("UPDATE mutex_groups SET updated_by=?, updated_at=? WHERE id=?",
+               (actor(), time.time(), group_id))
+
+
+@app.get("/api/groups")
+@require_admin
+def list_groups():
+    db = get_db()
+    rows = db.execute("SELECT * FROM mutex_groups ORDER BY name").fetchall()
+    return jsonify([group_to_dict(db, r) for r in rows])
+
+
+@app.post("/api/groups")
+@require_admin
+def create_group():
+    body = request.get_json(force=True)
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if not all(c.isalnum() or c in "-_." for c in name):
+        return jsonify({"error": "name may only contain letters, digits, - _ ."}), 400
+    db = get_db()
+    if db.execute("SELECT 1 FROM mutex_groups WHERE name=?", (name,)).fetchone():
+        return jsonify({"error": "group already exists"}), 409
+    now = time.time()
+    db.execute(
+        "INSERT INTO mutex_groups (name, description, updated_by, created_at, updated_at)"
+        " VALUES (?,?,?,?,?)",
+        (name, body.get("description", ""), actor(), now, now),
+    )
+    audit(actor(), name, "group", "create_group")
+    db.commit()
+    return jsonify({"ok": True}), 201
+
+
+@app.delete("/api/groups/<name>")
+@require_admin
+def delete_group(name):
+    db = get_db()
+    cur = db.execute("DELETE FROM mutex_groups WHERE name=?", (name,))
+    if cur.rowcount == 0:
+        return jsonify({"error": "group not found"}), 404
+    # 成员关系与落定记录随组级联删除，组内开关恢复按原规则求值
+    audit(actor(), name, "group", "delete_group")
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.put("/api/groups/<name>/flags")
+@require_admin
+def add_flag_to_group(name):
+    body = request.get_json(force=True, silent=True) or {}
+    flag_name = body.get("flag")
+    if not isinstance(flag_name, str) or not flag_name:
+        return jsonify({"error": "flag is required"}), 400
+    db = get_db()
+    group = db.execute("SELECT * FROM mutex_groups WHERE name=?", (name,)).fetchone()
+    if group is None:
+        return jsonify({"error": "group not found"}), 404
+    flag = db.execute("SELECT * FROM flags WHERE name=?", (flag_name,)).fetchone()
+    if flag is None:
+        return jsonify({"error": "flag not found"}), 404
+    existing = db.execute(
+        "SELECT g.name FROM group_members m JOIN mutex_groups g ON g.id = m.group_id"
+        " WHERE m.flag_id=?", (flag["id"],),
+    ).fetchone()
+    if existing is not None:
+        return jsonify({"error": f"flag already in group '{existing['name']}'"
+                                 " (a flag can join at most one group)"}), 409
+    db.execute("INSERT INTO group_members (group_id, flag_id) VALUES (?,?)",
+               (group["id"], flag["id"]))
+    touch_group(db, group["id"])
+    audit(actor(), name, "group", "add_flag", f"flag={flag_name}")
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/groups/<name>/flags")
+@require_admin
+def remove_flag_from_group(name):
+    body = request.get_json(force=True, silent=True) or {}
+    flag_name = body.get("flag")
+    if not isinstance(flag_name, str) or not flag_name:
+        return jsonify({"error": "flag is required"}), 400
+    db = get_db()
+    group = db.execute("SELECT * FROM mutex_groups WHERE name=?", (name,)).fetchone()
+    if group is None:
+        return jsonify({"error": "group not found"}), 404
+    flag = db.execute("SELECT * FROM flags WHERE name=?", (flag_name,)).fetchone()
+    if flag is None:
+        return jsonify({"error": "flag not found"}), 404
+    cur = db.execute("DELETE FROM group_members WHERE group_id=? AND flag_id=?",
+                     (group["id"], flag["id"]))
+    if cur.rowcount == 0:
+        return jsonify({"error": "flag not in group"}), 404
+    # 释放该开关在组内占有的落定记录，相关身份之后可重新落定组内其他开关
+    db.execute("DELETE FROM group_assignments WHERE group_id=? AND flag_id=?",
+               (group["id"], flag["id"]))
+    touch_group(db, group["id"])
+    audit(actor(), name, "group", "remove_flag", f"flag={flag_name}")
     db.commit()
     return jsonify({"ok": True})
 
