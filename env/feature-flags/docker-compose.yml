@@ -1,0 +1,14 @@
+services:
+  feature-flags:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # 生产环境务必改成强随机串
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+    volumes:
+      - flags-data:/data
+    restart: unless-stopped
+
+volumes:
+  flags-data:

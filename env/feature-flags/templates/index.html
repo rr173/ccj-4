@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>特性开关管理</title>
+<style>
+  :root { --border:#d8dee4; --bg:#f6f8fa; --accent:#0969da; --danger:#cf222e; --ok:#1a7f37; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin:0; background:var(--bg); color:#1f2328; font-size:14px; }
+  header { background:#24292f; color:#fff; padding:10px 20px; display:flex; gap:12px;
+           align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  header input { padding:5px 8px; border-radius:6px; border:1px solid #555; background:#2f363d;
+                 color:#fff; width:180px; }
+  header .hint { color:#9da7b3; font-size:12px; }
+  main { display:grid; grid-template-columns: 320px 1fr; gap:16px; padding:16px 20px;
+         align-items:start; }
+  .card { background:#fff; border:1px solid var(--border); border-radius:8px; padding:14px; }
+  .card h2 { font-size:14px; margin:0 0 10px; }
+  .flag-item { padding:8px 10px; border:1px solid var(--border); border-radius:6px;
+               margin-bottom:6px; cursor:pointer; display:flex; justify-content:space-between;
+               align-items:center; gap:8px; }
+  .flag-item:hover { background:var(--bg); }
+  .flag-item.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .flag-item .name { font-weight:600; word-break:break-all; }
+  .badges { display:flex; gap:4px; flex-shrink:0; }
+  .badge { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid var(--border);
+           color:#57606a; white-space:nowrap; }
+  .badge.on  { color:var(--ok); border-color:var(--ok); }
+  .badge.off { color:var(--danger); border-color:var(--danger); }
+  .badge.roll{ color:var(--accent); border-color:var(--accent); }
+  input[type=text], input[type=number], textarea { width:100%; padding:6px 8px;
+        border:1px solid var(--border); border-radius:6px; font-size:14px; }
+  button { padding:6px 14px; border:1px solid var(--border); border-radius:6px;
+           background:#fff; cursor:pointer; font-size:14px; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.danger  { background:var(--danger); color:#fff; border-color:var(--danger); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .layer { border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:12px; }
+  .layer h3 { margin:0 0 8px; font-size:13px; }
+  .layer h3 .prio { color:#57606a; font-weight:normal; font-size:12px; }
+  .layer.kill { border-color:#f0b8bc; background:#fff8f8; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  th { color:#57606a; font-weight:600; }
+  input[type=range] { flex:1; }
+  .muted { color:#57606a; font-size:12px; }
+  #toast { position:fixed; bottom:20px; right:20px; padding:10px 16px; border-radius:8px;
+           background:#24292f; color:#fff; opacity:0; transition:opacity .2s; }
+  #toast.err { background:var(--danger); }
+  .check-result { font-family:ui-monospace, monospace; font-size:13px; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🚩 特性开关管理</h1>
+  <input id="token" type="password" placeholder="管理 Token">
+  <input id="actor" type="text" placeholder="操作人（记入审计）">
+  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 单人强制 &gt; 比例放量 &gt; 默认值</span>
+</header>
+
+<main>
+  <div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>新建开关</h2>
+      <div class="row"><input id="newName" type="text" placeholder="开关名，如 new-checkout"></div>
+      <div class="row"><input id="newDesc" type="text" placeholder="描述（可选）"></div>
+      <div class="row">
+        <label><input type="checkbox" id="newDefault"> 默认开</label>
+        <button class="primary" onclick="createFlag()">创建</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>开关列表 <button style="float:right" onclick="loadAll()">刷新</button></h2>
+      <div id="flagList"><span class="muted">加载中…</span></div>
+    </div>
+  </div>
+
+  <div>
+    <div id="detail" class="card" style="margin-bottom:16px">
+      <span class="muted">从左侧选择一个开关</span>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h2>调用方结果验证</h2>
+      <div class="row">
+        <input id="checkIdentity" type="text" placeholder="身份 identity" style="max-width:240px">
+        <button onclick="checkIdentity()">查询当前开关</button>
+      </div>
+      <div id="checkResult" class="check-result"></div>
+    </div>
+
+    <div class="card">
+      <h2>最近操作（审计） <button style="float:right" onclick="loadAudit()">刷新</button></h2>
+      <table>
+        <thead><tr><th>时间</th><th>操作人</th><th>开关</th><th>层</th><th>动作</th><th>详情</th></tr></thead>
+        <tbody id="auditBody"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let flags = [];
+let selected = null;
+
+$('token').value = localStorage.getItem('ff_token') || '';
+$('actor').value = localStorage.getItem('ff_actor') || '';
+$('token').addEventListener('change', () => { localStorage.setItem('ff_token', $('token').value); loadAll(); });
+$('actor').addEventListener('change', () => localStorage.setItem('ff_actor', $('actor').value));
+
+function headers() {
+  return { 'Content-Type': 'application/json',
+           'X-Admin-Token': $('token').value,
+           'X-Actor': $('actor').value || 'unknown' };
+}
+
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = isErr ? 'err' : '';
+  t.style.opacity = 1;
+  setTimeout(() => t.style.opacity = 0, 2500);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: headers() });
+  if (!res.ok) {
+    let msg = res.status;
+    try { msg = (await res.json()).error || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+async function loadAll() { await loadFlags(); await loadAudit(); }
+
+async function loadFlags() {
+  try {
+    flags = await api('/api/flags');
+  } catch (e) {
+    $('flagList').innerHTML = '<span class="muted">加载失败：' + e.message + '（检查 Token）</span>';
+    return;
+  }
+  const el = $('flagList');
+  if (!flags.length) { el.innerHTML = '<span class="muted">还没有开关</span>'; renderDetail(); return; }
+  el.innerHTML = '';
+  for (const f of flags) {
+    const div = document.createElement('div');
+    div.className = 'flag-item' + (selected === f.name ? ' active' : '');
+    const badges = [];
+    if (f.kill_switch) badges.push('<span class="badge off">全关</span>');
+    if (f.rollout_percent > 0) badges.push(`<span class="badge roll">${f.rollout_percent}%</span>`);
+    badges.push(f.default_enabled
+      ? '<span class="badge on">默认开</span>' : '<span class="badge">默认关</span>');
+    if (f.override_count) badges.push(`<span class="badge">${f.override_count} 人强制</span>`);
+    div.innerHTML = `<span class="name">${esc(f.name)}</span><span class="badges">${badges.join('')}</span>`;
+    div.onclick = () => { selected = f.name; loadFlags(); renderDetail(); };
+    el.appendChild(div);
+  }
+  renderDetail();
+}
+
+function current() { return flags.find(f => f.name === selected); }
+
+async function renderDetail() {
+  const el = $('detail');
+  const f = current();
+  if (!f) { el.innerHTML = '<span class="muted">从左侧选择一个开关</span>'; return; }
+
+  el.innerHTML = `
+    <h2 style="margin-bottom:4px">${esc(f.name)}
+      <button class="danger" style="float:right" onclick="deleteFlag()">删除开关</button>
+    </h2>
+    <div class="muted" style="margin-bottom:12px">${esc(f.description || '（无描述）')}</div>
+
+    <div class="layer kill">
+      <h3>① 全关 <span class="prio">最高优先级：打开后所有人均为关</span></h3>
+      <button class="${f.kill_switch ? '' : 'danger'}" onclick="toggleKill()">
+        ${f.kill_switch ? '解除全关' : '⛔ 一键全关'}</button>
+      ${f.kill_switch ? '<span class="badge off" style="margin-left:8px">当前处于全关状态</span>' : ''}
+    </div>
+
+    <div class="layer">
+      <h3>② 单人强制 <span class="prio">对指定身份强制开/关，覆盖放量与默认值</span></h3>
+      <div class="row">
+        <input id="ovIdentity" type="text" placeholder="身份 identity" style="max-width:220px">
+        <button onclick="setOverride(true)">强制开</button>
+        <button onclick="setOverride(false)">强制关</button>
+      </div>
+      <table><thead><tr><th>身份</th><th>强制为</th><th></th></tr></thead>
+        <tbody id="ovBody"><tr><td colspan="3" class="muted">加载中…</td></tr></tbody></table>
+    </div>
+
+    <div class="layer">
+      <h3>③ 比例放量 <span class="prio">命中放量区间的身份为开；同一身份结果恒定</span></h3>
+      <div class="row">
+        <input type="range" min="0" max="100" value="${f.rollout_percent}"
+               oninput="$('pctLabel').textContent=this.value+'%'"
+               onchange="setRollout(this.value)">
+        <b id="pctLabel">${f.rollout_percent}%</b>
+      </div>
+    </div>
+
+    <div class="layer">
+      <h3>④ 默认值 <span class="prio">以上各层都未决定时兜底</span></h3>
+      <label><input type="checkbox" ${f.default_enabled ? 'checked' : ''}
+        onchange="setDefault(this.checked)"> 默认开</label>
+    </div>`;
+  loadOverrides();
+}
+
+async function loadOverrides() {
+  const body = $('ovBody');
+  if (!body) return;
+  const list = await api(`/api/flags/${encodeURIComponent(selected)}/overrides`);
+  body.innerHTML = list.length ? '' : '<tr><td colspan="3" class="muted">无</td></tr>';
+  for (const o of list) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${esc(o.identity)}</td>
+      <td>${o.enabled ? '<span class="badge on">开</span>' : '<span class="badge off">关</span>'}</td>
+      <td><button onclick="removeOverride('${esc(o.identity)}')">移除</button></td>`;
+    body.appendChild(tr);
+  }
+}
+
+async function createFlag() {
+  try {
+    await api('/api/flags', { method: 'POST', body: JSON.stringify({
+      name: $('newName').value, description: $('newDesc').value,
+      default_enabled: $('newDefault').checked }) });
+    $('newName').value = ''; $('newDesc').value = ''; $('newDefault').checked = false;
+    toast('已创建'); loadAll();
+  } catch (e) { toast('创建失败：' + e.message, true); }
+}
+
+async function deleteFlag() {
+  if (!confirm(`确定删除开关 ${selected}？`)) return;
+  await api(`/api/flags/${encodeURIComponent(selected)}`, { method: 'DELETE' });
+  selected = null; toast('已删除'); loadAll();
+}
+
+async function patch(body) {
+  try {
+    await api(`/api/flags/${encodeURIComponent(selected)}`,
+              { method: 'PATCH', body: JSON.stringify(body) });
+    loadAll();
+  } catch (e) { toast('操作失败：' + e.message, true); }
+}
+
+const toggleKill  = () => patch({ kill_switch: !current().kill_switch });
+const setDefault  = v  => patch({ default_enabled: v });
+const setRollout  = v  => patch({ rollout_percent: parseInt(v, 10) });
+
+async function setOverride(enabled) {
+  const id = $('ovIdentity').value.trim();
+  if (!id) return toast('请填写身份', true);
+  await api(`/api/flags/${encodeURIComponent(selected)}/overrides/${encodeURIComponent(id)}`,
+            { method: 'PUT', body: JSON.stringify({ enabled }) });
+  $('ovIdentity').value = '';
+  toast('已设置'); loadAll();
+}
+
+async function removeOverride(identity) {
+  await api(`/api/flags/${encodeURIComponent(selected)}/overrides/${encodeURIComponent(identity)}`,
+            { method: 'DELETE' });
+  toast('已移除'); loadAll();
+}
+
+async function checkIdentity() {
+  const id = $('checkIdentity').value.trim();
+  if (!selected || !id) return toast('先选开关并填写身份', true);
+  const r = await fetch(`/api/flags/${encodeURIComponent(selected)}/check?identity=${encodeURIComponent(id)}`)
+    .then(r => r.json());
+  $('checkResult').innerHTML = r.error ? esc(r.error)
+    : `结果：<b style="color:${r.enabled ? 'var(--ok)' : 'var(--danger)'}">${r.enabled ? '开' : '关'}</b>
+       <span class="muted">（由「${r.reason}」层决定）</span>`;
+}
+
+async function loadAudit() {
+  try {
+    const rows = await api('/api/audit?limit=100');
+    $('auditBody').innerHTML = rows.map(r => `<tr>
+      <td>${new Date(r.created_at * 1000).toLocaleString()}</td>
+      <td>${esc(r.actor)}</td><td>${esc(r.flag_name)}</td><td>${esc(r.layer)}</td>
+      <td>${esc(r.action)}</td><td class="muted">${esc(r.detail)}</td></tr>`).join('')
+      || '<tr><td colspan="6" class="muted">暂无记录</td></tr>';
+  } catch (e) { $('auditBody').innerHTML = `<tr><td colspan="6" class="muted">加载失败：${esc(e.message)}</td></tr>`; }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+loadAll();
+</script>
+</body>
+</html>
