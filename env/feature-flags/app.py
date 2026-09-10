@@ -2,12 +2,24 @@
 
 求值优先级（固定，不可配置）：
     1. 全关（kill switch）        -> 一律关
-    2. 开关依赖（depends_on）     -> 依赖的开关对此人此身属性不是开，本开关必须关
-    3. 单人强制（override）        -> 强制开 / 强制关
-    4. 属性打开条件（targeting）   -> 来问带的属性全对上则开；对不上落到下面
-    5. 互斥组（group）            -> 组内同一身份最多一个开
-    6. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关
-    7. 默认值（default_enabled）   -> 仅当放量比例为 0（未启用放量）时兜底
+    2. 结果冻结（freeze）          -> 此人对本开关冻住的那一刻的结果，与之后的一切配置改动无关
+    3. 开关依赖（depends_on）     -> 依赖的开关对此人此身属性不是开，本开关必须关
+    4. 单人强制（override）        -> 强制开 / 强制关
+    5. 属性打开条件（targeting）   -> 来问带的属性全对上则开；对不上落到下面
+    6. 互斥组（group）            -> 组内同一身份最多一个开
+    7. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关
+    8. 默认值（default_enabled）   -> 仅当放量比例为 0（未启用放量）时兜底
+
+结果冻结（freeze）：管理端可以把某个人对某个开关「此刻」的结果冻住。冻住时
+系统先按当时的全部规则（依赖、强制、属性以不带属性的口径、互斥组、放量、默认）
+完整求一次值，把得到的开/关存下来；此后该人再来问（单查、整包、带不带属性），
+只要本开关没被全关压着，一律给冻住的那个结果——改默认值、放量比例、属性条件、
+依赖关系（乃至给此人加单人强制、改互斥组）都不动它；被别的开关依赖时，依赖者
+看到的也是这个冻住的结果。全关是唯一的例外：本开关一旦全关，冻住期间也一律关
+（reason=kill_switch），全关解除后仍回到冻住的值。解冻后没有任何残留，立刻按
+解冻当时的规则求值。冻 / 解冻都让该身份的已发整包（含他拿过的各身属性包）整包
+换新版本，拿着冻/解冻前那包来问算过期；冻住期间改其他配置，该开关对此人的结果
+不变，但配置变更本身仍按原规则让相关整包推进版本。
 
 开关依赖（depends_on）：管理端可以指定本开关「先看另一个开关」。来问时
 （单查或整包），用同一个身份、同一身属性把被依赖的开关完整求值一遍：
@@ -107,6 +119,21 @@ CREATE TABLE IF NOT EXISTS overrides (
     created_at REAL NOT NULL,
     UNIQUE(flag_id, identity)
 );
+-- 结果冻结：管理端把 (开关, 人) 此刻的结果冻住。frozen_enabled 是冻住那一刻
+-- 按当时完整规则求出的开/关；frozen_reason 记下它当时由哪一层决定（审计/展示用）。
+-- 冻住后求值只认本行，与 flags/overrides/依赖/组的后续变化无关；全关仍压过。
+-- 开关删除时冻结记录一并删除（ON DELETE CASCADE）。
+CREATE TABLE IF NOT EXISTS freezes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    flag_id       INTEGER NOT NULL REFERENCES flags(id) ON DELETE CASCADE,
+    identity      TEXT NOT NULL,
+    frozen_enabled INTEGER NOT NULL,
+    frozen_reason TEXT NOT NULL DEFAULT '',
+    created_by    TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    UNIQUE(flag_id, identity)
+);
+CREATE INDEX IF NOT EXISTS idx_freezes_identity ON freezes(identity);
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     actor      TEXT NOT NULL,
@@ -200,8 +227,8 @@ CREATE TABLE IF NOT EXISTS draft_changes (
 );
 """
 
-LAYERS = ("kill_switch", "depends_on", "override", "targeting", "group",
-          "rollout", "default")
+LAYERS = ("kill_switch", "freeze", "depends_on", "override", "targeting",
+          "group", "rollout", "default")
 
 
 # ---------------------------------------------------------------- attrs / targeting
@@ -395,19 +422,36 @@ def group_of(db, flag_id):
     return row["group_id"] if row else None
 
 
-def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None):
+def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
+             _skip_freeze_id=None):
     """按固定优先级求值，返回 (enabled, reason)。
 
     attrs 为来问时带的属性（dict）。属性条件命中时这一层直接定论为开；
     对不上 / 没带属性 / 开关没定条件，都按原来的放量 / 默认值算。
 
-    开关依赖在全关之后、单人强制之前：用同一身份同一身属性把被依赖的
-    开关完整求值一遍，被依赖的不开，本开关一律关（reason=depends_on）。
+    结果冻结在全关之后、开关依赖之前：冻住后直接返回冻住那一刻的结果
+    （reason=freeze），不再看依赖、强制、属性、组、放量与默认值；因此
+    改依赖也救不回/压不掉冻住的值。被别的开关依赖时，依赖者沿备忘拿到
+    的就是这个冻住的结果。全关仍在更前面，冻住也压不过全关。
+    _skip_freeze_id 仅供「重新冻住」时顶层使用：按假设此开关没冻的口径
+    求它此刻的结果（沿依赖递归时被依赖开关的冻结照常生效）。
     依赖链上的结果在单次求值内备忘，保证链上每个开关只算一次、结果一致；
     成环在管理端写入时已拒绝，运行时再兜一层防环。
     """
     if flag["kill_switch"]:
         return False, "kill_switch"
+
+    # 结果冻结：只认冻住那一刻存下的开/关，此后其他层怎么改都不影响它。
+    if _skip_freeze_id != flag["id"]:
+        freeze = db.execute(
+            "SELECT frozen_enabled FROM freezes WHERE flag_id=? AND identity=?",
+            (flag["id"], identity),
+        ).fetchone()
+        if freeze is not None:
+            result = (bool(freeze["frozen_enabled"]), "freeze")
+            if _memo is not None:
+                _memo[flag["id"]] = result[0]
+            return result
 
     # 开关依赖：被依赖的开关对此人此身属性不是开，则必须关。
     # 对本开关的强制开排在依赖之后，救不回依赖关着的情形。
@@ -498,12 +542,15 @@ def attrs_hash_of(attrs):
 def bundle_content_hash(db, identity, attrs=None):
     """求值输入摘要：对「会影响此身份此身属性求值结果的全部输入」做确定性摘要。
 
-    覆盖：所有开关的求值相关字段、此身份的单人强制、互斥组成员关系、
-    此身份在组内的落定记录、开关之间的依赖关系。带属性来拿时，某个
-    开关的属性条件只在此人属性对得上（即该条件实际参与了此人求值）时
-    才进摘要——改一个此人对不上的条件不影响他的包，对得上的条件增删改
-    必换版本；不带属性时摘要与没有「属性条件」这一层时一字不差——
-    管理端怎么增改条件，不带属性的老包都不失效。
+    覆盖：所有开关的求值相关字段、此身份的单人强制、此身份的结果冻结、
+    互斥组成员关系、此身份在组内的落定记录、开关之间的依赖关系。带属性来拿时，
+    某个开关的属性条件只在此人属性对得上（即该条件实际参与了此人求值）时才进
+    摘要——改一个此人对不上的条件不影响他的包，对得上的条件增删改必换版本；
+    不带属性时摘要与没有「属性条件」这一层时一字不差——管理端怎么增改条件，
+    不带属性的老包都不失效。
+    冻住的开关对此人只认 freezes 行：它的默认值/放量/属性条件/依赖边/单人强制
+    在冻住期间都不参与求值，因此这些改动不进此人的摘要（不换版本）；它的全关
+    仍压过冻结，所以全关字段保留，冻住期间开全关仍让包换版本。
     与求值无关的字段（如描述、时间戳）不影响摘要；只与别人相关的改动
     （如给他人的单人强制）也不影响此身份的摘要。
     """
@@ -516,6 +563,12 @@ def bundle_content_hash(db, identity, attrs=None):
         " JOIN flags f ON f.id = o.flag_id WHERE o.identity=? ORDER BY f.name",
         (identity,),
     ).fetchall()
+    freezes = db.execute(
+        "SELECT f.name, z.frozen_enabled FROM freezes z"
+        " JOIN flags f ON f.id = z.flag_id WHERE z.identity=? ORDER BY f.name",
+        (identity,),
+    ).fetchall()
+    frozen_names = {r["name"] for r in freezes}
     members = db.execute(
         "SELECT g.name AS g, f.name AS f FROM group_members m"
         " JOIN mutex_groups g ON g.id = m.group_id"
@@ -529,26 +582,38 @@ def bundle_content_hash(db, identity, attrs=None):
     ).fetchall()
     payload = {
         "identity": identity,
-        "flags": [[r["name"], bool(r["default_enabled"]), r["rollout_percent"],
+        # 冻住的开关：默认值/放量在冻住期间不参与求值，摘要里恒为中性值，
+        # 全关仍压过冻结、照常参与，故保留真实值。
+        "flags": [[r["name"],
+                   False if r["name"] in frozen_names else bool(r["default_enabled"]),
+                   0 if r["name"] in frozen_names else r["rollout_percent"],
                    bool(r["kill_switch"])] for r in flags],
-        "overrides": [[r["name"], bool(r["enabled"])] for r in overrides],
+        # 冻住的开关不看单人强制，给它的强制不进摘要
+        "overrides": [[r["name"], bool(r["enabled"])] for r in overrides
+                      if r["name"] not in frozen_names],
+        "freezes": [[r["name"], bool(r["frozen_enabled"])] for r in freezes],
         "groups": [[r["g"], r["f"]] for r in members],
         "assignments": [[r["g"], r["f"]] for r in assignments],
     }
     # 开关依赖关系是全局求值输入：改了谁依赖谁（含解除、被依赖开关删除）
-    # 所有已发整包都要换新版本。按依赖者名字排序，保证摘要确定。
+    # 相关已发整包都要换新版本。冻住的开关不看自己的出边依赖（冻住在依赖层
+    # 之前直接定论），所以它自己那条边不进摘要；别人对它的依赖保留——依赖者
+    # 求值时会沿备忘拿到它冻住的结果。按依赖者名字排序，保证摘要确定。
     dependencies = db.execute(
         "SELECT f.name AS child, p.name AS parent FROM flags f"
         " JOIN flags p ON p.id = f.depends_on_flag_id ORDER BY f.name"
     ).fetchall()
-    payload["dependencies"] = [[r["child"], r["parent"]] for r in dependencies]
+    payload["dependencies"] = [[r["child"], r["parent"]] for r in dependencies
+                               if r["child"] not in frozen_names]
     if attrs:
         # 带属性的包：属性本身进摘要；属性条件只在「对此人对得上」时进摘要
-        # （实际参与了求值才算求值输入，对不上的条件改动不波及此人）
+        # （实际参与了求值才算求值输入，对不上的条件改动不波及此人）。
+        # 冻住的开关连属性条件层也不看，条件永不进摘要。
         payload["attrs"] = attrs
         with_rules = []
         for row, r in zip(payload["flags"], flags):
-            if r["targeting_rule"] and targeting_matches(r["targeting_rule"], attrs):
+            if (r["name"] not in frozen_names and r["targeting_rule"]
+                    and targeting_matches(r["targeting_rule"], attrs)):
                 with_rules.append(row + [json.loads(r["targeting_rule"])])
             else:
                 with_rules.append(row)
@@ -769,6 +834,9 @@ def list_flags():
         item = flag_to_dict(row, dep_names.get(row["id"], ""))
         item["override_count"] = db.execute(
             "SELECT COUNT(*) c FROM overrides WHERE flag_id=?", (row["id"],)
+        ).fetchone()["c"]
+        item["freeze_count"] = db.execute(
+            "SELECT COUNT(*) c FROM freezes WHERE flag_id=?", (row["id"],)
         ).fetchone()["c"]
         item["group"] = groups.get(row["id"])
         item["scheduled_changes"] = pending.get(row["id"], [])
@@ -1135,6 +1203,108 @@ def delete_override(name):
     record_invalidations(db, actor(),
                          f"remove_override {name} identity={identity}")
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- 结果冻结（freeze）
+
+def freeze_result(db, flag, identity):
+    """冻住时按当前完整规则求一次「此刻」的结果（不带属性口径），
+    返回 (enabled, reason)。跳过本开关已有的冻结行——重新冻同一个人时，
+    冻住的是「假如现在解冻会算出的结果」；被依赖开关的冻结照常生效。"""
+    return evaluate(db, flag, identity, None,
+                    _skip_freeze_id=flag["id"])
+
+
+@app.get("/api/flags/<name>/freezes")
+@require_admin
+def list_freezes(name):
+    """管理端：列出某开关被冻住结果的人及其冻住的值、冻住时的理由。"""
+    db = get_db()
+    flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
+    if flag is None:
+        return jsonify({"error": "flag not found"}), 404
+    rows = db.execute(
+        "SELECT identity, frozen_enabled, frozen_reason, created_by, created_at"
+        " FROM freezes WHERE flag_id=? ORDER BY identity", (flag["id"],),
+    ).fetchall()
+    return jsonify([
+        {"identity": r["identity"], "enabled": bool(r["frozen_enabled"]),
+         "frozen_reason": r["frozen_reason"], "created_by": r["created_by"],
+         "created_at": r["created_at"]}
+        for r in rows
+    ])
+
+
+@app.put("/api/flags/<name>/freezes")
+@require_admin
+def put_freeze(name):
+    """把某人对此开关此刻的结果冻住。
+
+    冻住时先按当前全部规则（不带属性口径）求一次值，把开/关连同当时的
+    理由存下来。此后该人来问一律给冻住的值（全关仍压过），改默认值、放量、
+    属性条件、依赖、单人强制都不动它。重复冻同一个人 = 按此刻规则重新冻
+    （值没变就是 no-op，不产生失效记录）。冻住让该身份的已发整包换新版本。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    identity = body.get("identity")
+    if not isinstance(identity, str) or identity == "":
+        return jsonify({"error": "identity is required (non-empty string)"}), 400
+    db = get_db()
+    flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
+    if flag is None:
+        return jsonify({"error": "flag not found"}), 404
+    enabled, reason = freeze_result(db, flag, identity)
+    now = time.time()
+    existing = db.execute(
+        "SELECT frozen_enabled FROM freezes WHERE flag_id=? AND identity=?",
+        (flag["id"], identity),
+    ).fetchone()
+    if existing is not None and bool(existing["frozen_enabled"]) == enabled:
+        # 冻住的值与现状一致：不改动、不换版本（幂等）
+        return jsonify({"ok": True, "changed": False, "enabled": enabled,
+                        "reason": reason})
+    db.execute(
+        "INSERT INTO freezes (flag_id, identity, frozen_enabled, frozen_reason,"
+        " created_by, created_at) VALUES (?,?,?,?,?,?)"
+        " ON CONFLICT(flag_id, identity) DO UPDATE SET frozen_enabled=excluded.frozen_enabled,"
+        " frozen_reason=excluded.frozen_reason, created_by=excluded.created_by,"
+        " created_at=excluded.created_at",
+        (flag["id"], identity, 1 if enabled else 0, reason, actor(), now),
+    )
+    audit(actor(), name, "freeze", "freeze_result",
+          f"identity={identity} enabled={enabled} reason={reason}")
+    db.commit()
+    record_invalidations(db, actor(),
+                         f"freeze_result {name} identity={identity} -> {enabled}")
+    return jsonify({"ok": True, "changed": True, "enabled": enabled,
+                    "reason": reason})
+
+
+@app.delete("/api/flags/<name>/freezes")
+@require_admin
+def delete_freeze(name):
+    """解冻：移除某人对此开关的结果冻结，此后该人立即按解冻当时的规则求值。
+
+    解冻让该身份的已发整包（含各身属性包）换新版本；解冻本身不改任何
+    开关配置。identity 放在 JSON body 里。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    identity = body.get("identity")
+    if not isinstance(identity, str) or identity == "":
+        return jsonify({"error": "identity is required (non-empty string)"}), 400
+    db = get_db()
+    flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
+    if flag is None:
+        return jsonify({"error": "flag not found"}), 404
+    cur = db.execute("DELETE FROM freezes WHERE flag_id=? AND identity=?",
+                     (flag["id"], identity))
+    if cur.rowcount == 0:
+        return jsonify({"ok": True, "changed": False})
+    audit(actor(), name, "freeze", "unfreeze_result", f"identity={identity}")
+    db.commit()
+    record_invalidations(db, actor(),
+                         f"unfreeze_result {name} identity={identity}")
+    return jsonify({"ok": True, "changed": True})
 
 
 # ---------------------------------------------------------------- scheduled changes

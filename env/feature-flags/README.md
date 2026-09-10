@@ -5,13 +5,14 @@
 ## 求值优先级（固定，代码中不可调整）
 
 ```
-全关(kill_switch) > 开关依赖(depends_on) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout) > 默认值(default)
+全关(kill_switch) > 结果冻结(freeze) > 开关依赖(depends_on) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout) > 默认值(default)
 ```
 
-- **全关**：打开后所有身份一律为关，覆盖一切。
+- **全关**：打开后所有身份一律为关，覆盖一切，**包括冻住的结果**。
+- **结果冻结**：见下节。
 - **开关依赖**：见下节。
 - **单人强制**：对指定 identity 强制开/关，覆盖属性条件、互斥组、放量与默认值；
-  但救不回「被依赖开关是关」（依赖层在强制之前）。
+  但救不回「被依赖开关是关」（依赖层在强制之前），也动不了冻住的结果。
 - **属性打开条件**：见下节。
 - **互斥组**：见下节。
 - **比例放量**：`sha256("{flag}:{identity}") % 100 < percent` 则开，未命中则关。
@@ -19,6 +20,44 @@
   同一身份对同一开关永远落在同一侧，与进程、机器、重启无关；
   调高比例只会**新增**命中者，已命中者不会掉出。
 - **默认值**：仅当放量比例为 0 时兜底。
+
+## 结果冻结（freeze）
+
+管理端可以把**某个人对某个开关「此刻」的结果**冻住。冻住时系统先按当时的全部
+规则（依赖、单人强制、不带属性口径的属性条件、互斥组、放量、默认值）完整求一次
+值，把得到的开/关存下来：
+
+```bash
+# 把 u123 此刻对 new-checkout 的结果冻住（先求后冻，返回冻住的值与当时理由）
+curl -X PUT http://localhost:8000/api/flags/new-checkout/freezes \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "Content-Type: application/json" \
+  -d '{"identity": "u123"}'
+# => {"ok":true,"changed":true,"enabled":true,"reason":"rollout"}
+
+# 解冻
+curl -X DELETE http://localhost:8000/api/flags/new-checkout/freezes \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" -d '{"identity": "u123"}'
+```
+
+- **冻住后雷打不动**：此后该人来问（单查、整包、带不带属性），只要本开关没被
+  全关压着，一律给冻住的那个结果（`reason=freeze`）。改默认值、放量比例、属性
+  条件、依赖关系、给此人加单人强制、改互斥组——都不动它；被别的开关依赖时，
+  依赖者看到的也是这个冻住的结果。没冻的人不受影响，照改后的规则算。
+- **全关仍压过冻住**：本开关一键全关期间，冻住的人也是一律关
+  （`reason=kill_switch`）；解除全关后自动回到冻住的值。
+- **解冻即按当时规则**：解冻没有任何残留，下一次来问立刻按解冻当时的配置求值。
+- **冻/解冻让整包换新版本**：该身份拿过的整包（不含属性的包与各身属性包）全部
+  序号 +1、换新版本，拿着冻/解冻前那包来问得到 `valid=false`，失效记录里记的新
+  版本与本人再来拿时拿到的一字不差。冻住期间改默认值/放量/条件/依赖/强制，此人
+  这些结果没变，他的包版本一字不变；但全关仍会让包换版本。
+- **重复冻 = 按此刻规则重新冻**：同一个人再冻一次，若此刻结果（假设现在解冻会
+  算出的值）与已冻住的相同，则什么都不变（`changed=false`，不产生失效）；不同则
+  以新结果为准。
+- **只对人不对属性**：冻住只认 identity，与来问时带不带 `attrs`、带什么属性无关；
+  冻住那一刻按不带属性的口径求值。
+- 删除开关时它的冻结记录一并删除；`GET /api/flags/<name>/freezes` 可查看该开关
+  冻住了哪些人。
 
 ## 开关依赖（depends_on）
 
@@ -237,7 +276,7 @@ docker run -d -p 8000:8000 -e ADMIN_TOKEN=你的强随机串 \
 ```bash
 GET '/api/flags/<name>/check?identity=<用户身份>[&attrs=<URL编码的JSON属性>]'
 # => {"flag":"new-checkout","identity":"u123","enabled":true,"reason":"rollout"}
-#    reason ∈ kill_switch | depends_on | override | targeting | group | rollout | default，表示结果由哪一层决定
+#    reason ∈ kill_switch | freeze | depends_on | override | targeting | group | rollout | default，表示结果由哪一层决定
 #    identity / attrs 需 URL 编码；identity 允许包含斜杠、空格、引号等任意字符
 #    attrs 必须是扁平 JSON 对象，值为标量（字符串/数字/布尔/null）；非法返回 400
 
@@ -258,6 +297,9 @@ GET '/api/bundle?identity=<用户身份>[&attrs=<URL编码的JSON属性>][&versi
 | GET | `/api/flags/<name>/overrides` | 列出单人强制 |
 | PUT | `/api/flags/<name>/overrides` | 设置 `{identity, enabled}` |
 | DELETE | `/api/flags/<name>/overrides` | 移除，body `{identity}` |
+| GET | `/api/flags/<name>/freezes` | 列出被冻住结果的人（冻住的值、冻住时的理由、操作人） |
+| PUT | `/api/flags/<name>/freezes` | 冻住某人此刻的结果，body `{identity}`；返回 `{changed, enabled, reason}`（重复冻且值未变则 `changed=false`） |
+| DELETE | `/api/flags/<name>/freezes` | 解冻，body `{identity}`；解冻后立即按当时规则求值 |
 | GET | `/api/groups` | 列出互斥组（含成员开关、`updated_by` 最近修改人） |
 | POST | `/api/groups` | 新建组 `{name, description}` |
 | DELETE | `/api/groups/<name>` | 解散组（落定记录一并清除） |

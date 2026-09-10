@@ -65,7 +65,7 @@
   <h1>🚩 特性开关管理</h1>
   <input id="token" type="password" placeholder="管理 Token">
   <input id="actor" type="text" placeholder="操作人（记入审计）">
-  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 开关依赖 &gt; 单人强制 &gt; 属性条件 &gt; 互斥组 &gt; 比例放量 &gt; 默认值</span>
+  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 结果冻结 &gt; 开关依赖 &gt; 单人强制 &gt; 属性条件 &gt; 互斥组 &gt; 比例放量 &gt; 默认值</span>
 </header>
 
 <main>
@@ -206,6 +206,7 @@ async function loadFlags() {
     badges.push(f.default_enabled
       ? '<span class="badge on">默认开</span>' : '<span class="badge">默认关</span>');
     if (f.override_count) badges.push(`<span class="badge">${f.override_count} 人强制</span>`);
+    if (f.freeze_count) badges.push(`<span class="badge on">🧊 ${f.freeze_count} 人冻住</span>`);
     if (f.group) badges.push(`<span class="badge roll">组:${esc(f.group)}</span>`);
     if (f.scheduled_changes && f.scheduled_changes.length)
       badges.push(`<span class="badge roll">⏰ ${f.scheduled_changes.length} 项定时</span>`);
@@ -232,19 +233,29 @@ async function renderDetail() {
     <div class="muted" style="margin-bottom:12px">${esc(f.description || '（无描述）')}</div>
 
     ${f.group ? `<div class="layer">
-      <h3>互斥组 <span class="prio">同一人组内最多一个开，先开者恒定；优先级低于全关与单人强制</span></h3>
+      <h3>互斥组 <span class="prio">同一人组内最多一个开，先开者恒定；优先级低于全关、冻结与单人强制</span></h3>
       本开关属于 <b>${esc(f.group)}</b>，组内成员：${esc((groups.find(g => g.name === f.group) || {flags:[]}).flags.join('、') || '—')}
     </div>` : ''}
 
     <div class="layer kill">
-      <h3>① 全关 <span class="prio">最高优先级：打开后所有人均为关</span></h3>
+      <h3>① 全关 <span class="prio">最高优先级：打开后所有人均为关，冻住的人也不例外</span></h3>
       <button class="${f.kill_switch ? '' : 'danger'}" onclick="toggleKill()">
         ${f.kill_switch ? '解除全关' : '⛔ 一键全关'}</button>
       ${f.kill_switch ? '<span class="badge off" style="margin-left:8px">当前处于全关状态</span>' : ''}
     </div>
 
     <div class="layer">
-      <h3>② 开关依赖 <span class="prio">来问时先用同一个身份、同一身属性问被依赖的开关：它是关，本开关一律关（强制开也救不回）；它是开才继续往下算。依赖可成链，不能成环</span></h3>
+      <h3>② 结果冻结 <span class="prio">把某人此刻的结果冻住：之后改默认值、放量、属性条件、依赖、单人强制，此人都还是冻住的那个（全关仍压过）；解冻后按当时规则</span></h3>
+      <div class="row">
+        <input id="fzIdentity" type="text" placeholder="身份 identity" style="max-width:220px">
+        <button class="primary" onclick="freezeResult()">冻住此人此刻结果</button>
+      </div>
+      <table><thead><tr><th>身份</th><th>冻住为</th><th>冻住时的理由</th><th></th></tr></thead>
+        <tbody id="fzBody"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody></table>
+    </div>
+
+    <div class="layer">
+      <h3>③ 开关依赖 <span class="prio">来问时先用同一个身份、同一身属性问被依赖的开关：它是关，本开关一律关（强制开也救不回）；它是开才继续往下算。依赖可成链，不能成环</span></h3>
       <div class="row">
         <select id="depSelect" style="min-width:220px">${depOptions(f)}</select>
         <button class="primary" onclick="saveDependency()">保存依赖</button>
@@ -255,7 +266,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>③ 单人强制 <span class="prio">对指定身份强制开/关，覆盖属性条件、放量与默认值；但救不回「被依赖开关是关」</span></h3>
+      <h3>④ 单人强制 <span class="prio">对指定身份强制开/关，覆盖属性条件、放量与默认值；但救不回「被依赖开关是关」，也动不了冻住的结果</span></h3>
       <div class="row">
         <input id="ovIdentity" type="text" placeholder="身份 identity" style="max-width:220px">
         <button onclick="setOverride(true)">强制开</button>
@@ -266,7 +277,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>④ 属性打开条件 <span class="prio">来问带上的属性全对上则开；对不上、没带属性都按下面的放量/默认值算。命中算自然为开，仍过互斥组裁决</span></h3>
+      <h3>⑤ 属性打开条件 <span class="prio">来问带上的属性全对上则开；对不上、没带属性都按下面的放量/默认值算。命中算自然为开，仍过互斥组裁决</span></h3>
       <div class="row">
         <input id="tgtRule" type="text" style="flex:1"
           placeholder='JSON 条件，如 {"plan":"pro","level":[3,5]}；多键 AND，值给列表是任一；清空填 {}'
@@ -278,7 +289,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>⑤ 比例放量 <span class="prio">属性对不上时才看这里：比例 &gt; 0 时此层定论，命中开、未命中关；同一身份结果恒定</span></h3>
+      <h3>⑥ 比例放量 <span class="prio">属性对不上时才看这里：比例 &gt; 0 时此层定论，命中开、未命中关；同一身份结果恒定</span></h3>
       <div class="row">
         <input type="range" min="0" max="100" value="${f.rollout_percent}"
                oninput="$('pctLabel').textContent=this.value+'%'"
@@ -288,13 +299,13 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>⑥ 默认值 <span class="prio">属性对不上且放量比例为 0 时兜底</span></h3>
+      <h3>⑦ 默认值 <span class="prio">属性对不上且放量比例为 0 时兜底</span></h3>
       <label><input type="checkbox" ${f.default_enabled ? 'checked' : ''}
         onchange="setDefault(this.checked)"> 默认开</label>
     </div>
 
     <div class="layer">
-      <h3>⑦ 发布稿 <span class="prio">把本开关下面这些字段的改动收进选中的稿；稿不发布就不生效，发布时整稿一起生效（成环会整稿拒绝）</span></h3>
+      <h3>⑧ 发布稿 <span class="prio">把本开关下面这些字段的改动收进选中的稿；稿不发布就不生效，发布时整稿一起生效（成环会整稿拒绝）</span></h3>
       <div class="row">
         <select id="draftSelect" style="min-width:220px"></select>
       </div>
@@ -315,6 +326,7 @@ async function renderDetail() {
       <div id="scheduledList">${renderScheduled(f)}</div>
     </div>`;
   loadOverrides();
+  loadFreezes();
   populateDraftSelect();
 }
 
@@ -470,6 +482,58 @@ async function removeOverride(identity) {
   toast('已移除'); loadAll();
 }
 
+// ---------------------------------------------------------------- 结果冻结
+
+const REASON_NAMES = { kill_switch: '全关', freeze: '结果冻结', depends_on: '开关依赖',
+                       override: '单人强制', targeting: '属性条件',
+                       group: '互斥组', rollout: '比例放量', default: '默认值' };
+
+async function loadFreezes() {
+  const body = $('fzBody');
+  if (!body) return;
+  const list = await api(`/api/flags/${encodeURIComponent(selected)}/freezes`);
+  body.innerHTML = list.length ? '' : '<tr><td colspan="4" class="muted">无</td></tr>';
+  for (const z of list) {
+    const tr = document.createElement('tr');
+    const tdId = document.createElement('td');
+    tdId.textContent = z.identity;
+    const tdState = document.createElement('td');
+    tdState.innerHTML = z.enabled
+      ? '<span class="badge on">开</span>' : '<span class="badge off">关</span>';
+    const tdReason = document.createElement('td');
+    tdReason.className = 'muted';
+    tdReason.textContent = (REASON_NAMES[z.frozen_reason] || z.frozen_reason)
+      + (z.created_by ? `（${z.created_by} 冻的）` : '');
+    const tdBtn = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.textContent = '解冻';
+    btn.addEventListener('click', () => unfreezeResult(z.identity));
+    tdBtn.appendChild(btn);
+    tr.append(tdId, tdState, tdReason, tdBtn);
+    body.appendChild(tr);
+  }
+}
+
+async function freezeResult() {
+  const id = $('fzIdentity').value;  // 不 trim：首尾空格也是身份的一部分
+  if (!id) return toast('请填写身份', true);
+  try {
+    const r = await api(`/api/flags/${encodeURIComponent(selected)}/freezes`,
+      { method: 'PUT', body: JSON.stringify({ identity: id }) });
+    $('fzIdentity').value = '';
+    toast(r.changed
+      ? `已冻住此刻结果：${r.enabled ? '开' : '关'}（${REASON_NAMES[r.reason] || r.reason}）`
+      : '已经冻着同一个结果，未改动');
+  } catch (e) { return toast('冻结失败：' + e.message, true); }
+  loadAll();
+}
+
+async function unfreezeResult(identity) {
+  await api(`/api/flags/${encodeURIComponent(selected)}/freezes`,
+            { method: 'DELETE', body: JSON.stringify({ identity }) });
+  toast('已解冻，之后按当时规则算'); loadAll();
+}
+
 function readAttrs() {
   const raw = $('checkAttrs').value.trim();
   if (!raw) return '';
@@ -488,12 +552,9 @@ async function checkIdentity() {
   const url = `/api/flags/${encodeURIComponent(selected)}/check?identity=${encodeURIComponent(id)}`
     + (aq ? `&attrs=${aq}` : '');
   const r = await fetch(url).then(r => r.json());
-  const layerNames = { kill_switch: '全关', depends_on: '开关依赖',
-                       override: '单人强制', targeting: '属性条件',
-                       group: '互斥组', rollout: '比例放量', default: '默认值' };
   $('checkResult').innerHTML = r.error ? esc(r.error)
     : `结果：<b style="color:${r.enabled ? 'var(--ok)' : 'var(--danger)'}">${r.enabled ? '开' : '关'}</b>
-       <span class="muted">（由「${layerNames[r.reason] || r.reason}」层决定）</span>`;
+       <span class="muted">（由「${REASON_NAMES[r.reason] || r.reason}」层决定）</span>`;
 }
 
 // ---------------------------------------------------------------- 整包
