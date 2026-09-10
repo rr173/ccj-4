@@ -412,6 +412,7 @@ def close_db(_exc):
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     # 老库迁移：bundles 增加 content_hash / generation（旧行下次来拿时按新规则重算）
     cols = {r[1] for r in conn.execute("PRAGMA table_info(bundles)")}
@@ -947,8 +948,9 @@ _FLAG_DEFAULT = {"default_enabled": False, "rollout_percent": 0,
 def _normalize_replay_patch(changes):
     """把预约 / 发布稿里存的字段值归一成重放用的覆盖 patch。
 
-    targeting / config 存的是 canonical 串（与 flags 列同口径，''=清除）；
-    布尔与比例还原成重放状态里的类型；depends_on 是名字串（''=解除）。
+    发布稿存的是 canonical 串（与 flags 列同口径，''=清除）；预约存的是
+    原始 JSON 值（dict / None，与到点时走 apply_flag_fields 的口径一致），
+    这里两种都归一成库里的串形态。depends_on 是名字串（''=解除）。
     """
     patch = {}
     if "kill_switch" in changes:
@@ -958,15 +960,17 @@ def _normalize_replay_patch(changes):
     if "rollout_percent" in changes:
         patch["rollout_percent"] = int(changes["rollout_percent"])
     if "targeting" in changes:
-        patch["targeting"] = changes["targeting"] if changes["targeting"] else ""
+        v = changes["targeting"]
+        patch["targeting"] = v if isinstance(v, str) else validate_targeting(v)
     if "config" in changes:
-        patch["config"] = changes["config"] if changes["config"] else ""
+        v = changes["config"]
+        patch["config"] = v if isinstance(v, str) else validate_config(v)
     if "depends_on" in changes:
         patch["depends_on"] = changes["depends_on"] or ""
     return patch
 
 
-def replay_state(db, identity, at):
+def replay_state(db, identity, at, attrs=None):
     """重放身份 identity 在时刻 at 的完整求值状态（纯函数，不写库）。
 
     数据源：
@@ -1026,7 +1030,13 @@ def replay_state(db, identity, at):
             if name not in flags:
                 # 开关当时还没建（或已删）：这条预约/稿对那一刻不生效
                 continue
-            flags[name].update(_normalize_replay_patch(changes))
+            patch = _normalize_replay_patch(changes)
+            dep = patch.get("depends_on")
+            if dep and dep not in flags:
+                # 到点应用时被依赖开关已删除：线上写不出这条边（按解除处理）；
+                # 发布稿在目标缺失时整稿拒绝，但这里只兜已发布稿的极端情形
+                patch["depends_on"] = ""
+            flags[name].update(patch)
             continue
 
         ev_kind, subject, ev_identity, payload = body
@@ -1041,6 +1051,10 @@ def replay_state(db, identity, at):
             flags.pop(subject, None)
             overrides.pop((subject, identity), None)
             frozen.pop((subject, identity), None)
+            # 与线上删除路径一致：别人指向它的依赖边自动解除
+            for other in flags.values():
+                if other["depends_on"] == subject:
+                    other["depends_on"] = ""
             for gname, members in list(groups.items()):
                 members.discard(subject)
                 if assignments.get(gname) == subject:
@@ -1104,13 +1118,12 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
         return ret(fz["enabled"], "freeze", fz["config"])
 
     dep = flag["depends_on"]
-    if dep:
+    if dep and dep in state["flags"]:
         if _chain is not None and dep in _chain:
             raise RuntimeError(f"dependency cycle through {dep}")
-        dep_enabled = False
         if _memo is not None and dep in _memo:
             dep_enabled = _memo[dep]
-        elif dep in state["flags"]:
+        else:
             next_chain = {name} if _chain is None else _chain | {name}
             dep_enabled, _, _ = evaluate_at(state, dep, identity, attrs,
                                             _memo, next_chain)
@@ -1118,6 +1131,7 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
             if _memo is not None:
                 _memo[name] = False
             return ret(False, "depends_on")
+    # dep 指向当时不存在的开关：删除路径已把边清掉，这里兜底按无依赖继续
 
     if (name, identity) in state["overrides"]:
         enabled = state["overrides"][(name, identity)]
@@ -1139,7 +1153,14 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
             _memo[name] = natural
         return ret(natural, reason, flag["config"])
 
-    won = state["assignments"].get(group_name) == name
+    # 组裁决复刻线上「先到先得、只落定一次」：这一刻已落定过（真实查询写过
+    # 落定记录）就按落定算；没落定过则模拟 INSERT OR IGNORE——本次名字序求值
+    # 链上首个自然开的组内开关落定。与 evaluate 的写库版唯一区别是不写库。
+    winner = state["assignments"].get(group_name)
+    if winner is None:
+        state["assignments"][group_name] = name
+        winner = name
+    won = winner == name
     if _memo is not None:
         _memo[name] = won
     return ret(won, "group", flag["config"])
@@ -1147,7 +1168,7 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
 
 def compute_history_bundle(db, identity, at, attrs=None):
     """求该身份在时刻 at 所有「当时存在」的开关结果（按名字序，与线上整包同口径）。"""
-    state = replay_state(db, identity, at)
+    state = replay_state(db, identity, at, attrs)
     results = {}
     memo = {}
     for name in sorted(state["flags"]):
@@ -1546,8 +1567,10 @@ def schedule_flag_change(db, flag, body, effective_at):
             return jsonify({"error": str(e)}), 400
     if "config" in payload:
         try:
-            # 预约表里存规范化后的串，到点应用时不再产生歧义
-            payload["config"] = json.loads(validate_config(payload["config"]))
+            # 预约表里存规范化后的值：None 表示清除（与立即生效 PATCH 同口径），
+            # 到点应用时 apply_flag_fields 再走同一套写入
+            payload["config"] = (json.loads(validate_config(payload["config"]))
+                                 if payload["config"] is not None else None)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
     if "depends_on" in payload:
