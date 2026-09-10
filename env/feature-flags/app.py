@@ -24,6 +24,13 @@
 已发出的整包落库，管理端每次变更后用与调用方来拿时完全相同的求值重算
 各整包，内容变了的身份记入 bundle_invalidations——记下的新版本与本人
 再来拿时拿到的是同一个。管理端可看到「谁改了什么、让哪些人的整包失效了」。
+
+定时生效（scheduled change）：管理端改开关配置时可带 effective_at 约一个
+未来时刻。到点之前，求值、整包结果与整包版本都按原样（定时变更只躺在
+scheduled_changes 表里，不参与求值）；到点之后，第一个进来的请求把变更
+写到开关上（惰性应用，无需后台线程），此后按新规则求值、整包换新版本，
+到点前发出的整包版本随之过期。不带 effective_at 的改动仍然改完即生效。
+已约未生效的变更可取消；同一开关可约多个，到点按生效时间先后应用。
 """
 
 import hashlib
@@ -109,6 +116,19 @@ CREATE TABLE IF NOT EXISTS bundle_invalidations (
     old_version TEXT NOT NULL,
     new_version TEXT NOT NULL,
     created_at  REAL NOT NULL
+);
+-- 定时生效的配置变更：到点前不参与求值、不影响整包版本；
+-- 到点后由下一个进来的请求惰性应用（见 apply_due_scheduled_changes）
+CREATE TABLE IF NOT EXISTS scheduled_changes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    flag_id      INTEGER NOT NULL,          -- 目标开关；删除开关时未生效的预约一并取消
+    flag_name    TEXT NOT NULL,             -- 冗余存一份名字，开关删了记录仍可读
+    changes      TEXT NOT NULL,             -- JSON：到点要写入的字段与值
+    effective_at REAL NOT NULL,             -- 生效时刻（unix 秒）
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending/applied/cancelled/failed
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   REAL NOT NULL,
+    applied_at   REAL
 );
 """
 
@@ -434,6 +454,11 @@ def list_flags():
             " JOIN mutex_groups g ON g.id = m.group_id"
         )
     }
+    pending = {}
+    for r in db.execute(
+            "SELECT * FROM scheduled_changes WHERE status='pending'"
+            " ORDER BY effective_at, id"):
+        pending.setdefault(r["flag_id"], []).append(scheduled_to_dict(r))
     result = []
     for row in rows:
         item = flag_to_dict(row)
@@ -441,6 +466,7 @@ def list_flags():
             "SELECT COUNT(*) c FROM overrides WHERE flag_id=?", (row["id"],)
         ).fetchone()["c"]
         item["group"] = groups.get(row["id"])
+        item["scheduled_changes"] = pending.get(row["id"], [])
         result.append(item)
     return jsonify(result)
 
@@ -471,14 +497,17 @@ def create_flag():
     return jsonify({"ok": True}), 201
 
 
-@app.patch("/api/flags/<name>")
-@require_admin
-def update_flag(name):
-    db = get_db()
-    flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
-    if flag is None:
-        return jsonify({"error": "flag not found"}), 404
-    body = request.get_json(force=True)
+# 可预约定时生效的开关字段（与 PATCH 立即生效支持的字段一致）
+SCHEDULABLE_FIELDS = ("kill_switch", "default_enabled", "rollout_percent", "description")
+
+
+def apply_flag_fields(db, flag, body):
+    """把 kill_switch / default_enabled / rollout_percent / description 写到开关上。
+
+    立即生效与定时生效到点应用共用这一段。返回 (changes, error)：
+    changes 是 (layer, action, detail) 列表（值没变的字段不在列）；
+    error 非空表示校验失败，调用方不应提交事务。
+    """
     changes = []
 
     if "kill_switch" in body:
@@ -498,7 +527,7 @@ def update_flag(name):
     if "rollout_percent" in body:
         new = body["rollout_percent"]
         if not isinstance(new, int) or not 0 <= new <= 100:
-            return jsonify({"error": "rollout_percent must be an int in [0,100]"}), 400
+            return None, "rollout_percent must be an int in [0,100]"
         if new != flag["rollout_percent"]:
             db.execute("UPDATE flags SET rollout_percent=?, updated_at=? WHERE id=?",
                        (new, time.time(), flag["id"]))
@@ -507,7 +536,114 @@ def update_flag(name):
     if "description" in body:
         db.execute("UPDATE flags SET description=?, updated_at=? WHERE id=?",
                    (body["description"], time.time(), flag["id"]))
+    return changes, None
 
+
+def schedule_flag_change(db, flag, body, effective_at):
+    """把一次开关配置变更约到 effective_at 生效：校验后落库，到点前不影响
+    求值与整包版本，由 apply_due_scheduled_changes 到点应用。"""
+    if isinstance(effective_at, bool) or not isinstance(effective_at, (int, float)):
+        return jsonify({"error": "effective_at must be a unix timestamp in seconds"}), 400
+    if effective_at <= time.time():
+        return jsonify({"error": "effective_at must be in the future"
+                                 " (omit it to apply immediately)"}), 400
+    payload = {k: body[k] for k in SCHEDULABLE_FIELDS if k in body}
+    if not payload:
+        return jsonify({"error": "nothing to schedule"
+                                 " (no kill_switch/default_enabled/rollout_percent"
+                                 "/description given)"}), 400
+    # 与立即生效同一套校验，避免约了一个到点应用不了的值
+    if "rollout_percent" in payload:
+        v = payload["rollout_percent"]
+        if not isinstance(v, int) or not 0 <= v <= 100:
+            return jsonify({"error": "rollout_percent must be an int in [0,100]"}), 400
+    cur = db.execute(
+        "INSERT INTO scheduled_changes"
+        " (flag_id, flag_name, changes, effective_at, created_by, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (flag["id"], flag["name"], json.dumps(payload, ensure_ascii=False),
+         effective_at, actor(), time.time()))
+    audit(actor(), flag["name"], "schedule", "schedule_change",
+          f"effective_at={effective_at}"
+          f" changes={json.dumps(payload, ensure_ascii=False)}")
+    db.commit()
+    return jsonify({"ok": True, "scheduled": True,
+                    "change_id": cur.lastrowid, "effective_at": effective_at}), 202
+
+
+def apply_due_scheduled_changes():
+    """应用所有已到点的定时变更（惰性：随任意请求触发，无需后台线程）。
+
+    到点前：定时变更只在 scheduled_changes 表里，不参与求值，整包版本不变。
+    到点后：第一个进来的请求把变更写到开关上，并像管理端手动改动一样重算
+    已发整包、记失效——此后调用方按新规则求值、整包换新版本，到点前发出
+    的旧版本随之过期。操作人记预约时的人，而不是触发这次应用的请求方。
+    """
+    db = get_db()
+    now = time.time()
+    rows = db.execute(
+        "SELECT * FROM scheduled_changes"
+        " WHERE status='pending' AND effective_at<=? ORDER BY effective_at, id",
+        (now,),
+    ).fetchall()
+    for r in rows:
+        # 先抢占再应用：并发请求下只有一个请求会真正执行这次变更
+        cur = db.execute(
+            "UPDATE scheduled_changes SET status='applied', applied_at=?"
+            " WHERE id=? AND status='pending'",
+            (now, r["id"]))
+        if cur.rowcount == 0:
+            continue
+        flag = db.execute("SELECT * FROM flags WHERE id=?", (r["flag_id"],)).fetchone()
+        if flag is None:  # 开关已删（正常路径下删除时会取消预约，这里兜底）
+            db.execute("UPDATE scheduled_changes SET status='failed' WHERE id=?",
+                       (r["id"],))
+            audit(r["created_by"], r["flag_name"], "schedule",
+                  "scheduled_change_failed", "flag no longer exists")
+            db.commit()
+            continue
+        changes, err = apply_flag_fields(db, flag, json.loads(r["changes"]))
+        if err is not None:  # 落库前已校验，理论不可达；防御性处理
+            db.execute("UPDATE scheduled_changes SET status='failed' WHERE id=?",
+                       (r["id"],))
+            audit(r["created_by"], r["flag_name"], "schedule",
+                  "scheduled_change_failed", err)
+            db.commit()
+            continue
+        for layer, action, detail in changes:
+            audit(r["created_by"], r["flag_name"], layer, action,
+                  detail + "（定时生效）")
+        audit(r["created_by"], r["flag_name"], "schedule", "apply_scheduled",
+              f"change_id={r['id']} effective_at={r['effective_at']}")
+        db.commit()
+        desc = f"scheduled_change {r['flag_name']}"
+        if changes:
+            desc += ": " + ", ".join(d for _, _, d in changes)
+        record_invalidations(db, r["created_by"], desc)
+
+
+@app.before_request
+def _apply_due_scheduled_changes():
+    apply_due_scheduled_changes()
+
+
+@app.patch("/api/flags/<name>")
+@require_admin
+def update_flag(name):
+    db = get_db()
+    flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
+    if flag is None:
+        return jsonify({"error": "flag not found"}), 404
+    body = request.get_json(force=True)
+
+    # 约了生效时间：落库为定时变更，到点前求值与整包版本都不变
+    effective_at = body.get("effective_at")
+    if effective_at is not None:
+        return schedule_flag_change(db, flag, body, effective_at)
+
+    changes, err = apply_flag_fields(db, flag, body)
+    if err is not None:
+        return jsonify({"error": err}), 400
     for layer, action, detail in changes:
         audit(actor(), name, layer, action, detail)
     db.commit()
@@ -522,9 +658,13 @@ def update_flag(name):
 @require_admin
 def delete_flag(name):
     db = get_db()
-    cur = db.execute("DELETE FROM flags WHERE name=?", (name,))
-    if cur.rowcount == 0:
+    flag = db.execute("SELECT id FROM flags WHERE name=?", (name,)).fetchone()
+    if flag is None:
         return jsonify({"error": "flag not found"}), 404
+    db.execute("DELETE FROM flags WHERE id=?", (flag["id"],))
+    # 还没到点的定时变更随开关一起取消
+    db.execute("UPDATE scheduled_changes SET status='cancelled'"
+               " WHERE flag_id=? AND status='pending'", (flag["id"],))
     audit(actor(), name, "default", "delete_flag")
     db.commit()
     record_invalidations(db, actor(), f"delete_flag {name}")
@@ -596,6 +736,50 @@ def delete_override(name):
     db.commit()
     record_invalidations(db, actor(),
                          f"remove_override {name} identity={identity}")
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- scheduled changes
+
+def scheduled_to_dict(r):
+    return {
+        "id": r["id"],
+        "flag": r["flag_name"],
+        "changes": json.loads(r["changes"]),
+        "effective_at": r["effective_at"],
+        "created_by": r["created_by"],
+        "created_at": r["created_at"],
+    }
+
+
+@app.get("/api/scheduled-changes")
+@require_admin
+def list_scheduled_changes():
+    """管理端：所有还没到点的定时变更（已生效/已取消的进审计日志）。"""
+    rows = get_db().execute(
+        "SELECT * FROM scheduled_changes WHERE status='pending'"
+        " ORDER BY effective_at, id"
+    ).fetchall()
+    return jsonify([scheduled_to_dict(r) for r in rows])
+
+
+@app.delete("/api/scheduled-changes/<int:change_id>")
+@require_admin
+def cancel_scheduled_change(change_id):
+    """管理端：取消一个还没到点的定时变更；取消后到点也不会生效。"""
+    db = get_db()
+    r = db.execute(
+        "SELECT * FROM scheduled_changes WHERE id=?", (change_id,),
+    ).fetchone()
+    if r is None:
+        return jsonify({"error": "scheduled change not found"}), 404
+    if r["status"] != "pending":
+        return jsonify({"error": f"cannot cancel a change that is {r['status']}"}), 409
+    db.execute("UPDATE scheduled_changes SET status='cancelled' WHERE id=?",
+               (change_id,))
+    audit(actor(), r["flag_name"], "schedule", "cancel_scheduled",
+          f"change_id={change_id} changes={r['changes']}")
+    db.commit()
     return jsonify({"ok": True})
 
 

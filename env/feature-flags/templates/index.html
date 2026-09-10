@@ -191,6 +191,8 @@ async function loadFlags() {
       ? '<span class="badge on">默认开</span>' : '<span class="badge">默认关</span>');
     if (f.override_count) badges.push(`<span class="badge">${f.override_count} 人强制</span>`);
     if (f.group) badges.push(`<span class="badge roll">组:${esc(f.group)}</span>`);
+    if (f.scheduled_changes && f.scheduled_changes.length)
+      badges.push(`<span class="badge roll">⏰ ${f.scheduled_changes.length} 项定时</span>`);
     div.innerHTML = `<span class="name">${esc(f.name)}</span><span class="badges">${badges.join('')}</span>`;
     div.onclick = () => { selected = f.name; loadFlags(); renderDetail(); };
     el.appendChild(div);
@@ -248,8 +250,42 @@ async function renderDetail() {
       <h3>④ 默认值 <span class="prio">仅当放量比例为 0 时兜底</span></h3>
       <label><input type="checkbox" ${f.default_enabled ? 'checked' : ''}
         onchange="setDefault(this.checked)"> 默认开</label>
+    </div>
+
+    <div class="layer">
+      <h3>⏰ 定时生效 <span class="prio">可选：约个时间再应用；不填时间则改完立即生效。到点前求值与整包版本都不变</span></h3>
+      <div class="row">
+        <input id="scheduleAt" type="datetime-local" step="1" style="max-width:230px">
+        <span class="muted">填了时间后，再点上方「全关 / 放量 / 默认值」的改动会约到该时刻生效</span>
+      </div>
+      <div id="scheduledList">${renderScheduled(f)}</div>
     </div>`;
   loadOverrides();
+}
+
+const FIELD_NAMES = { kill_switch: '全关', default_enabled: '默认开',
+                      rollout_percent: '放量比例', description: '描述' };
+
+function renderScheduled(f) {
+  const list = f.scheduled_changes || [];
+  if (!list.length) return '<span class="muted">没有等待生效的定时变更</span>';
+  return list.map(s => {
+    const what = Object.entries(s.changes)
+      .map(([k, v]) => `${FIELD_NAMES[k] || k} → ${v}`).join('，');
+    return `<div class="row" style="margin-bottom:4px">
+      <span class="badge roll">⏰ ${new Date(s.effective_at * 1000).toLocaleString()} 生效</span>
+      <span>${esc(what)}</span>
+      <span class="muted">由 ${esc(s.created_by || '—')} 预约</span>
+      <button onclick="cancelScheduled(${s.id})">取消</button>
+    </div>`;
+  }).join('');
+}
+
+async function cancelScheduled(id) {
+  try {
+    await api(`/api/scheduled-changes/${id}`, { method: 'DELETE' });
+    toast('已取消，到点也不会生效'); loadAll();
+  } catch (e) { toast('取消失败：' + e.message, true); }
 }
 
 async function loadOverrides() {
@@ -292,8 +328,13 @@ async function deleteFlag() {
 
 async function patch(body) {
   try {
-    await api(`/api/flags/${encodeURIComponent(selected)}`,
+    const t = $('scheduleAt') && $('scheduleAt').value;
+    if (t) body.effective_at = new Date(t).getTime() / 1000;  // 约了时间则定时生效
+    const r = await api(`/api/flags/${encodeURIComponent(selected)}`,
               { method: 'PATCH', body: JSON.stringify(body) });
+    toast(r && r.scheduled
+      ? '已预约，将于 ' + new Date(r.effective_at * 1000).toLocaleString() + ' 生效'
+      : '已生效');
     loadAll();
   } catch (e) { toast('操作失败：' + e.message, true); }
 }

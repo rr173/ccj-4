@@ -69,6 +69,31 @@ GET /api/bundle?identity=<用户身份>&version=<手中的版本>
 
 > 与单开关 `check` 一样，整包查询对组内开关可能写入落定记录（GET 有写副作用）。
 
+## 定时生效（约个时间再生效）
+
+管理端改开关配置（全关 / 默认值 / 放量比例 / 描述）时，可以带一个 `effective_at`
+（unix 秒）把改动约到未来某个时刻生效：
+
+```bash
+# 把放量比例约到 2026-09-12 09:00:00（服务器时间）生效
+curl -X PATCH http://localhost:8000/api/flags/new-checkout \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"rollout_percent": 50, "effective_at": 1789146000}'
+# => 202 {"ok":true,"scheduled":true,"change_id":3,"effective_at":1789146000}
+```
+
+- **到点前一切照旧**：定时变更只躺在预约表里，不参与求值——来问的人还按现在的
+  结果走，整包结果与整包版本都不换。
+- **到点后自动生效**：第一个进来的请求（`check` / `bundle` / 管理端接口均可）
+  把变更写到开关上（惰性应用，无需后台线程）。此后按新规则求值、整包换新版本；
+  拿着到点前那包的版本来问会明确告知已过期（`valid=false`），响应里附带按新
+  规则重算的新包。失效记录与审计里能查到这次生效（操作人记预约时的人）。
+- **不约时间照旧立即生效**：不带 `effective_at` 的改动行为完全不变。
+- **可取消**：还没到点的预约可以随时取消，取消后到点也不会生效；同一开关可约
+  多个变更，到点按生效时间先后应用；删除开关会一并取消它未生效的预约。
+- `effective_at` 必须是将来的时刻；想立即生效就不要带这个字段。
+
 ## 快速开始
 
 ```bash
@@ -105,8 +130,8 @@ GET /api/bundle?identity=<用户身份>[&version=<手中的整包版本>]
 |---|---|---|
 | GET | `/api/flags` | 列出所有开关 |
 | POST | `/api/flags` | 新建 `{name, description, default_enabled}` |
-| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, kill_switch, description}` |
-| DELETE | `/api/flags/<name>` | 删除开关 |
+| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, kill_switch, description}`；带 `effective_at`（unix 秒）则约到该时刻生效 |
+| DELETE | `/api/flags/<name>` | 删除开关（其未生效的定时变更一并取消） |
 | GET | `/api/flags/<name>/overrides` | 列出单人强制 |
 | PUT | `/api/flags/<name>/overrides` | 设置 `{identity, enabled}` |
 | DELETE | `/api/flags/<name>/overrides` | 移除，body `{identity}` |
@@ -119,6 +144,8 @@ GET /api/bundle?identity=<用户身份>[&version=<手中的整包版本>]
 > identity 一律放在 JSON body / 查询参数里，不进 URL 路径，
 > 因此含 `/`、空格、`"`、`'` 等字符的身份都能正常设置、查询、移除。
 | GET | `/api/audit?limit=100` | 最近操作记录（谁、何时、改了哪一层） |
+| GET | `/api/scheduled-changes` | 还没到点的定时变更（开关、改动内容、生效时刻、预约人） |
+| DELETE | `/api/scheduled-changes/<id>` | 取消一个还没到点的定时变更 |
 | GET | `/api/bundles` | 已发出的整包（身份、版本、是否已过期 stale） |
 | GET | `/api/bundles/invalidations?limit=100` | 整包失效记录：谁改了什么、让哪些身份的整包从哪个版本变成哪个版本 |
 
