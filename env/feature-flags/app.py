@@ -2,10 +2,20 @@
 
 求值优先级（固定，不可配置）：
     1. 全关（kill switch）        -> 一律关
-    2. 单人强制（override）        -> 强制开 / 强制关
-    3. 属性打开条件（targeting）   -> 来问带的属性全对上则开；对不上落到下面
-    4. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关
-    5. 默认值（default_enabled）   -> 仅当放量比例为 0（未启用放量）时兜底
+    2. 开关依赖（depends_on）     -> 依赖的开关对此人此身属性不是开，本开关必须关
+    3. 单人强制（override）        -> 强制开 / 强制关
+    4. 属性打开条件（targeting）   -> 来问带的属性全对上则开；对不上落到下面
+    5. 互斥组（group）            -> 组内同一身份最多一个开
+    6. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关
+    7. 默认值（default_enabled）   -> 仅当放量比例为 0（未启用放量）时兜底
+
+开关依赖（depends_on）：管理端可以指定本开关「先看另一个开关」。来问时
+（单查或整包），用同一个身份、同一身属性把被依赖的开关完整求值一遍：
+被依赖的是开，本开关才有机会继续往下算；被依赖的是关，本开关一律判关
+（reason=depends_on）——这一层在单人强制之前，所以对本开关的强制开也救
+不回来，只有本开关的全关能压过它（全关仍然一律关）。依赖可以成链
+（C 依赖 B 依赖 A，A 关则 B、C 都关），但不能互相绕着依赖：自依赖与
+成环在管理端写入时直接拒绝。被依赖开关被删除时，依赖关系自动解除。
 
 属性打开条件：调用方来问时可以带上「这个人身上的属性」（attrs，一个 JSON
 对象，如 {"plan":"pro","level":3}）。管理端给开关定一个条件（targeting，
@@ -16,12 +26,12 @@
 结果为开」，开关若在互斥组内仍要过组规则；全关与单人强制仍然优先于它。
 
 互斥组（mutex group）：管理端可把多个开关编入同一组，一个开关最多进一组。
-对同一身份，组内最多一个开关为开：第 3/4/5 层判开后，若开关在组内，则由
+对同一身份，组内最多一个开关为开：第 4/6/7 层判开后，若开关在组内，则由
 组规则裁决——该身份在组内已落定过别的开关则判关，否则落定为本开关并
 写库；之后身份不变，落定的开关不变（落定只认身份，与本次带没带属性、
-带了什么属性无关）。全关与单人强制优先于组规则
-（强制开不受组内已有人开着的限制，全关仍然全关）；未进组的开关按原
-规则求值，不参与组规则。
+带了什么属性无关）。全关、开关依赖与单人强制优先于组规则
+（强制开不受组内已有人开着的限制，全关仍然全关，依赖关着时强制开也开不了）；
+未进组的开关按原规则求值，不参与组规则。
 
 放量分桶：sha256("{flag_name}:{identity}") % 100，同一身份对同一开关
 永远落在同一侧，与进程、机器、重启无关。
@@ -30,10 +40,11 @@
 结果与整包版本。整包按 (身份, 属性) 分别记账：同一人带不同属性来拿是不同
 的包、各自有版本；不带属性的包不受任何属性条件影响（管理端增改条件时它的
 版本一字不变）。
-版本 = 求值输入摘要（会影响此身份此身属性求值的全部输入）+ 单调递增的内容
-序号：配置不变时同一 (身份, 属性) 反复来拿，结果与版本都不变；管理端改动
-任何会影响此包的一层后，序号 +1，版本必变；配置改回去摘要虽复原，但序号
-不回头，旧版本永远不会再有效。带 version 参数来问可校验手中的包是否过期。
+版本 = 求值输入摘要（会影响此身份此身属性求值的全部输入，含开关之间的
+依赖关系）+ 单调递增的内容序号：配置不变时同一 (身份, 属性) 反复来拿，
+结果与版本都不变；管理端改动任何会影响此包的一层（包括依赖关系）后，
+序号 +1，版本必变；配置改回去摘要虽复原，但序号不回头，旧版本永远不会
+再有效。带 version 参数来问可校验手中的包是否过期。
 已发出的整包落库，管理端每次变更后用与调用方来拿时完全相同的求值重算
 各整包，内容变了的 (身份, 属性) 记入 bundle_invalidations——记下的新版本
 与本人带同一身属性再来拿时拿到的是同一个。管理端可看到「谁改了什么、
@@ -70,6 +81,9 @@ CREATE TABLE IF NOT EXISTS flags (
     rollout_percent INTEGER NOT NULL DEFAULT 0,
     kill_switch     INTEGER NOT NULL DEFAULT 0,
     targeting_rule  TEXT NOT NULL DEFAULT '',  -- 属性打开条件（canonical JSON）；''=未定条件
+    -- 本开关依赖的另一个开关：被依赖者对此人此身属性不是开时，本开关必须关；
+    -- NULL=无依赖。被依赖开关删除时自动置空（ON DELETE SET NULL）
+    depends_on_flag_id INTEGER REFERENCES flags(id) ON DELETE SET NULL,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
@@ -152,7 +166,8 @@ CREATE TABLE IF NOT EXISTS scheduled_changes (
 );
 """
 
-LAYERS = ("kill_switch", "override", "targeting", "group", "rollout", "default")
+LAYERS = ("kill_switch", "depends_on", "override", "targeting", "group",
+          "rollout", "default")
 
 
 # ---------------------------------------------------------------- attrs / targeting
@@ -278,6 +293,10 @@ def init_db():
     flag_cols = {r[1] for r in conn.execute("PRAGMA table_info(flags)")}
     if "targeting_rule" not in flag_cols:
         conn.execute("ALTER TABLE flags ADD COLUMN targeting_rule TEXT NOT NULL DEFAULT ''")
+    # 开关依赖：flags 增加 depends_on_flag_id（老库一律从无依赖起步；
+    # 不能在 ALTER 上加外键，但删除路径里同样会把指向已删开关的依赖置空）
+    if "depends_on_flag_id" not in flag_cols:
+        conn.execute("ALTER TABLE flags ADD COLUMN depends_on_flag_id INTEGER")
     # 整包按 (身份, 属性) 分别记账：把旧的「身份主键」整包表重建为复合主键，
     # 已发的老包原样保留（它们是不带属性的包，attrs_hash=''）
     pk = conn.execute("PRAGMA table_info(bundles)").fetchall()
@@ -312,7 +331,7 @@ def audit(actor, flag_name, layer, action, detail=""):
     )
 
 
-def flag_to_dict(row):
+def flag_to_dict(row, dep_name=None):
     return {
         "name": row["name"],
         "description": row["description"],
@@ -320,6 +339,7 @@ def flag_to_dict(row):
         "rollout_percent": row["rollout_percent"],
         "kill_switch": bool(row["kill_switch"]),
         "targeting": json.loads(row["targeting_rule"]) if row["targeting_rule"] else {},
+        "depends_on": dep_name if dep_name is not None else "",
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -341,21 +361,54 @@ def group_of(db, flag_id):
     return row["group_id"] if row else None
 
 
-def evaluate(db, flag, identity, attrs=None):
+def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None):
     """按固定优先级求值，返回 (enabled, reason)。
 
     attrs 为来问时带的属性（dict）。属性条件命中时这一层直接定论为开；
     对不上 / 没带属性 / 开关没定条件，都按原来的放量 / 默认值算。
+
+    开关依赖在全关之后、单人强制之前：用同一身份同一身属性把被依赖的
+    开关完整求值一遍，被依赖的不开，本开关一律关（reason=depends_on）。
+    依赖链上的结果在单次求值内备忘，保证链上每个开关只算一次、结果一致；
+    成环在管理端写入时已拒绝，运行时再兜一层防环。
     """
     if flag["kill_switch"]:
         return False, "kill_switch"
+
+    # 开关依赖：被依赖的开关对此人此身属性不是开，则必须关。
+    # 对本开关的强制开排在依赖之后，救不回依赖关着的情形。
+    dep_id = flag["depends_on_flag_id"]
+    if dep_id is not None:
+        if _chain is not None and dep_id in _chain:
+            # 防御性兜底：环依赖写入时已拒绝，理论不可达
+            raise RuntimeError(f"dependency cycle through flag id {dep_id}")
+        dep_flag = db.execute("SELECT * FROM flags WHERE id=?", (dep_id,)).fetchone()
+        if dep_flag is None:
+            # 被依赖开关已删除（正常路径下外键会把这里置空，这里兜底）
+            db.execute("UPDATE flags SET depends_on_flag_id=NULL WHERE id=?",
+                       (flag["id"],))
+        else:
+            dep_enabled = False
+            if _memo is not None and dep_id in _memo:
+                dep_enabled = _memo[dep_id]
+            else:
+                next_chain = {flag["id"]} if _chain is None else _chain | {flag["id"]}
+                dep_enabled, _ = evaluate(db, dep_flag, identity, attrs,
+                                          _memo, next_chain)
+            if not dep_enabled:
+                if _memo is not None:
+                    _memo[flag["id"]] = False
+                return False, "depends_on"
 
     override = db.execute(
         "SELECT enabled FROM overrides WHERE flag_id=? AND identity=?",
         (flag["id"], identity),
     ).fetchone()
     if override is not None:
-        return bool(override["enabled"]), "override"
+        result = (bool(override["enabled"]), "override")
+        if _memo is not None:
+            _memo[flag["id"]] = result[0]
+        return result
 
     # 属性打开条件：来问属性全对上则开，且不落到放量 / 默认值
     if targeting_matches(flag["targeting_rule"], attrs):
@@ -371,6 +424,8 @@ def evaluate(db, flag, identity, attrs=None):
 
     group_id = group_of(db, flag["id"])
     if group_id is None or not natural:
+        if _memo is not None:
+            _memo[flag["id"]] = natural
         return natural, reason
 
     # 互斥组裁决：仅当自然结果为开才参与（属性命中也算）。组内同一身份
@@ -391,7 +446,10 @@ def evaluate(db, flag, identity, attrs=None):
             "SELECT flag_id FROM group_assignments WHERE group_id=? AND identity=?",
             (group_id, identity),
         ).fetchone()
-    return winner["flag_id"] == flag["id"], "group"
+    won = winner["flag_id"] == flag["id"]
+    if _memo is not None:
+        _memo[flag["id"]] = won
+    return won, "group"
 
 
 # ---------------------------------------------------------------- bundle
@@ -407,11 +465,11 @@ def bundle_content_hash(db, identity, attrs=None):
     """求值输入摘要：对「会影响此身份此身属性求值结果的全部输入」做确定性摘要。
 
     覆盖：所有开关的求值相关字段、此身份的单人强制、互斥组成员关系、
-    此身份在组内的落定记录。带属性来拿时，某个开关的属性条件只在此人
-    属性对得上（即该条件实际参与了此人求值）时才进摘要——改一个此人
-    对不上的条件不影响他的包，对得上的条件增删改必换版本；不带属性时
-    摘要与没有「属性条件」这一层时一字不差——管理端怎么增改条件，
-    不带属性的老包都不失效。
+    此身份在组内的落定记录、开关之间的依赖关系。带属性来拿时，某个
+    开关的属性条件只在此人属性对得上（即该条件实际参与了此人求值）时
+    才进摘要——改一个此人对不上的条件不影响他的包，对得上的条件增删改
+    必换版本；不带属性时摘要与没有「属性条件」这一层时一字不差——
+    管理端怎么增改条件，不带属性的老包都不失效。
     与求值无关的字段（如描述、时间戳）不影响摘要；只与别人相关的改动
     （如给他人的单人强制）也不影响此身份的摘要。
     """
@@ -443,6 +501,13 @@ def bundle_content_hash(db, identity, attrs=None):
         "groups": [[r["g"], r["f"]] for r in members],
         "assignments": [[r["g"], r["f"]] for r in assignments],
     }
+    # 开关依赖关系是全局求值输入：改了谁依赖谁（含解除、被依赖开关删除）
+    # 所有已发整包都要换新版本。按依赖者名字排序，保证摘要确定。
+    dependencies = db.execute(
+        "SELECT f.name AS child, p.name AS parent FROM flags f"
+        " JOIN flags p ON p.id = f.depends_on_flag_id ORDER BY f.name"
+    ).fetchall()
+    payload["dependencies"] = [[r["child"], r["parent"]] for r in dependencies]
     if attrs:
         # 带属性的包：属性本身进摘要；属性条件只在「对此人对得上」时进摘要
         # （实际参与了求值才算求值输入，对不上的条件改动不波及此人）
@@ -472,17 +537,21 @@ def make_version(content_hash, generation):
 def compute_bundle(db, identity, attrs=None):
     """求出此身份此身属性下所有开关的结果与求值输入摘要。先求值（可能写入
     组落定记录），再取摘要，保证摘要覆盖本次求值产生的落定记录——管理端
-    失效扫描与调用方来拿走同一套求值，记下的版本与本人来拿时拿到的才一致。"""
+    失效扫描与调用方来拿走同一套求值，记下的版本与本人来拿时拿到的才一致。
+    整包共用一份依赖备忘：被依赖的开关先算一次，依赖它的开关与单查它时
+    拿到的是同一个结果、同一个理由。"""
     flags = db.execute("SELECT * FROM flags ORDER BY name").fetchall()
     results = {}
+    memo = {}
     for flag in flags:
-        enabled, reason = evaluate(db, flag, identity, attrs)
+        enabled, reason = evaluate(db, flag, identity, attrs, memo)
         results[flag["name"]] = {"enabled": enabled, "reason": reason}
     return results, bundle_content_hash(db, identity, attrs)
 
 
 def record_invalidations(db, actor_name, change):
-    """配置变更后调用：用与调用方来拿时完全相同的求值重算每个已发整包。
+    """配置变更后调用：用与调用方来拿时完全相同的求值重算每个已发整包
+    （开关依赖也照新关系算：被依赖开关关着时，依赖它的开关全按 depends_on 关重算）。
 
     整包按 (身份, 属性) 记账，逐包重算：求值输入变了的包，内容序号 +1、
     记一条失效记录（谁改的、哪次变更、让谁的哪身属性的整包从哪个版本变成
@@ -546,6 +615,8 @@ def check(name):
     引号等任意字符；不做 strip，首尾空格也是身份的一部分。
     attrs 为 URL 编码的扁平 JSON 对象，如 attrs=%7B%22plan%22%3A%22pro%22%7D；
     带了属性且对上管理端定的打开条件时，结果由属性条件层决定。
+    若开关配了依赖，会用同一身份同一身属性先求被依赖的开关；
+    被依赖的不开时，本开关返回 enabled=false、reason=depends_on。
     """
     identity = request.args.get("identity")
     if not identity:
@@ -647,6 +718,13 @@ def list_flags():
             " JOIN mutex_groups g ON g.id = m.group_id"
         )
     }
+    dep_names = {
+        r["child_id"]: r["name"]
+        for r in db.execute(
+            "SELECT c.id AS child_id, p.name AS name FROM flags c"
+            " JOIN flags p ON p.id = c.depends_on_flag_id"
+        )
+    }
     pending = {}
     for r in db.execute(
             "SELECT * FROM scheduled_changes WHERE status='pending'"
@@ -654,7 +732,7 @@ def list_flags():
         pending.setdefault(r["flag_id"], []).append(scheduled_to_dict(r))
     result = []
     for row in rows:
-        item = flag_to_dict(row)
+        item = flag_to_dict(row, dep_names.get(row["id"], ""))
         item["override_count"] = db.execute(
             "SELECT COUNT(*) c FROM overrides WHERE flag_id=?", (row["id"],)
         ).fetchone()["c"]
@@ -697,12 +775,45 @@ def create_flag():
 
 # 可预约定时生效的开关字段（与 PATCH 立即生效支持的字段一致）
 SCHEDULABLE_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
-                      "description", "targeting")
+                      "description", "targeting", "depends_on")
+
+
+def validate_depends_on(db, flag, raw):
+    """校验管理端要设置的依赖开关，返回 (depends_on_name, error)。
+
+    None / "" / 空串表示解除依赖（返回 ("", None)）。否则必须是另一个
+    已存在的开关，且加上「本开关 -> 该开关」这条边后不能成环（自依赖
+    同样拒绝）。error 非空时调用方返回 400，不落库。
+    """
+    if raw is None:
+        return "", None
+    if not isinstance(raw, str):
+        return None, "depends_on must be a flag name (string), or null/empty to clear"
+    dep_name = raw.strip()
+    if dep_name == "":
+        return "", None
+    if dep_name == flag["name"]:
+        return None, "a flag cannot depend on itself"
+    dep = db.execute("SELECT id FROM flags WHERE name=?", (dep_name,)).fetchone()
+    if dep is None:
+        return None, f"depends_on flag '{dep_name}' not found"
+    # 沿现有的依赖边往下走：若能从被依赖者走回本开关，加上新边就成环
+    seen = set()
+    cursor = dep["id"]
+    while cursor is not None and cursor not in seen:
+        if cursor == flag["id"]:
+            return None, "circular dependency rejected"
+        seen.add(cursor)
+        row = db.execute(
+            "SELECT depends_on_flag_id FROM flags WHERE id=?", (cursor,),
+        ).fetchone()
+        cursor = row["depends_on_flag_id"] if row else None
+    return dep_name, None
 
 
 def apply_flag_fields(db, flag, body):
     """把 kill_switch / default_enabled / rollout_percent / description /
-    targeting 写到开关上。
+    targeting / depends_on 写到开关上。
 
     立即生效与定时生效到点应用共用这一段。返回 (changes, error)：
     changes 是 (layer, action, detail) 列表（值没变的字段不在列）；
@@ -710,6 +821,31 @@ def apply_flag_fields(db, flag, body):
     """
     changes = []
 
+    if "depends_on" in body:
+        dep_name, err = validate_depends_on(db, flag, body["depends_on"])
+        if err:
+            return None, err
+        old_id = flag["depends_on_flag_id"]
+        old_name = ""
+        if old_id is not None:
+            row = db.execute("SELECT name FROM flags WHERE id=?", (old_id,)).fetchone()
+            old_name = row["name"] if row else ""
+        if dep_name != old_name:
+            new_id = None
+            if dep_name:
+                new_id = db.execute(
+                    "SELECT id FROM flags WHERE name=?", (dep_name,),
+                ).fetchone()["id"]
+            db.execute("UPDATE flags SET depends_on_flag_id=?, updated_at=? WHERE id=?",
+                       (new_id, time.time(), flag["id"]))
+            if new_id is None:
+                changes.append(("depends_on", "clear_dependency",
+                                f"depends_on removed (was {old_name})"))
+            else:
+                detail = f"depends_on={dep_name}"
+                if old_name:
+                    detail = f"depends_on: {old_name} -> {dep_name}"
+                changes.append(("depends_on", "set_dependency", detail))
     if "targeting" in body:
         try:
             new_rule = validate_targeting(body["targeting"])
@@ -764,7 +900,7 @@ def schedule_flag_change(db, flag, body, effective_at):
     if not payload:
         return jsonify({"error": "nothing to schedule"
                                  " (no kill_switch/default_enabled/rollout_percent"
-                                 "/description given)"}), 400
+                                 "/description/depends_on given)"}), 400
     # 与立即生效同一套校验，避免约了一个到点应用不了的值
     if "rollout_percent" in payload:
         v = payload["rollout_percent"]
@@ -775,6 +911,12 @@ def schedule_flag_change(db, flag, body, effective_at):
             validate_targeting(payload["targeting"])
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+    if "depends_on" in payload:
+        # 环校验按「预约到点那一刻」之前的当前依赖图做；到点应用时若图已变
+        # 形成环（理论上每次写入都拒绝成环，不可达），该条预约会记为 failed
+        _, err = validate_depends_on(db, flag, payload["depends_on"])
+        if err:
+            return jsonify({"error": err}), 400
     cur = db.execute(
         "INSERT INTO scheduled_changes"
         " (flag_id, flag_name, changes, effective_at, created_by, created_at)"
@@ -883,6 +1025,10 @@ def delete_flag(name):
     # 还没到点的定时变更随开关一起取消
     db.execute("UPDATE scheduled_changes SET status='cancelled'"
                " WHERE flag_id=? AND status='pending'", (flag["id"],))
+    # 新库由 ON DELETE SET NULL 解除「别人对它」的依赖；老库迁移出来的外键
+    # 没有该动作，这里显式兜底，避免留下指向已删开关的依赖
+    db.execute("UPDATE flags SET depends_on_flag_id=NULL"
+               " WHERE depends_on_flag_id=?", (flag["id"],))
     audit(actor(), name, "default", "delete_flag")
     db.commit()
     record_invalidations(db, actor(), f"delete_flag {name}")

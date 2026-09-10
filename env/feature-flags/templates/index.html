@@ -65,7 +65,7 @@
   <h1>🚩 特性开关管理</h1>
   <input id="token" type="password" placeholder="管理 Token">
   <input id="actor" type="text" placeholder="操作人（记入审计）">
-  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 单人强制 &gt; 属性条件 &gt; 互斥组 &gt; 比例放量 &gt; 默认值</span>
+  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 开关依赖 &gt; 单人强制 &gt; 属性条件 &gt; 互斥组 &gt; 比例放量 &gt; 默认值</span>
 </header>
 
 <main>
@@ -192,6 +192,7 @@ async function loadFlags() {
     div.className = 'flag-item' + (selected === f.name ? ' active' : '');
     const badges = [];
     if (f.kill_switch) badges.push('<span class="badge off">全关</span>');
+    if (f.depends_on) badges.push(`<span class="badge roll">依赖:${esc(f.depends_on)}</span>`);
     if (f.rollout_percent > 0) badges.push(`<span class="badge roll">${f.rollout_percent}%</span>`);
     if (f.targeting && Object.keys(f.targeting).length)
       badges.push('<span class="badge on">属性条件</span>');
@@ -234,7 +235,18 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>② 单人强制 <span class="prio">对指定身份强制开/关，覆盖属性条件、放量与默认值</span></h3>
+      <h3>② 开关依赖 <span class="prio">来问时先用同一个身份、同一身属性问被依赖的开关：它是关，本开关一律关（强制开也救不回）；它是开才继续往下算。依赖可成链，不能成环</span></h3>
+      <div class="row">
+        <select id="depSelect" style="min-width:220px">${depOptions(f)}</select>
+        <button class="primary" onclick="saveDependency()">保存依赖</button>
+        ${f.depends_on ? '<span class="badge roll">当前依赖：' + esc(f.depends_on) + '</span>'
+                       : '<span class="muted">当前无依赖</span>'}
+      </div>
+      <div class="muted">选「（无依赖）」并保存即解除；删除被依赖的开关时依赖自动解除。</div>
+    </div>
+
+    <div class="layer">
+      <h3>③ 单人强制 <span class="prio">对指定身份强制开/关，覆盖属性条件、放量与默认值；但救不回「被依赖开关是关」</span></h3>
       <div class="row">
         <input id="ovIdentity" type="text" placeholder="身份 identity" style="max-width:220px">
         <button onclick="setOverride(true)">强制开</button>
@@ -245,7 +257,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>③ 属性打开条件 <span class="prio">来问带上的属性全对上则开；对不上、没带属性都按下面的放量/默认值算。命中算自然为开，仍过互斥组裁决</span></h3>
+      <h3>④ 属性打开条件 <span class="prio">来问带上的属性全对上则开；对不上、没带属性都按下面的放量/默认值算。命中算自然为开，仍过互斥组裁决</span></h3>
       <div class="row">
         <input id="tgtRule" type="text" style="flex:1"
           placeholder='JSON 条件，如 {"plan":"pro","level":[3,5]}；多键 AND，值给列表是任一；清空填 {}'
@@ -257,7 +269,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>④ 比例放量 <span class="prio">属性对不上时才看这里：比例 &gt; 0 时此层定论，命中开、未命中关；同一身份结果恒定</span></h3>
+      <h3>⑤ 比例放量 <span class="prio">属性对不上时才看这里：比例 &gt; 0 时此层定论，命中开、未命中关；同一身份结果恒定</span></h3>
       <div class="row">
         <input type="range" min="0" max="100" value="${f.rollout_percent}"
                oninput="$('pctLabel').textContent=this.value+'%'"
@@ -267,7 +279,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>⑤ 默认值 <span class="prio">属性对不上且放量比例为 0 时兜底</span></h3>
+      <h3>⑥ 默认值 <span class="prio">属性对不上且放量比例为 0 时兜底</span></h3>
       <label><input type="checkbox" ${f.default_enabled ? 'checked' : ''}
         onchange="setDefault(this.checked)"> 默认开</label>
     </div>
@@ -276,7 +288,7 @@ async function renderDetail() {
       <h3>⏰ 定时生效 <span class="prio">可选：约个时间再应用；不填时间则改完立即生效。到点前求值与整包版本都不变</span></h3>
       <div class="row">
         <input id="scheduleAt" type="datetime-local" step="1" style="max-width:230px">
-        <span class="muted">填了时间后，再点上方「全关 / 属性条件 / 放量 / 默认值」的改动会约到该时刻生效</span>
+        <span class="muted">填了时间后，再点上方「全关 / 依赖 / 属性条件 / 放量 / 默认值」的改动会约到该时刻生效</span>
       </div>
       <div id="scheduledList">${renderScheduled(f)}</div>
     </div>`;
@@ -285,7 +297,19 @@ async function renderDetail() {
 
 const FIELD_NAMES = { kill_switch: '全关', default_enabled: '默认开',
                       rollout_percent: '放量比例', description: '描述',
-                      targeting: '属性打开条件' };
+                      targeting: '属性打开条件', depends_on: '开关依赖' };
+
+function depOptions(f) {
+  let html = '<option value="">（无依赖）</option>';
+  for (const other of flags) {
+    if (other.name === f.name) continue;
+    html += `<option value="${esc(other.name)}"${other.name === f.depends_on ? ' selected' : ''}>`
+          + esc(other.name) + '</option>';
+  }
+  return html;
+}
+
+const saveDependency = () => patch({ depends_on: $('depSelect').value });
 
 function renderScheduled(f) {
   const list = f.scheduled_changes || [];
@@ -408,7 +432,8 @@ async function checkIdentity() {
   const url = `/api/flags/${encodeURIComponent(selected)}/check?identity=${encodeURIComponent(id)}`
     + (aq ? `&attrs=${aq}` : '');
   const r = await fetch(url).then(r => r.json());
-  const layerNames = { kill_switch: '全关', override: '单人强制', targeting: '属性条件',
+  const layerNames = { kill_switch: '全关', depends_on: '开关依赖',
+                       override: '单人强制', targeting: '属性条件',
                        group: '互斥组', rollout: '比例放量', default: '默认值' };
   $('checkResult').innerHTML = r.error ? esc(r.error)
     : `结果：<b style="color:${r.enabled ? 'var(--ok)' : 'var(--danger)'}">${r.enabled ? '开' : '关'}</b>

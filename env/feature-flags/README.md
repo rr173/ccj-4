@@ -5,11 +5,13 @@
 ## 求值优先级（固定，代码中不可调整）
 
 ```
-全关(kill_switch) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout) > 默认值(default)
+全关(kill_switch) > 开关依赖(depends_on) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout) > 默认值(default)
 ```
 
 - **全关**：打开后所有身份一律为关，覆盖一切。
-- **单人强制**：对指定 identity 强制开/关，覆盖属性条件、互斥组、放量与默认值。
+- **开关依赖**：见下节。
+- **单人强制**：对指定 identity 强制开/关，覆盖属性条件、互斥组、放量与默认值；
+  但救不回「被依赖开关是关」（依赖层在强制之前）。
 - **属性打开条件**：见下节。
 - **互斥组**：见下节。
 - **比例放量**：`sha256("{flag}:{identity}") % 100 < percent` 则开，未命中则关。
@@ -17,6 +19,42 @@
   同一身份对同一开关永远落在同一侧，与进程、机器、重启无关；
   调高比例只会**新增**命中者，已命中者不会掉出。
 - **默认值**：仅当放量比例为 0 时兜底。
+
+## 开关依赖（depends_on）
+
+管理端可以指定本开关**先看另一个开关**。来问时（单查或整包），系统会用
+**同一个身份、同一身属性**把被依赖的开关完整求值一遍：
+
+- 被依赖的开关对这个人、这身属性**也是开**，本开关才有机会继续往下算
+  （强制、属性条件、互斥组、放量、默认值照旧）；
+- 被依赖的是**关**，本开关**一律判关**，`reason=depends_on`。这一层排在
+  单人强制之前——对本开关的强制开也救不回来；只有本开关自己的全关能压过它
+  （全关仍然一律关）。
+
+```bash
+# pay 开关默认开；promo-pay 依赖它：pay 关的人，promo-pay 必然关
+curl -X PATCH http://localhost:8000/api/flags/promo-pay \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" -d '{"depends_on": "pay"}'
+
+curl "http://localhost:8000/api/flags/promo-pay/check?identity=u123"
+# pay 开：{"enabled":true,"reason":"default",…}（继续按本开关自己的规则算）
+# pay 关：{"enabled":false,"reason":"depends_on",…}
+```
+
+- **同一身份、同一身属性**：被依赖开关按来问的同一 `identity` 与同一身 `attrs`
+  求值。例如 pay 只对 `plan=pro` 的人开，那么 free 用户来问 promo-pay 时，
+  pay 对这身属性是关，promo-pay 也是关。
+- **可以成链**：C 依赖 B、B 依赖 A；A 关则 B、C 都关（链上每一步的理由都是
+  `depends_on`）。整包求值时链上开关只算一次，单查任一开关与整包里的结果一致。
+- **不能成环**：自依赖、互相绕着依赖（含间接成环）在管理端写入时直接 `400`
+  拒绝，不会写出一个算不出来的配置。
+- **改了立即按新的算**：设置、改依赖、解除（`""` / `null`）都立即生效；
+  依赖关系是整包求值输入的一部分，改动后所有已发整包换新版本，拿着改前那包
+  来问会得到 `valid=false`。也支持带 `effective_at` 预约定时改依赖。
+- **删除被依赖开关**：依赖关系自动解除，本开关恢复按自己的规则算。
+- 管理端列表中每个开关带 `depends_on` 字段（空串表示无依赖）。
+
 
 ## 属性打开条件（targeting）
 
@@ -61,9 +99,10 @@ curl "http://localhost:8000/api/flags/new-checkout/check?identity=u123&attrs=%7B
 - 自然结果为开且开关在组内时，由组规则裁决：该身份在组内已落定过别的开关
   则判关；否则落定为本开关并写库（`group_assignments` 表），此后恒定。
   并发请求下同一身份也只会有一个开关落定成功。
-- **全关与单人强制优先于组规则**：强制开不受组内已有人开着的限制，
-  全关仍然全关；这两层解除后，原落定结果恢复。
+- **全关、依赖与单人强制优先于组规则**：强制开不受组内已有人开着的限制，
+  全关仍然全关，被依赖开关关着时强制开也开不了；这几层解除后，原落定结果恢复。
 - 未进组的开关完全按原规则求值。
+- 被依赖的开关会先于依赖者求值：若两者同组，先落定的是被依赖者。
 - 把开关移出组（或删除开关）会释放它在组内占有的落定记录，相关身份之后
   可重新落定组内其他开关；解散整组则清除全部落定记录，组内开关恢复按
   原规则求值。
@@ -84,13 +123,13 @@ GET '/api/bundle?identity=<用户身份>&attrs=<URL编码的JSON属性>'
 ```
 
 - **版本恒定**：版本 = 求值输入摘要（会影响此身份此身属性求值的全部输入：所有开关的
-  求值字段、此人的单人强制、互斥组成员关系、此人的组内落定记录；带属性时还包括属性
-  本身与对此人实际生效的属性条件）+ 单调递增的内容序号。配置没变时，同一
-  (身份, 属性) 多次来拿，每个开关的结果和版本都不变。
+  求值字段、此人的单人强制、互斥组成员关系、此人的组内落定记录、开关之间的依赖关系；
+  带属性时还包括属性本身与对此人实际生效的属性条件）+ 单调递增的内容序号。配置没变时，
+  同一 (身份, 属性) 多次来拿，每个开关的结果和版本都不变。
 - **变了必新版本**：管理端改了任何会影响此包的一层（开关配置、对此人的强制、
-  互斥组变动、对此人生效的属性条件），序号 +1，他再来拿一定是新版本、按改完后的
-  规则重算。与他无关的改动（如给别人的单人强制、改描述、他对不上的属性条件）
-  不影响他的版本。
+  互斥组变动、依赖关系、对此人生效的属性条件），序号 +1，他再来拿一定是新版本、
+  按改完后的规则重算。与他无关的改动（如给别人的单人强制、改描述、他对不上的
+  属性条件）不影响他的版本。
 - **改回不复活**：序号只增不减——把配置改回去，摘要虽复原，版本也不会回到
   旧值；改过一次，旧包就永远失效，不存在"改回去旧包又能用"。
 - **记录即所得**：管理端变更后系统用与调用方来拿时完全相同的求值重算每个
@@ -112,7 +151,7 @@ GET '/api/bundle?identity=<用户身份>&attrs=<URL编码的JSON属性>&version=
 
 ## 定时生效（约个时间再生效）
 
-管理端改开关配置（全关 / 默认值 / 放量比例 / 属性打开条件 / 描述）时，可以带一个
+管理端改开关配置（全关 / 开关依赖 / 默认值 / 放量比例 / 属性打开条件 / 描述）时，可以带一个
 `effective_at`（unix 秒）把改动约到未来某个时刻生效：
 
 ```bash
@@ -157,7 +196,7 @@ docker run -d -p 8000:8000 -e ADMIN_TOKEN=你的强随机串 \
 ```bash
 GET '/api/flags/<name>/check?identity=<用户身份>[&attrs=<URL编码的JSON属性>]'
 # => {"flag":"new-checkout","identity":"u123","enabled":true,"reason":"rollout"}
-#    reason ∈ kill_switch | override | targeting | group | rollout | default，表示结果由哪一层决定
+#    reason ∈ kill_switch | depends_on | override | targeting | group | rollout | default，表示结果由哪一层决定
 #    identity / attrs 需 URL 编码；identity 允许包含斜杠、空格、引号等任意字符
 #    attrs 必须是扁平 JSON 对象，值为标量（字符串/数字/布尔/null）；非法返回 400
 
@@ -173,7 +212,7 @@ GET '/api/bundle?identity=<用户身份>[&attrs=<URL编码的JSON属性>][&versi
 |---|---|---|
 | GET | `/api/flags` | 列出所有开关 |
 | POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting}` |
-| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, kill_switch, targeting, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；带 `effective_at`（unix 秒）则约到该时刻生效 |
+| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |
 | DELETE | `/api/flags/<name>` | 删除开关（其未生效的定时变更一并取消） |
 | GET | `/api/flags/<name>/overrides` | 列出单人强制 |
 | PUT | `/api/flags/<name>/overrides` | 设置 `{identity, enabled}` |
@@ -211,6 +250,12 @@ curl -X PATCH http://localhost:8000/api/flags/new-checkout \
   -d '{"targeting": {"plan": "pro", "level": [3, 5]}}'
 curl 'http://localhost:8000/api/flags/new-checkout/check?identity=u123&attrs=%7B%22plan%22%3A%22pro%22%2C%22level%22%3A3%7D'
 # => {"flag":"new-checkout","identity":"u123","attrs":{"plan":"pro","level":3},"enabled":true,"reason":"targeting"}
+
+# 指定依赖：promo-pay 必须等 pay 对同一个人是开时才可能开（pay 关则一律关）
+curl -X PATCH http://localhost:8000/api/flags/promo-pay \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" -d '{"depends_on": "pay"}'
+# 解除依赖：-d '{"depends_on": ""}'
 
 # 建互斥组并把两个开关编进去
 curl -X POST http://localhost:8000/api/groups \
