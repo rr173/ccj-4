@@ -84,6 +84,7 @@ scheduled_changes 表里，不参与求值）；到点之后，第一个进来�
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -105,6 +106,11 @@ CREATE TABLE IF NOT EXISTS flags (
     rollout_percent INTEGER NOT NULL DEFAULT 0,
     kill_switch     INTEGER NOT NULL DEFAULT 0,
     targeting_rule  TEXT NOT NULL DEFAULT '',  -- 属性打开条件（canonical JSON）；''=未定条件
+    -- 开关挂的配置（canonical JSON）：''=没挂。开关对此人判开时，这份配置随
+    -- check / 整包一起发给此人；判关（含全关）时不带。冻住在开的人拿冻住那一刻
+    -- 这份（freezes.frozen_config），此后改这里不动他；改这里只让此刻判开的人的
+    -- 已发整包换新版本，判关的人与没挂配置时一样不受影响。
+    flag_config     TEXT NOT NULL DEFAULT '',
     -- 本开关依赖的另一个开关：被依赖者对此人此身属性不是开时，本开关必须关；
     -- NULL=无依赖。被依赖开关删除时自动置空（ON DELETE SET NULL）
     depends_on_flag_id INTEGER REFERENCES flags(id) ON DELETE SET NULL,
@@ -129,6 +135,9 @@ CREATE TABLE IF NOT EXISTS freezes (
     identity      TEXT NOT NULL,
     frozen_enabled INTEGER NOT NULL,
     frozen_reason TEXT NOT NULL DEFAULT '',
+    -- 冻住那一刻开关挂的配置快照（canonical JSON）：冻住在开的人此后
+    -- 单查/整包都带这份；冻住在关则恒为 ''（不带）。全关期间也不带。
+    frozen_config TEXT NOT NULL DEFAULT '',
     created_by    TEXT NOT NULL DEFAULT '',
     created_at    REAL NOT NULL,
     UNIQUE(flag_id, identity)
@@ -320,6 +329,43 @@ def targeting_matches(rule_json, attrs):
     return True
 
 
+def validate_config(value):
+    """校验管理端给开关挂的配置，返回规范化 JSON 串。
+
+    配置可以是任意 JSON 值（对象 / 数组 / 标量），随开的结果一起下发；
+    None 表示清除配置（返回 ""）。NaN / Infinity 不是合法 JSON，拒绝。
+    """
+    if value is None:
+        return ""
+
+    def check(v, path="$"):
+        if v is None or isinstance(v, (str, bool, int)):
+            return
+        if isinstance(v, float):
+            if not math.isfinite(v):
+                raise ValueError(f"config at {path} must be finite JSON (no NaN/Infinity)")
+            return
+        if isinstance(v, dict):
+            for k, vv in v.items():
+                if not isinstance(k, str):
+                    raise ValueError("config object keys must be strings")
+                check(vv, f"{path}.{k}")
+            return
+        if isinstance(v, list):
+            for i, vv in enumerate(v):
+                check(vv, f"{path}[{i}]")
+            return
+        raise ValueError(f"config at {path} is not a JSON value")
+
+    check(value)
+    return canonical_json(value)
+
+
+def parse_flag_config(flag_config_json):
+    """把库里存的配置 JSON 串还原成值；没挂（''）时返回 None。"""
+    return json.loads(flag_config_json) if flag_config_json else None
+
+
 # ---------------------------------------------------------------- db helpers
 
 def get_db():
@@ -358,6 +404,14 @@ def init_db():
     # 不能在 ALTER 上加外键，但删除路径里同样会把指向已删开关的依赖置空）
     if "depends_on_flag_id" not in flag_cols:
         conn.execute("ALTER TABLE flags ADD COLUMN depends_on_flag_id INTEGER")
+    # 开关挂的配置：flags 增加 flag_config（老库一律从没挂配置起步）
+    if "flag_config" not in flag_cols:
+        conn.execute("ALTER TABLE flags ADD COLUMN flag_config TEXT NOT NULL DEFAULT ''")
+    # 结果冻结快照：freezes 增加 frozen_config（老的冻结行从空快照起步，
+    # 与「冻住期间改配置不动冻住的人」一致；想带新配置需重新冻一次）
+    freeze_cols = {r[1] for r in conn.execute("PRAGMA table_info(freezes)")}
+    if "frozen_config" not in freeze_cols:
+        conn.execute("ALTER TABLE freezes ADD COLUMN frozen_config TEXT NOT NULL DEFAULT ''")
     # 整包按 (身份, 属性) 分别记账：把旧的「身份主键」整包表重建为复合主键，
     # 已发的老包原样保留（它们是不带属性的包，attrs_hash=''）
     pk = conn.execute("PRAGMA table_info(bundles)").fetchall()
@@ -400,6 +454,7 @@ def flag_to_dict(row, dep_name=None):
         "rollout_percent": row["rollout_percent"],
         "kill_switch": bool(row["kill_switch"]),
         "targeting": json.loads(row["targeting_rule"]) if row["targeting_rule"] else {},
+        "config": parse_flag_config(row["flag_config"]),
         "depends_on": dep_name if dep_name is not None else "",
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -424,34 +479,48 @@ def group_of(db, flag_id):
 
 def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
              _skip_freeze_id=None):
-    """按固定优先级求值，返回 (enabled, reason)。
+    """按固定优先级求值，返回 (enabled, reason, config)。
+
+    config 是「此人此刻拿得到的开关配置」：只看最终开/关，与由哪一层决定
+    无关——最终为开且开关挂了配置，就带上该配置（对象/数组/标量原样）；
+    最终为关（全关、依赖关、强制关、组内没争到、放量未命中、默认关）或开关
+    没挂配置，config 一律为 None（接口里不带这个键）。
 
     attrs 为来问时带的属性（dict）。属性条件命中时这一层直接定论为开；
     对不上 / 没带属性 / 开关没定条件，都按原来的放量 / 默认值算。
 
     结果冻结在全关之后、开关依赖之前：冻住后直接返回冻住那一刻的结果
     （reason=freeze），不再看依赖、强制、属性、组、放量与默认值；因此
-    改依赖也救不回/压不掉冻住的值。被别的开关依赖时，依赖者沿备忘拿到
-    的就是这个冻住的结果。全关仍在更前面，冻住也压不过全关。
+    改依赖也救不回/压不掉冻住的值。冻在开的人同时拿到冻住那一刻挂着的
+    配置快照（frozen_config），此后改挂的配置不动他；冻在关则不带。
+    被别的开关依赖时，依赖者沿备忘拿到的就是这个冻住的结果。全关仍在更
+    前面，冻住也压不过全关（全关一律关、不带配置）。
     _skip_freeze_id 仅供「重新冻住」时顶层使用：按假设此开关没冻的口径
     求它此刻的结果（沿依赖递归时被依赖开关的冻结照常生效）。
     依赖链上的结果在单次求值内备忘，保证链上每个开关只算一次、结果一致；
     成环在管理端写入时已拒绝，运行时再兜一层防环。
     """
-    if flag["kill_switch"]:
-        return False, "kill_switch"
+    def ret(enabled, reason, config_json=None):
+        """统一出口：开且挂了配置才随结果带配置；关一律不带。"""
+        cfg = parse_flag_config(config_json) if enabled and config_json else None
+        return enabled, reason, cfg
 
-    # 结果冻结：只认冻住那一刻存下的开/关，此后其他层怎么改都不影响它。
+    if flag["kill_switch"]:
+        return ret(False, "kill_switch")
+
+    # 结果冻结：只认冻住那一刻存下的开/关（连同配置快照），此后其他层
+    # 怎么改都不影响它。
     if _skip_freeze_id != flag["id"]:
         freeze = db.execute(
-            "SELECT frozen_enabled FROM freezes WHERE flag_id=? AND identity=?",
+            "SELECT frozen_enabled, frozen_config FROM freezes"
+            " WHERE flag_id=? AND identity=?",
             (flag["id"], identity),
         ).fetchone()
         if freeze is not None:
-            result = (bool(freeze["frozen_enabled"]), "freeze")
+            enabled = bool(freeze["frozen_enabled"])
             if _memo is not None:
-                _memo[flag["id"]] = result[0]
-            return result
+                _memo[flag["id"]] = enabled
+            return ret(enabled, "freeze", freeze["frozen_config"])
 
     # 开关依赖：被依赖的开关对此人此身属性不是开，则必须关。
     # 对本开关的强制开排在依赖之后，救不回依赖关着的情形。
@@ -471,22 +540,22 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
                 dep_enabled = _memo[dep_id]
             else:
                 next_chain = {flag["id"]} if _chain is None else _chain | {flag["id"]}
-                dep_enabled, _ = evaluate(db, dep_flag, identity, attrs,
-                                          _memo, next_chain)
+                dep_enabled, _, _ = evaluate(db, dep_flag, identity, attrs,
+                                             _memo, next_chain)
             if not dep_enabled:
                 if _memo is not None:
                     _memo[flag["id"]] = False
-                return False, "depends_on"
+                return ret(False, "depends_on")
 
     override = db.execute(
         "SELECT enabled FROM overrides WHERE flag_id=? AND identity=?",
         (flag["id"], identity),
     ).fetchone()
     if override is not None:
-        result = (bool(override["enabled"]), "override")
+        enabled = bool(override["enabled"])
         if _memo is not None:
-            _memo[flag["id"]] = result[0]
-        return result
+            _memo[flag["id"]] = enabled
+        return ret(enabled, "override", flag["flag_config"])
 
     # 属性打开条件：来问属性全对上则开，且不落到放量 / 默认值
     if targeting_matches(flag["targeting_rule"], attrs):
@@ -504,7 +573,7 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
     if group_id is None or not natural:
         if _memo is not None:
             _memo[flag["id"]] = natural
-        return natural, reason
+        return ret(natural, reason, flag["flag_config"])
 
     # 互斥组裁决：仅当自然结果为开才参与（属性命中也算）。组内同一身份
     # 最多一个开，先到先得，落定只认身份、与本次带的属性无关。
@@ -527,7 +596,7 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
     won = winner["flag_id"] == flag["id"]
     if _memo is not None:
         _memo[flag["id"]] = won
-    return won, "group"
+    return ret(won, "group", flag["flag_config"])
 
 
 # ---------------------------------------------------------------- bundle
@@ -539,7 +608,7 @@ def attrs_hash_of(attrs):
     return hashlib.sha256(canonical_json(attrs).encode("utf-8")).hexdigest()[:16]
 
 
-def bundle_content_hash(db, identity, attrs=None):
+def bundle_content_hash(db, identity, attrs=None, results=None):
     """求值输入摘要：对「会影响此身份此身属性求值结果的全部输入」做确定性摘要。
 
     覆盖：所有开关的求值相关字段、此身份的单人强制、此身份的结果冻结、
@@ -548,15 +617,20 @@ def bundle_content_hash(db, identity, attrs=None):
     摘要——改一个此人对不上的条件不影响他的包，对得上的条件增删改必换版本；
     不带属性时摘要与没有「属性条件」这一层时一字不差——管理端怎么增改条件，
     不带属性的老包都不失效。
+    开关挂的配置只在「此人此刻对该开关判开」时随结果下发，因此也只在判开时
+    进摘要：改挂的配置只让此刻判开的人的包换新版本，判关的人（含全关期间）
+    版本一字不变；没挂配置的开关与以前完全一致。results 必须是 compute_bundle
+    刚求出的结果（失效扫描与本人来拿走同一套求值，摘要口径才一致）。
     冻住的开关对此人只认 freezes 行：它的默认值/放量/属性条件/依赖边/单人强制
-    在冻住期间都不参与求值，因此这些改动不进此人的摘要（不换版本）；它的全关
-    仍压过冻结，所以全关字段保留，冻住期间开全关仍让包换版本。
+    在冻住期间都不参与求值，因此这些改动不进此人的摘要（不换版本），它挂的
+    配置也只认冻住那一刻的快照 frozen_config；它的全关仍压过冻结，所以全关
+    字段保留，冻住期间开全关仍让包换版本。
     与求值无关的字段（如描述、时间戳）不影响摘要；只与别人相关的改动
     （如给他人的单人强制）也不影响此身份的摘要。
     """
     flags = db.execute(
-        "SELECT name, default_enabled, rollout_percent, kill_switch, targeting_rule"
-        " FROM flags ORDER BY name"
+        "SELECT name, default_enabled, rollout_percent, kill_switch, targeting_rule,"
+        " flag_config FROM flags ORDER BY name"
     ).fetchall()
     overrides = db.execute(
         "SELECT f.name, o.enabled FROM overrides o"
@@ -564,7 +638,7 @@ def bundle_content_hash(db, identity, attrs=None):
         (identity,),
     ).fetchall()
     freezes = db.execute(
-        "SELECT f.name, z.frozen_enabled FROM freezes z"
+        "SELECT f.name, z.frozen_enabled, z.frozen_config FROM freezes z"
         " JOIN flags f ON f.id = z.flag_id WHERE z.identity=? ORDER BY f.name",
         (identity,),
     ).fetchall()
@@ -591,7 +665,9 @@ def bundle_content_hash(db, identity, attrs=None):
         # 冻住的开关不看单人强制，给它的强制不进摘要
         "overrides": [[r["name"], bool(r["enabled"])] for r in overrides
                       if r["name"] not in frozen_names],
-        "freezes": [[r["name"], bool(r["frozen_enabled"])] for r in freezes],
+        # 冻住的开关：第三个元素是冻住那一刻挂着的配置快照（冻在关时为 ''）
+        "freezes": [[r["name"], bool(r["frozen_enabled"]), r["frozen_config"]]
+                    for r in freezes],
         "groups": [[r["g"], r["f"]] for r in members],
         "assignments": [[r["g"], r["f"]] for r in assignments],
     }
@@ -605,6 +681,18 @@ def bundle_content_hash(db, identity, attrs=None):
     ).fetchall()
     payload["dependencies"] = [[r["child"], r["parent"]] for r in dependencies
                                if r["child"] not in frozen_names]
+    # 开关挂的配置只在该开关对此人此刻判开时下发，才是此人整包的求值输入：
+    # 判开且挂了配置 -> 配置内容进摘要（改配置必换版本）；判关或没挂 -> 不进
+    # （改配置不波及他，全关期间所有开关判关，与「全关后不要带」一致）。
+    # 冻住的开关配置走 freezes 里的快照，这里不重复计。
+    configs = []
+    if results is not None:
+        for r in flags:
+            if r["name"] in frozen_names:
+                continue
+            if r["flag_config"] and results.get(r["name"], {}).get("enabled"):
+                configs.append([r["name"], json.loads(r["flag_config"])])
+    payload["configs"] = configs
     if attrs:
         # 带属性的包：属性本身进摘要；属性条件只在「对此人对得上」时进摘要
         # （实际参与了求值才算求值输入，对不上的条件改动不波及此人）。
@@ -635,17 +723,21 @@ def make_version(content_hash, generation):
 
 def compute_bundle(db, identity, attrs=None):
     """求出此身份此身属性下所有开关的结果与求值输入摘要。先求值（可能写入
-    组落定记录），再取摘要，保证摘要覆盖本次求值产生的落定记录——管理端
-    失效扫描与调用方来拿走同一套求值，记下的版本与本人来拿时拿到的才一致。
+    组落定记录），再取摘要，保证摘要覆盖本次求值产生的落定记录与本次判开
+    的开关配置——管理端失效扫描与调用方来拿走同一套求值，记下的版本与本人
+    来拿时拿到的才一致。
     整包共用一份依赖备忘：被依赖的开关先算一次，依赖它的开关与单查它时
     拿到的是同一个结果、同一个理由。"""
     flags = db.execute("SELECT * FROM flags ORDER BY name").fetchall()
     results = {}
     memo = {}
     for flag in flags:
-        enabled, reason = evaluate(db, flag, identity, attrs, memo)
-        results[flag["name"]] = {"enabled": enabled, "reason": reason}
-    return results, bundle_content_hash(db, identity, attrs)
+        enabled, reason, config = evaluate(db, flag, identity, attrs, memo)
+        item = {"enabled": enabled, "reason": reason}
+        if config is not None:
+            item["config"] = config
+        results[flag["name"]] = item
+    return results, bundle_content_hash(db, identity, attrs, results)
 
 
 def record_invalidations(db, actor_name, change):
@@ -728,13 +820,16 @@ def check(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
-    enabled, reason = evaluate(db, flag, identity, attrs)
+    enabled, reason, config = evaluate(db, flag, identity, attrs)
     body = {
         "flag": name,
         "identity": identity,
         "enabled": enabled,
         "reason": reason,
     }
+    # 开才带开关挂的配置（冻住的人拿冻住那一刻那份）；关不带这个键
+    if config is not None:
+        body["config"] = config
     if attrs is not None:
         body["attrs"] = attrs
     return jsonify(body)
@@ -860,16 +955,22 @@ def create_flag():
         targeting_json = validate_targeting(body.get("targeting"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    try:
+        config_json = validate_config(body.get("config"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     now = time.time()
     default_enabled = 1 if body.get("default_enabled") else 0
     db.execute(
         "INSERT INTO flags (name, description, default_enabled, targeting_rule,"
-        " created_at, updated_at) VALUES (?,?,?,?,?,?)",
-        (name, body.get("description", ""), default_enabled, targeting_json, now, now),
+        " flag_config, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        (name, body.get("description", ""), default_enabled, targeting_json,
+         config_json, now, now),
     )
     audit(actor(), name, "default", "create_flag",
           f"default_enabled={bool(default_enabled)}"
-          + (f" targeting={targeting_json}" if targeting_json else ""))
+          + (f" targeting={targeting_json}" if targeting_json else "")
+          + (f" config={config_json}" if config_json else ""))
     db.commit()
     record_invalidations(db, actor(), f"create_flag {name}")
     return jsonify({"ok": True}), 201
@@ -877,7 +978,7 @@ def create_flag():
 
 # 可预约定时生效的开关字段（与 PATCH 立即生效支持的字段一致）
 SCHEDULABLE_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
-                      "description", "targeting", "depends_on")
+                      "description", "targeting", "depends_on", "config")
 
 
 def validate_depends_on(db, flag, raw):
@@ -915,7 +1016,7 @@ def validate_depends_on(db, flag, raw):
 
 def apply_flag_fields(db, flag, body):
     """把 kill_switch / default_enabled / rollout_percent / description /
-    targeting / depends_on 写到开关上。
+    targeting / depends_on / config 写到开关上。
 
     立即生效与定时生效到点应用共用这一段。返回 (changes, error)：
     changes 是 (layer, action, detail) 列表（值没变的字段不在列）；
@@ -961,6 +1062,19 @@ def apply_flag_fields(db, flag, body):
             else:
                 changes.append(("targeting", "clear_targeting",
                                 f"targeting removed (was {flag['targeting_rule']})"))
+    if "config" in body:
+        try:
+            new_config = validate_config(body["config"])
+        except ValueError as e:
+            return None, str(e)
+        if new_config != flag["flag_config"]:
+            db.execute("UPDATE flags SET flag_config=?, updated_at=? WHERE id=?",
+                       (new_config, time.time(), flag["id"]))
+            if new_config:
+                changes.append(("config", "set_config", f"config={new_config}"))
+            else:
+                changes.append(("config", "clear_config",
+                                f"config removed (was {flag['flag_config']})"))
     if "kill_switch" in body:
         new = 1 if body["kill_switch"] else 0
         if new != flag["kill_switch"]:
@@ -1002,7 +1116,7 @@ def schedule_flag_change(db, flag, body, effective_at):
     if not payload:
         return jsonify({"error": "nothing to schedule"
                                  " (no kill_switch/default_enabled/rollout_percent"
-                                 "/description/depends_on given)"}), 400
+                                 "/description/depends_on/config given)"}), 400
     # 与立即生效同一套校验，避免约了一个到点应用不了的值
     if "rollout_percent" in payload:
         v = payload["rollout_percent"]
@@ -1011,6 +1125,12 @@ def schedule_flag_change(db, flag, body, effective_at):
     if "targeting" in payload:
         try:
             validate_targeting(payload["targeting"])
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+    if "config" in payload:
+        try:
+            # 预约表里存规范化后的串，到点应用时不再产生歧义
+            payload["config"] = json.loads(validate_config(payload["config"]))
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
     if "depends_on" in payload:
@@ -1209,8 +1329,9 @@ def delete_override(name):
 
 def freeze_result(db, flag, identity):
     """冻住时按当前完整规则求一次「此刻」的结果（不带属性口径），
-    返回 (enabled, reason)。跳过本开关已有的冻结行——重新冻同一个人时，
-    冻住的是「假如现在解冻会算出的结果」；被依赖开关的冻结照常生效。"""
+    返回 (enabled, reason, config)。跳过本开关已有的冻结行——重新冻同一个人时，
+    冻住的是「假如现在解冻会算出的结果」；被依赖开关的冻结照常生效。
+    config 即此人此刻判开时开关挂的配置（冻住后按这份快照下发），判关为 None。"""
     return evaluate(db, flag, identity, None,
                     _skip_freeze_id=flag["id"])
 
@@ -1224,12 +1345,14 @@ def list_freezes(name):
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
     rows = db.execute(
-        "SELECT identity, frozen_enabled, frozen_reason, created_by, created_at"
+        "SELECT identity, frozen_enabled, frozen_reason, frozen_config, created_by, created_at"
         " FROM freezes WHERE flag_id=? ORDER BY identity", (flag["id"],),
     ).fetchall()
     return jsonify([
         {"identity": r["identity"], "enabled": bool(r["frozen_enabled"]),
-         "frozen_reason": r["frozen_reason"], "created_by": r["created_by"],
+         "frozen_reason": r["frozen_reason"],
+         "config": json.loads(r["frozen_config"]) if r["frozen_config"] else None,
+         "created_by": r["created_by"],
          "created_at": r["created_at"]}
         for r in rows
     ])
@@ -1253,31 +1376,42 @@ def put_freeze(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
-    enabled, reason = freeze_result(db, flag, identity)
+    enabled, reason, config = freeze_result(db, flag, identity)
     now = time.time()
     existing = db.execute(
-        "SELECT frozen_enabled FROM freezes WHERE flag_id=? AND identity=?",
+        "SELECT frozen_enabled, frozen_config FROM freezes"
+        " WHERE flag_id=? AND identity=?",
         (flag["id"], identity),
     ).fetchone()
     if existing is not None and bool(existing["frozen_enabled"]) == enabled:
-        # 冻住的值与现状一致：不改动、不换版本（幂等）
+        # 冻住的开/关没变就是 no-op：值、理由、配置快照都不刷新（与「冻住后
+        # 雷打不动」一致，想拿新配置需先解冻），不产生失效记录。
         return jsonify({"ok": True, "changed": False, "enabled": enabled,
                         "reason": reason})
+    # 第一次冻，或重新冻把结果从开冻成关 / 从关冻成开：此刻挂着的配置一并
+    # 快照——冻在开带这份（没挂为 ''），冻在关为 ''（关不带配置）。
+    config_json = flag["flag_config"] if enabled else ""
     db.execute(
         "INSERT INTO freezes (flag_id, identity, frozen_enabled, frozen_reason,"
-        " created_by, created_at) VALUES (?,?,?,?,?,?)"
-        " ON CONFLICT(flag_id, identity) DO UPDATE SET frozen_enabled=excluded.frozen_enabled,"
-        " frozen_reason=excluded.frozen_reason, created_by=excluded.created_by,"
+        " frozen_config, created_by, created_at) VALUES (?,?,?,?,?,?,?)"
+        " ON CONFLICT(flag_id, identity) DO UPDATE SET"
+        " frozen_enabled=excluded.frozen_enabled,"
+        " frozen_reason=excluded.frozen_reason,"
+        " frozen_config=excluded.frozen_config,"
+        " created_by=excluded.created_by,"
         " created_at=excluded.created_at",
-        (flag["id"], identity, 1 if enabled else 0, reason, actor(), now),
+        (flag["id"], identity, 1 if enabled else 0, reason, config_json,
+         actor(), now),
     )
     audit(actor(), name, "freeze", "freeze_result",
           f"identity={identity} enabled={enabled} reason={reason}")
     db.commit()
     record_invalidations(db, actor(),
                          f"freeze_result {name} identity={identity} -> {enabled}")
-    return jsonify({"ok": True, "changed": True, "enabled": enabled,
-                    "reason": reason})
+    body = {"ok": True, "changed": True, "enabled": enabled, "reason": reason}
+    if config is not None:
+        body["config"] = config
+    return jsonify(body)
 
 
 @app.delete("/api/flags/<name>/freezes")
@@ -1356,7 +1490,7 @@ def cancel_scheduled_change(change_id):
 # 稿里允许收的开关字段（与立即生效 PATCH 支持的字段一致，但不含 effective_at：
 # 稿在发布的一刻统一生效，不能再约时间）
 DRAFT_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
-                "description", "targeting", "depends_on")
+                "description", "targeting", "depends_on", "config")
 
 
 def normalize_patch(db, body):
@@ -1381,6 +1515,8 @@ def normalize_patch(db, body):
         out["depends_on"] = dep  # "" = 解除依赖
     if "targeting" in body:
         out["targeting"] = validate_targeting(body["targeting"])  # "" = 清除条件
+    if "config" in body:
+        out["config"] = validate_config(body["config"])  # "" = 清除配置
     if "kill_switch" in body:
         out["kill_switch"] = 1 if body["kill_switch"] else 0
     if "default_enabled" in body:
@@ -1398,10 +1534,12 @@ def normalize_patch(db, body):
 
 
 def draft_change_to_dict(ch):
-    """稿内改动存储格式 -> 对外 JSON（布尔还原、targeting 的 '' 还原为 {}）。"""
+    """稿内改动存储格式 -> 对外 JSON（布尔还原；targeting/config 的 '' 还原为 None）。"""
     out = dict(ch)
     if "targeting" in out:
         out["targeting"] = json.loads(out["targeting"]) if out["targeting"] else {}
+    if "config" in out:
+        out["config"] = json.loads(out["config"]) if out["config"] else None
     for k in ("kill_switch", "default_enabled"):
         if k in out:
             out[k] = bool(out[k])
@@ -1510,6 +1648,16 @@ def apply_patch_to_flag(db, flag, ch, now):
             else:
                 changes.append(("targeting", "clear_targeting",
                                 f"targeting removed (was {flag['targeting_rule']})"))
+    if "config" in ch:
+        new_config = ch["config"]
+        if new_config != flag["flag_config"]:
+            db.execute("UPDATE flags SET flag_config=?, updated_at=? WHERE id=?",
+                       (new_config, now, fid))
+            if new_config:
+                changes.append(("config", "set_config", f"config={new_config}"))
+            else:
+                changes.append(("config", "clear_config",
+                                f"config removed (was {flag['flag_config']})"))
     if "kill_switch" in ch:
         new = ch["kill_switch"]
         if new != flag["kill_switch"]:

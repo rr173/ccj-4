@@ -203,6 +203,7 @@ async function loadFlags() {
     if (f.rollout_percent > 0) badges.push(`<span class="badge roll">${f.rollout_percent}%</span>`);
     if (f.targeting && Object.keys(f.targeting).length)
       badges.push('<span class="badge on">属性条件</span>');
+    if (f.config != null) badges.push('<span class="badge on">挂配置</span>');
     badges.push(f.default_enabled
       ? '<span class="badge on">默认开</span>' : '<span class="badge">默认关</span>');
     if (f.override_count) badges.push(`<span class="badge">${f.override_count} 人强制</span>`);
@@ -289,6 +290,18 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
+      <h3>⑤ˊ 开关配置 <span class="prio">挂一份 JSON（对象/数组/标量都行）：对此开关判开的人，单查与整包都带上这份；判关（含全关）不带。改这份只让此刻判开的人整包换新版本；冻住在开的人一直拿冻住那一刻那份</span></h3>
+      <div class="row">
+        <input id="flagConfig" type="text" style="flex:1"
+          placeholder='JSON 配置，如 {"color":"blue"}；null 或留空后点「清除」=不挂配置'
+          value="${f.config != null ? esc(JSON.stringify(f.config)) : ''}">
+        <button class="primary" onclick="setFlagConfig()">保存配置</button>
+        <button onclick="clearFlagConfig()">清除</button>
+      </div>
+      <div class="muted">配置只随「开」走，与由哪一层决定无关；没挂配置时调用方的响应里根本没有 <code>config</code> 这个键。</div>
+    </div>
+
+    <div class="layer">
       <h3>⑥ 比例放量 <span class="prio">属性对不上时才看这里：比例 &gt; 0 时此层定论，命中开、未命中关；同一身份结果恒定</span></h3>
       <div class="row">
         <input type="range" min="0" max="100" value="${f.rollout_percent}"
@@ -314,7 +327,7 @@ async function renderDetail() {
         <button onclick="unstageFromDraft()">从稿里摘掉本开关</button>
         <span id="draftStaged" class="muted"></span>
       </div>
-      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 属性条件（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
+      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 属性条件 / 开关配置（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
     </div>
 
     <div class="layer">
@@ -365,7 +378,8 @@ function populateDraftSelect() {
 
 const FIELD_NAMES = { kill_switch: '全关', default_enabled: '默认开',
                       rollout_percent: '放量比例', description: '描述',
-                      targeting: '属性打开条件', depends_on: '开关依赖' };
+                      targeting: '属性打开条件', depends_on: '开关依赖',
+                      config: '开关配置' };
 
 function depOptions(f) {
   let html = '<option value="">（无依赖）</option>';
@@ -456,7 +470,7 @@ const toggleKill  = () => patch({ kill_switch: !current().kill_switch });
 const setDefault  = v  => patch({ default_enabled: v });
 const setRollout  = v  => patch({ rollout_percent: parseInt(v, 10) });
 
-async function setTargeting() {
+const setTargeting = async function() {
   let rule;
   const raw = $('tgtRule').value.trim();
   if (!raw) return toast('条件为空：要清除请点「清除」', true);
@@ -464,8 +478,17 @@ async function setTargeting() {
   if (typeof rule !== 'object' || Array.isArray(rule))
     return toast('条件必须是 JSON 对象', true);
   await patch({ targeting: rule });
-}
+};
 const clearTargeting = () => patch({ targeting: {} });
+
+async function setFlagConfig() {
+  const raw = $('flagConfig').value.trim();
+  if (!raw) return toast('配置为空：不挂配置请点「清除」', true);
+  let cfg;
+  try { cfg = JSON.parse(raw); } catch (e) { return toast('配置不是合法 JSON', true); }
+  await patch({ config: cfg });
+}
+const clearFlagConfig = () => patch({ config: null });
 
 async function setOverride(enabled) {
   const id = $('ovIdentity').value;  // 不 trim：首尾空格也是身份的一部分
@@ -502,8 +525,10 @@ async function loadFreezes() {
       ? '<span class="badge on">开</span>' : '<span class="badge off">关</span>';
     const tdReason = document.createElement('td');
     tdReason.className = 'muted';
+    const cfgTxt = z.config !== undefined && z.config !== null
+      ? `，配置快照 ${JSON.stringify(z.config)}` : '';
     tdReason.textContent = (REASON_NAMES[z.frozen_reason] || z.frozen_reason)
-      + (z.created_by ? `（${z.created_by} 冻的）` : '');
+      + (z.created_by ? `（${z.created_by} 冻的）` : '') + cfgTxt;
     const tdBtn = document.createElement('td');
     const btn = document.createElement('button');
     btn.textContent = '解冻';
@@ -554,7 +579,9 @@ async function checkIdentity() {
   const r = await fetch(url).then(r => r.json());
   $('checkResult').innerHTML = r.error ? esc(r.error)
     : `结果：<b style="color:${r.enabled ? 'var(--ok)' : 'var(--danger)'}">${r.enabled ? '开' : '关'}</b>
-       <span class="muted">（由「${REASON_NAMES[r.reason] || r.reason}」层决定）</span>`;
+       <span class="muted">（由「${REASON_NAMES[r.reason] || r.reason}」层决定）</span>`
+       + (r.config !== undefined
+          ? `<div class="muted" style="margin-top:4px">配置：<code>${esc(JSON.stringify(r.config))}</code></div>` : '');
 }
 
 // ---------------------------------------------------------------- 整包
@@ -572,7 +599,10 @@ function renderBundle(r) {
   if (r.error) return esc(r.error);
   const rows = Object.entries(r.flags).map(([name, v]) =>
     `<div>${esc(name)}：<b style="color:${v.enabled ? 'var(--ok)' : 'var(--danger)'}">` +
-    `${v.enabled ? '开' : '关'}</b> <span class="muted">(${esc(v.reason)})</span></div>`).join('');
+    `${v.enabled ? '开' : '关'}</b> <span class="muted">(${esc(v.reason)})</span>` +
+    (v.config !== undefined
+      ? ` <span class="muted">配置：<code>${esc(JSON.stringify(v.config))}</code></span>` : '') +
+    `</div>`).join('');
   return `<div>整包版本：<b>${esc(r.version)}</b></div>` +
          (rows || '<div class="muted">（还没有开关）</div>');
 }
@@ -716,7 +746,7 @@ async function stageToDraft() {
   const id = sel && sel.value;
   if (!id) return toast('先开一个稿', true);
   // 从当前控件收集要收入稿的字段：全关 / 默认开取当前开关状态，
-  // 放量比例取滑块值，属性条件取输入框（输入框为空表示这稿不动条件）
+  // 放量比例取滑块值，属性条件与开关配置取输入框（输入框为空表示这稿不动它）
   const patch = {
     kill_switch: current().kill_switch,
     default_enabled: current().default_enabled,
@@ -726,6 +756,11 @@ async function stageToDraft() {
   if (raw) {
     try { patch.targeting = JSON.parse(raw); }
     catch (e) { return toast('属性条件不是合法 JSON，无法收入稿', true); }
+  }
+  const cfgRaw = $('flagConfig').value.trim();
+  if (cfgRaw) {
+    try { patch.config = JSON.parse(cfgRaw); }
+    catch (e) { return toast('开关配置不是合法 JSON，无法收入稿', true); }
   }
   try {
     await api(`/api/drafts/${id}/flags/${encodeURIComponent(selected)}`,
