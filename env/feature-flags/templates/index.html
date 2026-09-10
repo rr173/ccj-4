@@ -126,6 +126,28 @@
     </div>
 
     <div class="card" style="margin-bottom:16px">
+      <h2>预演 <span class="muted" style="font-weight:normal">改前先看一眼：点名几个人，看「现在」与「改完 / 发布后」每个开关开没开；真的开关和稿都不会动</span></h2>
+      <div class="row">
+        <input id="pvIdentities" type="text" style="flex:1" placeholder="身份，多个用逗号分隔，如 u1, u2, u3">
+      </div>
+      <div class="row">
+        <input id="pvAttrs" type="text" style="flex:1"
+          placeholder='属性 attrs（可选，JSON 对象），如 {"plan":"pro","level":3}'>
+      </div>
+      <div class="row">
+        <select id="pvFlag" style="min-width:200px"></select>
+        <input id="pvChanges" type="text" style="flex:1"
+          placeholder='要改的字段（JSON），如 {"default_enabled":true,"rollout_percent":50}'>
+        <button onclick="runPreviewChanges()">预演这次改动</button>
+      </div>
+      <div class="row">
+        <select id="pvDraft" style="min-width:200px"></select>
+        <button onclick="runPreviewDraft()">预演发布这稿</button>
+      </div>
+      <div id="pvResult" class="check-result"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
       <h2>整包失效记录 <span class="muted" style="font-weight:normal">谁改了什么、让哪些人的整包过期了</span>
         <button style="float:right" onclick="loadInvalidations()">刷新</button></h2>
       <table>
@@ -191,6 +213,7 @@ async function loadFlags() {
     $('flagList').innerHTML = '<span class="muted">加载失败：' + e.message + '（检查 Token）</span>';
     return;
   }
+  populatePreviewSelects();
   const el = $('flagList');
   if (!flags.length) { el.innerHTML = '<span class="muted">还没有开关</span>'; renderDetail(); return; }
   el.innerHTML = '';
@@ -631,6 +654,95 @@ async function validateBundle() {
   if (!r.valid) $('bundleResult').innerHTML = renderBundle(r);
 }
 
+// ---------------------------------------------------------------- 预演
+
+function populatePreviewSelects() {
+  const pvF = $('pvFlag');
+  if (pvF) pvF.innerHTML = flags.length
+    ? flags.map(f => `<option value="${esc(f.name)}">${esc(f.name)}</option>`).join('')
+    : '<option value="">（还没有开关）</option>';
+  const pvD = $('pvDraft');
+  if (pvD) pvD.innerHTML = drafts.length
+    ? drafts.map(d => `<option value="${d.id}">#${d.id} ${esc(d.note || '')}（${Object.keys(d.flags || {}).length} 个开关）</option>`).join('')
+    : '<option value="">（没有未发布的稿）</option>';
+}
+
+function pvReadIdentities() {
+  const list = $('pvIdentities').value.split(',').map(s => s.trim()).filter(s => s);
+  if (!list.length) throw new Error('请填写至少一个身份（逗号分隔）');
+  return list;
+}
+
+function pvReadAttrs() {
+  const raw = $('pvAttrs').value.trim();
+  if (!raw) return null;
+  let a;
+  try { a = JSON.parse(raw); } catch (e) { throw new Error('属性不是合法 JSON'); }
+  if (typeof a !== 'object' || a === null || Array.isArray(a))
+    throw new Error('属性必须是 JSON 对象');
+  return a;
+}
+
+async function runPreview(body) {
+  try {
+    const r = await api('/api/preview', { method: 'POST', body: JSON.stringify(body) });
+    renderPreview(r);
+  } catch (e) { toast('预演失败：' + e.message, true); }
+}
+
+async function runPreviewChanges() {
+  let body;
+  try {
+    const raw = $('pvChanges').value.trim();
+    if (!raw) throw new Error('请填写要改的字段（JSON）');
+    let changes;
+    try { changes = JSON.parse(raw); } catch (e) { throw new Error('改动不是合法 JSON'); }
+    if (typeof changes !== 'object' || changes === null || Array.isArray(changes))
+      throw new Error('改动必须是 JSON 对象');
+    body = { identities: pvReadIdentities(), flag: $('pvFlag').value, changes };
+    const a = pvReadAttrs(); if (a) body.attrs = a;
+  } catch (e) { return toast(e.message, true); }
+  if (!body.flag) return toast('还没有开关', true);
+  await runPreview(body);
+}
+
+async function runPreviewDraft() {
+  let body;
+  try {
+    body = { identities: pvReadIdentities(), draft_id: parseInt($('pvDraft').value, 10) };
+    const a = pvReadAttrs(); if (a) body.attrs = a;
+  } catch (e) { return toast(e.message, true); }
+  if (!body.draft_id) return toast('还没有未发布的稿', true);
+  await runPreview(body);
+}
+
+function fmtFlag(name, v) {
+  return `${esc(name)}：<b style="color:${v.enabled ? 'var(--ok)' : 'var(--danger)'}">${v.enabled ? '开' : '关'}</b>`
+    + ` <span class="muted">(${esc(v.reason)})</span>`
+    + (v.config !== undefined
+       ? ` <span class="muted">配置：<code>${esc(JSON.stringify(v.config))}</code></span>` : '');
+}
+
+function renderPreview(r) {
+  let head;
+  if (r.mode === 'draft') {
+    head = `<div>稿 #${r.draft_id} ` + (r.publishable
+      ? '<span style="color:var(--ok)">现在发布能成功</span>'
+      : `<span style="color:var(--danger)">现在发布会失败</span>：${esc(r.error || '')}（什么都不会变）`) + '</div>';
+  } else {
+    head = `<div>要是现在改 ${esc(r.flag)}：<code>${esc(JSON.stringify(r.changes))}</code></div>`;
+  }
+  const blocks = Object.entries(r.identities).map(([id, p]) => {
+    const total = Object.keys(p.current).length;
+    const rows = p.changed.length
+      ? p.changed.map(n => `<div>• ${fmtFlag(n, p.current[n])} → ${fmtFlag(n, p.preview[n])}</div>`).join('')
+        + `<div class="muted">其余 ${total - p.changed.length} 个开关不变</div>`
+      : `<div class="muted">全部 ${total} 个开关结果不变</div>`;
+    return `<div style="margin-top:6px"><b>${esc(id)}</b>${rows}</div>`;
+  }).join('');
+  $('pvResult').innerHTML = head + blocks;
+}
+
 async function loadInvalidations() {
   try {
     const rows = await api('/api/bundles/invalidations?limit=200');
@@ -665,6 +777,7 @@ async function loadDrafts() {
     $('draftList').innerHTML = '<span class="muted">加载失败：' + e.message + '</span>';
     return;
   }
+  populatePreviewSelects();
   const el = $('draftList');
   if (!drafts.length) { el.innerHTML = '<span class="muted">没有未发布的稿</span>'; return; }
   el.innerHTML = '';

@@ -254,6 +254,47 @@ curl -s -X POST http://localhost:8000/api/drafts/$DID/publish \
   `description`。**稿不支持 `effective_at`**：发布的一刻就是整稿的生效时刻。
 - 若稿里某个开关在发布前被删除，发布会被整稿拒绝（先把该开关的改动从稿里摘掉即可）。
 
+## 预演（改前先看一眼）
+
+管理端要改某个开关、或手头有一稿还没发，可以先**点几个人**看一眼：这些人
+现在每个开关开没开；**要是现在就改完、或者现在就把这稿发出去**，会变成什么样。
+开着的开关带上那份配置。预演只是先看一眼——真的开关和稿都不会动：
+
+```bash
+# 情形一：要是现在就把 promo 改成「默认开 + 50% 放量」，u1/u2 会变成什么样
+curl -X POST http://localhost:8000/api/preview \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "Content-Type: application/json" \
+  -d '{"identities": ["u1", "u2"], "flag": "promo",
+       "changes": {"default_enabled": true, "rollout_percent": 50}}'
+
+# 情形二：要是现在就把稿 #3 发出去（draft_id 与 flag+changes 二选一）
+curl -X POST http://localhost:8000/api/preview \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "Content-Type: application/json" \
+  -d '{"identities": ["u1", "u2"], "draft_id": 3}'
+
+# => {"mode":"changes","flag":"promo","changes":{"default_enabled":true,"rollout_percent":50},
+#     "identities":{"u1":{"current":{…每个开关现在开没开…},
+#                         "preview":{…改完后开没开…},
+#                         "changed":["promo"]}, "u2":{…}}}
+```
+
+- **两份全量结果**：每个人给 `current`（现在每个开关开没开）与 `preview`
+  （改完 / 发布后会变成什么样），结构与整包的 `flags` 相同（开着的带 `config`，
+  冻住的人带冻住那一刻那份）；`changed` 列出结果会变的开关名
+  （开/关、决定层或配置任一不同都算）。
+- **真的什么都不动**：预演在「现在」的内存快照上套用假想改动求值——不落库、
+  不换整包版本、不写组落定、不进审计与历史流水，稿还是 open。
+- **全按现在的规矩算**：全关、冻结、依赖、单人强制、属性条件、互斥组、放量、
+  默认全部照现网；**还没到点的定时变更与别的没发布的稿不算进去**。
+  可带 `attrs`（JSON 对象）预演「带这身属性来问」的情形。
+- **稿发不出去照实说**：稿若现在发布会失败（目标开关被删、合并后成环），
+  响应带 `publishable:false` 与原因，`preview` 与 `current` 相同
+  （发不出去就是什么都不会变）。
+- **校验与真改同一口径**：改开关的预演按立即生效 PATCH 的规则校验（字段非法、
+  自依赖、成环都 400），不支持 `effective_at`——预演的就是「现在就改完」。
+  稿预演按发布时的整稿合并校验判定 `publishable`。
+- 一次最多点 100 个人；身份放在 JSON body 里，特殊字符无需转义。
+
 ## 问某个过去的时刻（历史重放）
 
 调用方可以指定一个**过去的时刻**，问某个人当时**每个开关**开还是关；开着的开关
@@ -351,6 +392,7 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 | DELETE | `/api/drafts/<id>/flags/<name>` | 从稿里摘掉该开关的整段改动 |
 | POST | `/api/drafts/<id>/publish` | 发布整稿：合并后成环/目标缺失则 400 整稿不动，否则一起生效、整包换版本 |
 | DELETE | `/api/drafts/<id>` | 丢弃未发布的稿（不影响任何求值与版本） |
+| POST | `/api/preview` | 预演（只读，什么都不动）：点名几个人，看「现在」与「改完/发布后」每个开关开没开；body `{identities, attrs?, flag+changes 或 draft_id}` |
 | GET | `/api/bundles` | 已发出的整包（身份、属性哈希、版本、是否已过期 stale） |
 | GET | `/api/bundles/invalidations?limit=100` | 整包失效记录：谁改了什么、让哪些人的哪身属性的整包从哪个版本变成哪个版本 |
 

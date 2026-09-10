@@ -80,6 +80,14 @@ scheduled_changes 表里，不参与求值）；到点之后，第一个进来�
 单独看都合法，所以 A 依赖 B、B 依赖 A 能各自收进同一稿，发布时才被一起
 拒绝）。没发布的稿可以整条丢弃（不影响任何求值），也可以摘掉稿里某个
 开关的改动。稿不支持 effective_at：发布时刻就是生效时刻。
+
+预演（preview）：管理端改某个开关之前、或手里有一稿还没发，可以先点几个人
+看一眼（POST /api/preview）：这些人现在每个开关开没开；要是现在就改完、
+或者现在就把这稿发出去，会变成什么样。开着的开关带上配置。预演全程只读——
+在「现在」的内存快照上套用假想改动后按同一套优先级求值，真的开关、稿、
+整包版本、组落定、审计与历史流水一概不动；全关、冻结、依赖按现在的规矩算，
+还没到点的定时变更与别的没发布的稿不算进去。稿若现在发不出去（目标开关
+没了 / 合并成环），预演照实回答 publishable=false 与原因，结果与现在相同。
 """
 
 import hashlib
@@ -265,6 +273,20 @@ LAYERS = ("kill_switch", "freeze", "depends_on", "override", "targeting",
 
 # ---------------------------------------------------------------- attrs / targeting
 
+def validate_attrs(attrs):
+    """校验「这个人身上的属性」对象：键为非空字符串、值为标量的扁平 dict。
+    非法抛 ValueError。parse_attrs 与预演接口（body 里直接给 JSON 对象）共用。"""
+    if not isinstance(attrs, dict):
+        raise ValueError("attrs must be a JSON object")
+    for k, v in attrs.items():
+        if not isinstance(k, str) or k == "":
+            raise ValueError("attr keys must be non-empty strings")
+        if isinstance(v, bool) or v is None or isinstance(v, (str, int, float)):
+            continue
+        raise ValueError(f"attr '{k}' must be a scalar (string/number/bool/null)")
+    return attrs
+
+
 def parse_attrs(raw):
     """解析调用方来问时带的属性（查询参数 attrs，URL 编码的 JSON 对象）。
 
@@ -278,15 +300,7 @@ def parse_attrs(raw):
         attrs = json.loads(raw)
     except (ValueError, TypeError):
         raise ValueError("attrs must be URL-encoded JSON, e.g. %7B%22plan%22%3A%22pro%22%7D")
-    if not isinstance(attrs, dict):
-        raise ValueError("attrs must be a JSON object")
-    for k, v in attrs.items():
-        if not isinstance(k, str) or k == "":
-            raise ValueError("attr keys must be non-empty strings")
-        if isinstance(v, bool) or v is None or isinstance(v, (str, int, float)):
-            continue
-        raise ValueError(f"attr '{k}' must be a scalar (string/number/bool/null)")
-    return attrs
+    return validate_attrs(attrs)
 
 
 def scalar_equal(a, b):
@@ -2340,6 +2354,225 @@ def discard_draft(draft_id):
     audit(actor(), f"draft:{draft_id}", "draft", "discard_draft", "")
     db.commit()
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- 预演（preview）
+
+def snapshot_current_state(db, identity):
+    """把「现在」线上的完整求值状态读成与 replay_state 相同的内存结构（纯读，不写库）。
+
+    预演专用：在这份内存状态上套用假想改动后用 evaluate_at 求值——全关、冻结、
+    依赖、单人强制、属性条件、互斥组、放量、默认全按现在的规矩。还没到点的定时
+    变更只躺在 scheduled_changes 里、没发布的稿只躺在 drafts 里，本来就没写进
+    这些表，自然不进预演。
+    """
+    flags = {}
+    rows = db.execute("SELECT * FROM flags").fetchall()
+    name_of_id = {r["id"]: r["name"] for r in rows}
+    for r in rows:
+        dep = ""
+        if r["depends_on_flag_id"] is not None:
+            dep = name_of_id.get(r["depends_on_flag_id"], "")
+        flags[r["name"]] = {
+            "default_enabled": bool(r["default_enabled"]),
+            "rollout_percent": r["rollout_percent"],
+            "kill_switch": bool(r["kill_switch"]),
+            "targeting": r["targeting_rule"],
+            "config": r["flag_config"],
+            "depends_on": dep,
+        }
+    overrides = {}
+    for r in db.execute(
+            "SELECT f.name AS fname, o.enabled FROM overrides o"
+            " JOIN flags f ON f.id=o.flag_id WHERE o.identity=?", (identity,)):
+        overrides[(r["fname"], identity)] = bool(r["enabled"])
+    frozen = {}
+    for r in db.execute(
+            "SELECT f.name AS fname, z.frozen_enabled, z.frozen_config FROM freezes z"
+            " JOIN flags f ON f.id=z.flag_id WHERE z.identity=?", (identity,)):
+        frozen[(r["fname"], identity)] = {"enabled": bool(r["frozen_enabled"]),
+                                          "config": r["frozen_config"]}
+    groups = {}
+    for r in db.execute(
+            "SELECT g.name AS gname, f.name AS fname FROM group_members m"
+            " JOIN mutex_groups g ON g.id=m.group_id"
+            " JOIN flags f ON f.id=m.flag_id"):
+        groups.setdefault(r["gname"], set()).add(r["fname"])
+    assignments = {}
+    for r in db.execute(
+            "SELECT g.name AS gname, f.name AS fname FROM group_assignments a"
+            " JOIN mutex_groups g ON g.id=a.group_id"
+            " JOIN flags f ON f.id=a.flag_id WHERE a.identity=?", (identity,)):
+        assignments[r["gname"]] = r["fname"]
+    return {"flags": flags, "overrides": overrides, "frozen": frozen,
+            "groups": groups, "assignments": assignments}
+
+
+def evaluate_state_bundle(state, identity, attrs=None):
+    """在内存状态上求全部开关（按名字序，与整包同口径），开着的带上配置。
+
+    纯函数：组内落定只在内存里模拟（与 evaluate_at 的历史重放同一套口径），
+    不写库——预演不会留下任何落定记录。
+    """
+    results = {}
+    memo = {}
+    for name in sorted(state["flags"]):
+        enabled, reason, config = evaluate_at(state, name, identity, attrs, memo)
+        item = {"enabled": enabled, "reason": reason}
+        if config is not None:
+            item["config"] = config
+        results[name] = item
+    return results
+
+
+def apply_patch_to_state(state, flag_name, patch):
+    """把一段规范化后的改动（normalize_patch 口径）套到内存状态里的开关上。
+
+    只动内存、不落库。依赖指向不存在的开关时按解除处理（与历史重放、线上
+    「被依赖开关删除自动解除」同一口径）。
+    """
+    flag = state["flags"].get(flag_name)
+    if flag is None:
+        return
+    if "kill_switch" in patch:
+        flag["kill_switch"] = bool(patch["kill_switch"])
+    if "default_enabled" in patch:
+        flag["default_enabled"] = bool(patch["default_enabled"])
+    if "rollout_percent" in patch:
+        flag["rollout_percent"] = int(patch["rollout_percent"])
+    if "targeting" in patch:
+        flag["targeting"] = patch["targeting"]
+    if "config" in patch:
+        flag["config"] = patch["config"]
+    if "depends_on" in patch:
+        dep = patch["depends_on"] or ""
+        flag["depends_on"] = dep if dep in state["flags"] else ""
+
+
+@app.post("/api/preview")
+@require_admin
+def preview():
+    """管理端预演：改前先看一眼——真的开关、稿、整包版本、组落定一概不动。
+
+    POST /api/preview
+      {
+        "identities": ["u1", "u2", …],            // 点名要看的人（必填，≤100 个）
+        "attrs": {"plan": "pro"},                  // 可选：假设带这身属性来问
+        "flag": "new-checkout", "changes": {…},    // 情形一：要是现在就改完
+        "draft_id": 3                              // 情形二：要是现在就把这稿发出去
+      }
+      （flag+changes 与 draft_id 二选一）
+
+    对每个人返回两份全量结果：current（现在每个开关开没开）与 preview（改完 /
+    发布后会变成什么样），开着的开关带配置；changed 列出结果会变（开/关、理由
+    或配置不同）的开关名。预演全程只读：不落库、不进审计与历史流水、不产生
+    失效记录；全关 / 冻结 / 依赖按现在的规矩算，还没到点的定时变更与别的没
+    发布的稿不算进去。稿若现在发不出去（目标开关没了 / 合并成环），
+    publishable=false 并带原因，preview 与 current 相同（发不出去=什么都不会变）。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    identities = body.get("identities")
+    if not isinstance(identities, list) or not identities:
+        return jsonify({"error": "identities is required"
+                                 " (non-empty list of strings)"}), 400
+    if len(identities) > 100:
+        return jsonify({"error": "at most 100 identities per preview"}), 400
+    for ident in identities:
+        if not isinstance(ident, str) or ident == "":
+            return jsonify({"error": "identities must be non-empty strings"}), 400
+    attrs = body.get("attrs")
+    if attrs is not None:
+        try:
+            validate_attrs(attrs)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        if not attrs:
+            attrs = None
+
+    has_changes = body.get("flag") is not None or body.get("changes") is not None
+    has_draft = body.get("draft_id") is not None
+    if has_changes == has_draft:
+        return jsonify({"error": "give exactly one of (flag + changes) or draft_id"}), 400
+
+    db = get_db()
+    publish_error = None
+    if has_changes:
+        flag_name = body.get("flag")
+        changes_body = body.get("changes")
+        if not isinstance(flag_name, str) or not flag_name:
+            return jsonify({"error": "flag is required with changes"}), 400
+        if not isinstance(changes_body, dict) or not changes_body:
+            return jsonify({"error": "changes is required (non-empty object)"}), 400
+        if changes_body.get("effective_at") is not None:
+            return jsonify({"error": "preview applies the change as of now;"
+                                     " effective_at is not supported"}), 400
+        flag = db.execute("SELECT * FROM flags WHERE name=?", (flag_name,)).fetchone()
+        if flag is None:
+            return jsonify({"error": "flag not found"}), 404
+        try:
+            patch = normalize_patch(db, changes_body)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        if not patch:
+            return jsonify({"error": "nothing to preview (no kill_switch"
+                                     "/default_enabled/rollout_percent/description"
+                                     "/targeting/depends_on/config given)"}), 400
+        # 与立即生效 PATCH 同一口径：依赖目标要存在、自依赖与成环直接拒
+        if "depends_on" in patch:
+            _, dep_err = validate_depends_on(db, flag, patch["depends_on"])
+            if dep_err:
+                return jsonify({"error": dep_err}), 400
+        staged = {flag_name: patch}
+        mode = {"mode": "changes", "flag": flag_name,
+                "changes": draft_change_to_dict(patch)}
+    else:
+        draft_id = body.get("draft_id")
+        if isinstance(draft_id, bool) or not isinstance(draft_id, int):
+            return jsonify({"error": "draft_id must be an integer"}), 400
+        draft, err = get_open_draft(db, draft_id)
+        if err:
+            return err
+        staged = {r["flag_name"]: json.loads(r["changes"])
+                  for r in db.execute(
+                      "SELECT flag_name, changes FROM draft_changes WHERE draft_id=?",
+                      (draft_id,))}
+        if not staged:
+            return jsonify({"error": "draft is empty"}), 400
+        # 与发布同一套校验：发不出去的稿，预演就是「什么都不会变」
+        missing = [n for n in staged if db.execute(
+            "SELECT 1 FROM flags WHERE name=?", (n,)).fetchone() is None]
+        if missing:
+            publish_error = ("draft targets flags that no longer exist"
+                             f" ({', '.join(missing)})")
+        else:
+            publish_error = merged_dependency_cycle(db, staged)
+        mode = {"mode": "draft", "draft_id": draft_id,
+                "publishable": publish_error is None}
+        if publish_error is not None:
+            mode["error"] = publish_error
+
+    people = {}
+    for ident in identities:
+        current = evaluate_state_bundle(snapshot_current_state(db, ident),
+                                        ident, attrs)
+        if publish_error is not None:
+            after = current
+        else:
+            state = snapshot_current_state(db, ident)
+            for fname, pch in staged.items():
+                apply_patch_to_state(state, fname, pch)
+            after = evaluate_state_bundle(state, ident, attrs)
+        changed = [n for n in current
+                   if current[n]["enabled"] != after[n]["enabled"]
+                   or current[n]["reason"] != after[n]["reason"]
+                   or current[n].get("config") != after[n].get("config")]
+        people[ident] = {"current": current, "preview": after, "changed": changed}
+
+    out = dict(mode)
+    out["identities"] = people
+    if attrs is not None:
+        out["attrs"] = attrs
+    return jsonify(out)
 
 
 # ---------------------------------------------------------------- mutex groups
