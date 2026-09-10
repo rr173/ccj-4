@@ -19,7 +19,9 @@
   只要比例 > 0，这一层就给出定论，不再落到默认值；比例为 0 表示未启用放量。
   同一身份对同一开关永远落在同一侧，与进程、机器、重启无关；
   调高比例只会**新增**命中者，已命中者不会掉出。
-- **默认值**：仅当放量比例为 0 时兜底。
+  若定了**放量条件**（`rollout_condition`），比例只对来问属性对上条件的人生效，
+  没对上的直接落到默认值（见「条件按比例放量」一节）。
+- **默认值**：放量比例为 0（未启用放量），或定了放量条件但没对上时兜底。
 
 ## 结果冻结（freeze）
 
@@ -128,6 +130,38 @@ curl "http://localhost:8000/api/flags/new-checkout/check?identity=u123&attrs=%7B
   属性的包版本一字不变。
 - `targeting` 同样支持 `effective_at` 预约定时生效；传 `{}` 或 `null` 清除条件。
 
+## 条件按比例放量（rollout_condition）
+
+管理端可以给放量比例再定一个「放量条件」（与 `targeting` 同形的 JSON 对象）：
+**比例放量只对来问属性对上条件的人生效**——对上的人里按比例开一部分、剩下的
+关；没对上的人（含没带属性来问的）不看比例，还按这个开关原来的默认值走：
+
+```bash
+# 只对 pro 套餐的人放 30%：pro 里三成开、七成关；其他人按默认值
+curl -X PATCH http://localhost:8000/api/flags/new-checkout \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"rollout_percent": 30, "rollout_condition": {"plan": "pro"}}'
+
+curl "http://localhost:8000/api/flags/new-checkout/check?identity=u123&attrs=%7B%22plan%22%3A%22pro%22%7D"
+# 对上：{"enabled":true|false,"reason":"rollout"}（由分桶决定，这一层定论）
+curl "http://localhost:8000/api/flags/new-checkout/check?identity=u456&attrs=%7B%22plan%22%3A%22free%22%7D"
+# 没对上：{"enabled":…,"reason":"default"}（不看比例，按默认值）
+```
+
+- **条件形式**：与 `targeting` 完全相同（多键 AND、值列表 OR、标量精确匹配），
+  传 `{}` 或 `null` 清除；没定条件时与只有比例时一字不差（比例对所有人分桶）。
+- **结果恒定**：分桶只认开关与身份（`sha256("{flag}:{identity}") % 100`），
+  条件只认来问属性——同一个人、同一身属性，问多少次、从哪台机器问都一样。
+- **优先级**：全关、结果冻结、开关依赖、单人强制都排在它前面，照样压过它；
+  对上的命中与放量命中一样算「自然结果为开」，在互斥组内仍要过组规则。
+- **改比例或改条件 → 整包换新版本**：比例 > 0 且定了条件时，这个条件决定每个
+  人走放量层还是默认值层，因此它是**所有人**（含不带属性的包）的求值输入——
+  改比例或改条件，所有已发整包序号 +1 换新版本，拿着改前那包来问得到
+  `valid=false`。比例为 0 时条件不参与求值，改它不动任何版本。
+- `rollout_condition` 同样支持 `effective_at` 预约定时生效、可收进发布稿、
+  可在预演里试；建开关时也可以直接带上。
+
 ## 互斥组
 
 管理端可把多个开关编入同一互斥组（一个开关最多进一个组）。对同一身份，
@@ -190,7 +224,7 @@ GET '/api/bundle?identity=<用户身份>&attrs=<URL编码的JSON属性>&version=
 
 ## 定时生效（约个时间再生效）
 
-管理端改开关配置（全关 / 开关依赖 / 默认值 / 放量比例 / 属性打开条件 / 描述）时，可以带一个
+管理端改开关配置（全关 / 开关依赖 / 默认值 / 放量比例 / 放量条件 / 属性打开条件 / 描述）时，可以带一个
 `effective_at`（unix 秒）把改动约到未来某个时刻生效：
 
 ```bash
@@ -250,7 +284,8 @@ curl -s -X POST http://localhost:8000/api/drafts/$DID/publish \
 - **多稿并存**：可以同时开多个稿；发布其中一个不影响其他稿。已发布 / 已丢弃的稿
   保留记录（`GET /api/drafts?all=1`），但不能再改、再发布。
 - 稿里可收的字段与立即生效 PATCH 一致：`kill_switch`、`default_enabled`、
-  `rollout_percent`、`targeting`（`{}` 清条件）、`depends_on`（`""`/`null` 解除）、
+  `rollout_percent`、`rollout_condition`（`{}` 清放量条件）、`targeting`
+  （`{}` 清条件）、`depends_on`（`""`/`null` 解除）、
   `description`。**稿不支持 `effective_at`**：发布的一刻就是整稿的生效时刻。
 - 若稿里某个开关在发布前被删除，发布会被整稿拒绝（先把该开关的改动从稿里摘掉即可）。
 
@@ -366,8 +401,8 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/flags` | 列出所有开关 |
-| POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting}` |
-| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |
+| POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting, rollout_condition}` |
+| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, rollout_condition, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`rollout_condition` 为放量条件 JSON（`{}`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |
 | DELETE | `/api/flags/<name>` | 删除开关（其未生效的定时变更一并取消） |
 | GET | `/api/flags/<name>/overrides` | 列出单人强制 |
 | PUT | `/api/flags/<name>/overrides` | 设置 `{identity, enabled}` |

@@ -224,6 +224,8 @@ async function loadFlags() {
     if (f.kill_switch) badges.push('<span class="badge off">全关</span>');
     if (f.depends_on) badges.push(`<span class="badge roll">依赖:${esc(f.depends_on)}</span>`);
     if (f.rollout_percent > 0) badges.push(`<span class="badge roll">${f.rollout_percent}%</span>`);
+    if (f.rollout_condition && Object.keys(f.rollout_condition).length)
+      badges.push('<span class="badge roll">条件放量</span>');
     if (f.targeting && Object.keys(f.targeting).length)
       badges.push('<span class="badge on">属性条件</span>');
     if (f.config != null) badges.push('<span class="badge on">挂配置</span>');
@@ -332,6 +334,15 @@ async function renderDetail() {
                onchange="setRollout(this.value)">
         <b id="pctLabel">${f.rollout_percent}%</b>
       </div>
+      <div class="row">
+        <input id="rolloutCond" type="text" style="flex:1"
+          placeholder='放量条件 JSON（可选），如 {"plan":"pro"}：只对对上条件的人按上面比例放量，没对上的按默认值；{} 或留空 = 不限'
+          value="${f.rollout_condition && Object.keys(f.rollout_condition).length ? esc(JSON.stringify(f.rollout_condition)) : ''}">
+        <button class="primary" onclick="setRolloutCondition()">保存条件</button>
+        <button onclick="clearRolloutCondition()">清除</button>
+      </div>
+      <div class="muted">定了条件后：对上的人按比例分桶（命中开、未命中关），没对上的（含没带属性）直接按下面的默认值。
+        改比例或改条件都会让已发出的整包（含不带属性的包）换新版本。</div>
     </div>
 
     <div class="layer">
@@ -350,7 +361,7 @@ async function renderDetail() {
         <button onclick="unstageFromDraft()">从稿里摘掉本开关</button>
         <span id="draftStaged" class="muted"></span>
       </div>
-      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 属性条件 / 开关配置（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
+      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 放量条件 / 属性条件 / 开关配置（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
     </div>
 
     <div class="layer">
@@ -400,9 +411,9 @@ function populateDraftSelect() {
 }
 
 const FIELD_NAMES = { kill_switch: '全关', default_enabled: '默认开',
-                      rollout_percent: '放量比例', description: '描述',
-                      targeting: '属性打开条件', depends_on: '开关依赖',
-                      config: '开关配置' };
+                      rollout_percent: '放量比例', rollout_condition: '放量条件',
+                      description: '描述', targeting: '属性打开条件',
+                      depends_on: '开关依赖', config: '开关配置' };
 
 function depOptions(f) {
   let html = '<option value="">（无依赖）</option>';
@@ -503,6 +514,17 @@ const setTargeting = async function() {
   await patch({ targeting: rule });
 };
 const clearTargeting = () => patch({ targeting: {} });
+
+const setRolloutCondition = async function() {
+  let rule;
+  const raw = $('rolloutCond').value.trim();
+  if (!raw) return toast('条件为空：要清除请点「清除」', true);
+  try { rule = JSON.parse(raw); } catch (e) { return toast('放量条件不是合法 JSON', true); }
+  if (typeof rule !== 'object' || Array.isArray(rule))
+    return toast('放量条件必须是 JSON 对象', true);
+  await patch({ rollout_condition: rule });
+};
+const clearRolloutCondition = () => patch({ rollout_condition: {} });
 
 async function setFlagConfig() {
   const raw = $('flagConfig').value.trim();
@@ -869,6 +891,11 @@ async function stageToDraft() {
   if (raw) {
     try { patch.targeting = JSON.parse(raw); }
     catch (e) { return toast('属性条件不是合法 JSON，无法收入稿', true); }
+  }
+  const rcRaw = $('rolloutCond').value.trim();
+  if (rcRaw) {
+    try { patch.rollout_condition = JSON.parse(rcRaw); }
+    catch (e) { return toast('放量条件不是合法 JSON，无法收入稿', true); }
   }
   const cfgRaw = $('flagConfig').value.trim();
   if (cfgRaw) {
