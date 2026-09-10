@@ -174,6 +174,47 @@ curl -X PATCH http://localhost:8000/api/flags/new-checkout \
   多个变更，到点按生效时间先后应用；删除开关会一并取消它未生效的预约。
 - `effective_at` 必须是将来的时刻；想立即生效就不要带这个字段。
 
+## 发布稿（好几处改动收成一稿，发布时一起生效）
+
+管理端可以把好几处改动先**收进同一稿**，发布前不影响任何线上结果；点发布后，
+稿里的改动**一起生效**，整包统一换新版本。
+
+```bash
+# 1) 开一个稿
+DID=$(curl -s -X POST http://localhost:8000/api/drafts \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "Content-Type: application/json" \
+  -d '{"note": "秋季大促一揽子变更"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["draft_id"])')
+
+# 2) 把多个开关的改动收进稿（同一字段后收的覆盖先收的，不同字段合并）
+curl -s -X PUT http://localhost:8000/api/drafts/$DID/flags/promo \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "Content-Type: application/json" \
+  -d '{"default_enabled": true, "rollout_percent": 30}'
+curl -s -X PUT http://localhost:8000/api/drafts/$DID/flags/beta \
+  -H "X-Admin-Token: $TOKEN" -d '{"kill_switch": true, "targeting": {"plan": "pro"}}'
+
+# 3) 发布：要么整稿一起生效，要么一处都不动
+curl -s -X POST http://localhost:8000/api/drafts/$DID/publish \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice"
+```
+
+- **发布前一切照旧**：稿只是躺在 `drafts` / `draft_changes` 两张表里，**不参与求值**。
+  来问一个开关、带属性来问、拿整包，全部按现在的配置算，整包版本一字不变，稿也不
+  产生任何失效记录。
+- **发布时一起生效**：发布是一个事务——稿里所有开关的字段一次性写入，随后像一次
+  普通变更那样统一重算已发整包：整包换新版本，拿着发布前那包来问得到 `valid=false`。
+- **发布时整体校验，成环整稿拒绝**：收入稿时只做字段级校验（A 依赖 B、B 依赖 A
+  各自都能收进来）；发布前把整稿与现网配置合并成图统一校验——**合并后的依赖关系
+  互相绕着（成环、自依赖）或依赖的开关已不存在，这一稿全都不生效**：一个字段都不
+  写、整包版本不变，稿仍是「未发布」，改好或摘掉相关条目后可以重新发布。
+- **没发布的稿能丢掉**：`DELETE /api/drafts/<id>` 整稿丢弃，不影响任何求值与版本；
+  也可以用 `DELETE /api/drafts/<id>/flags/<name>` 只摘掉稿里某个开关的改动。
+- **多稿并存**：可以同时开多个稿；发布其中一个不影响其他稿。已发布 / 已丢弃的稿
+  保留记录（`GET /api/drafts?all=1`），但不能再改、再发布。
+- 稿里可收的字段与立即生效 PATCH 一致：`kill_switch`、`default_enabled`、
+  `rollout_percent`、`targeting`（`{}` 清条件）、`depends_on`（`""`/`null` 解除）、
+  `description`。**稿不支持 `effective_at`**：发布的一刻就是整稿的生效时刻。
+- 若稿里某个开关在发布前被删除，发布会被整稿拒绝（先把该开关的改动从稿里摘掉即可）。
+
 ## 快速开始
 
 ```bash
@@ -228,6 +269,12 @@ GET '/api/bundle?identity=<用户身份>[&attrs=<URL编码的JSON属性>][&versi
 | GET | `/api/audit?limit=100` | 最近操作记录（谁、何时、改了哪一层） |
 | GET | `/api/scheduled-changes` | 还没到点的定时变更（开关、改动内容、生效时刻、预约人） |
 | DELETE | `/api/scheduled-changes/<id>` | 取消一个还没到点的定时变更 |
+| POST | `/api/drafts` | 开一个发布稿，body `{note?}`；返回 `draft_id` |
+| GET | `/api/drafts` / `/api/drafts/<id>` | 未发布稿列表（`?all=1` 含已发布/已丢弃）/ 稿详情（含每个开关已收的改动） |
+| PUT | `/api/drafts/<id>/flags/<name>` | 把对该开关的改动收进稿（字段合并，同字段后覆盖先；成环等只在发布时判） |
+| DELETE | `/api/drafts/<id>/flags/<name>` | 从稿里摘掉该开关的整段改动 |
+| POST | `/api/drafts/<id>/publish` | 发布整稿：合并后成环/目标缺失则 400 整稿不动，否则一起生效、整包换版本 |
+| DELETE | `/api/drafts/<id>` | 丢弃未发布的稿（不影响任何求值与版本） |
 | GET | `/api/bundles` | 已发出的整包（身份、属性哈希、版本、是否已过期 stale） |
 | GET | `/api/bundles/invalidations?limit=100` | 整包失效记录：谁改了什么、让哪些人的哪身属性的整包从哪个版本变成哪个版本 |
 

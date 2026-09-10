@@ -86,6 +86,12 @@
       <div class="row"><button class="primary" onclick="createGroup()">创建组</button></div>
       <div id="groupList"></div>
     </div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>发布稿 <span class="muted" style="font-weight:normal">好几处改动收成一稿，发布时一起生效；稿在发布前不影响任何结果</span></h2>
+      <div class="row"><input id="newDraftNote" type="text" placeholder="这稿要做什么（备注，可选）"></div>
+      <div class="row"><button class="primary" onclick="createDraft()">开新稿</button></div>
+      <div id="draftList"></div>
+    </div>
     <div class="card">
       <h2>开关列表 <button style="float:right" onclick="loadAll()">刷新</button></h2>
       <div id="flagList"><span class="muted">加载中…</span></div>
@@ -144,6 +150,7 @@
 const $ = id => document.getElementById(id);
 let flags = [];
 let groups = [];
+let drafts = [];
 let selected = null;
 
 $('token').value = localStorage.getItem('ff_token') || '';
@@ -175,7 +182,7 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
-async function loadAll() { await loadFlags(); await loadGroups(); await loadAudit(); await loadInvalidations(); }
+async function loadAll() { await loadFlags(); await loadGroups(); await loadDrafts(); await loadAudit(); await loadInvalidations(); }
 
 async function loadFlags() {
   try {
@@ -202,6 +209,8 @@ async function loadFlags() {
     if (f.group) badges.push(`<span class="badge roll">组:${esc(f.group)}</span>`);
     if (f.scheduled_changes && f.scheduled_changes.length)
       badges.push(`<span class="badge roll">⏰ ${f.scheduled_changes.length} 项定时</span>`);
+    if (drafts.some(d => d.flags && d.flags[f.name]))
+      badges.push('<span class="badge on">稿中</span>');
     div.innerHTML = `<span class="name">${esc(f.name)}</span><span class="badges">${badges.join('')}</span>`;
     div.onclick = () => { selected = f.name; loadFlags(); renderDetail(); };
     el.appendChild(div);
@@ -285,6 +294,19 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
+      <h3>⑦ 发布稿 <span class="prio">把本开关下面这些字段的改动收进选中的稿；稿不发布就不生效，发布时整稿一起生效（成环会整稿拒绝）</span></h3>
+      <div class="row">
+        <select id="draftSelect" style="min-width:220px"></select>
+      </div>
+      <div class="row">
+        <button class="primary" onclick="stageToDraft()">收进选中稿</button>
+        <button onclick="unstageFromDraft()">从稿里摘掉本开关</button>
+        <span id="draftStaged" class="muted"></span>
+      </div>
+      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 属性条件（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
+    </div>
+
+    <div class="layer">
       <h3>⏰ 定时生效 <span class="prio">可选：约个时间再应用；不填时间则改完立即生效。到点前求值与整包版本都不变</span></h3>
       <div class="row">
         <input id="scheduleAt" type="datetime-local" step="1" style="max-width:230px">
@@ -293,6 +315,40 @@ async function renderDetail() {
       <div id="scheduledList">${renderScheduled(f)}</div>
     </div>`;
   loadOverrides();
+  populateDraftSelect();
+}
+
+function stagedSummary(d, fname) {
+  const ch = d.flags && d.flags[fname];
+  if (!ch) return '';
+  return Object.entries(ch)
+    .filter(([k]) => FIELD_NAMES[k])
+    .map(([k, v]) => `${FIELD_NAMES[k]}→${typeof v === 'object' ? JSON.stringify(v) : v}`)
+    .join('，');
+}
+
+function populateDraftSelect() {
+  const sel = $('draftSelect');
+  if (!sel) return;
+  if (!drafts.length) {
+    sel.innerHTML = '<option value="">（还没有未发布的稿，先在左下方开一个）</option>';
+    sel.disabled = true;
+    $('draftStaged').textContent = '';
+    return;
+  }
+  sel.disabled = false;
+  sel.innerHTML = drafts.map(d => {
+    const n = Object.keys(d.flags || {}).length;
+    const staged = stagedSummary(d, selected);
+    return `<option value="${d.id}">#${d.id} ${esc(d.note || '')}（${n} 个开关）${staged ? '｜本开关已收：' + esc(staged) : ''}</option>`;
+  }).join('');
+  $('draftStaged').textContent = stagedSummary(drafts[0], selected)
+    ? '本开关在选中稿已收：' + stagedSummary(drafts[0], selected) : '';
+  sel.onchange = () => {
+    const d = drafts.find(x => String(x.id) === sel.value);
+    $('draftStaged').textContent = d && stagedSummary(d, selected)
+      ? '本开关已收：' + stagedSummary(d, selected) : '';
+  };
 }
 
 const FIELD_NAMES = { kill_switch: '全关', default_enabled: '默认开',
@@ -507,6 +563,125 @@ async function loadInvalidations() {
   } catch (e) {
     $('invBody').innerHTML = `<tr><td colspan="4" class="muted">加载失败：${esc(e.message)}</td></tr>`;
   }
+}
+
+// ---------------------------------------------------------------- 发布稿
+
+async function loadDrafts() {
+  try {
+    drafts = await api('/api/drafts');
+  } catch (e) {
+    $('draftList').innerHTML = '<span class="muted">加载失败：' + e.message + '</span>';
+    return;
+  }
+  const el = $('draftList');
+  if (!drafts.length) { el.innerHTML = '<span class="muted">没有未发布的稿</span>'; return; }
+  el.innerHTML = '';
+  for (const d of drafts) {
+    const div = document.createElement('div');
+    div.className = 'group-block';
+    const head = document.createElement('div');
+    head.className = 'row';
+    head.style.marginBottom = '4px';
+    const title = document.createElement('b');
+    title.textContent = `#${d.id} ${d.note || ''}`;
+    head.appendChild(title);
+    const pub = document.createElement('button');
+    pub.className = 'primary';
+    pub.textContent = '发布';
+    pub.style.cssText = 'margin-left:auto;padding:2px 10px';
+    pub.addEventListener('click', () => publishDraft(d.id));
+    const dis = document.createElement('button');
+    dis.className = 'danger';
+    dis.textContent = '丢弃';
+    dis.style.cssText = 'padding:2px 10px';
+    dis.addEventListener('click', () => discardDraft(d.id));
+    head.append(pub, dis);
+    div.appendChild(head);
+
+    const meta = document.createElement('div');
+    meta.className = 'muted';
+    meta.textContent = `${Object.keys(d.flags || {}).length} 个开关 · 由 ${d.created_by || '—'} 创建`;
+    div.appendChild(meta);
+
+    const items = document.createElement('div');
+    items.className = 'members';
+    for (const [fname, ch] of Object.entries(d.flags || {})) {
+      const chip = document.createElement('span');
+      chip.className = 'badge roll';
+      chip.title = Object.entries(ch).filter(([k]) => FIELD_NAMES[k])
+        .map(([k, v]) => `${FIELD_NAMES[k]} = ${JSON.stringify(v)}`).join('\n');
+      chip.textContent = fname;
+      items.appendChild(chip);
+    }
+    if (!Object.keys(d.flags || {}).length)
+      items.innerHTML = '<span class="muted">（空稿）</span>';
+    div.appendChild(items);
+    el.appendChild(div);
+  }
+  if ($('draftSelect')) populateDraftSelect();
+}
+
+async function createDraft() {
+  try {
+    await api('/api/drafts', { method: 'POST', body: JSON.stringify({
+      note: $('newDraftNote').value }) });
+    $('newDraftNote').value = '';
+    toast('已开稿，在开关详情里把改动收进来');
+    await loadDrafts();
+  } catch (e) { toast('开稿失败：' + e.message, true); }
+}
+
+async function publishDraft(id) {
+  const d = drafts.find(x => x.id === id);
+  if (!d || !Object.keys(d.flags || {}).length)
+    return toast('空稿不能发布', true);
+  if (!confirm(`确定发布稿 #${id}？稿里 ${Object.keys(d.flags).length} 个开关的改动将一起生效，发布前发出的整包全部过期。`)) return;
+  try {
+    const r = await api(`/api/drafts/${id}/publish`, { method: 'POST' });
+    toast(`已发布：${r.flags.length} 个开关、${r.changed} 处变更`);
+  } catch (e) { return toast('发布被拒绝：' + e.message, true); }
+  await loadAll();
+}
+
+async function discardDraft(id) {
+  if (!confirm(`确定丢弃稿 #${id}？稿里的改动全部作废，不影响任何结果。`)) return;
+  await api(`/api/drafts/${id}`, { method: 'DELETE' });
+  toast('已丢弃'); await loadAll();
+}
+
+async function stageToDraft() {
+  const sel = $('draftSelect');
+  const id = sel && sel.value;
+  if (!id) return toast('先开一个稿', true);
+  // 从当前控件收集要收入稿的字段：全关 / 默认开取当前开关状态，
+  // 放量比例取滑块值，属性条件取输入框（输入框为空表示这稿不动条件）
+  const patch = {
+    kill_switch: current().kill_switch,
+    default_enabled: current().default_enabled,
+    rollout_percent: parseInt(document.querySelector('input[type=range]').value, 10),
+  };
+  const raw = $('tgtRule').value.trim();
+  if (raw) {
+    try { patch.targeting = JSON.parse(raw); }
+    catch (e) { return toast('属性条件不是合法 JSON，无法收入稿', true); }
+  }
+  try {
+    await api(`/api/drafts/${id}/flags/${encodeURIComponent(selected)}`,
+      { method: 'PUT', body: JSON.stringify(patch) });
+    toast(`已把 ${selected} 的改动收进稿 #${id}（尚未发布）`);
+  } catch (e) { return toast('收入失败：' + e.message, true); }
+  await loadDrafts();
+}
+
+async function unstageFromDraft() {
+  const id = $('draftSelect') && $('draftSelect').value;
+  if (!id) return toast('先选择一个稿', true);
+  try {
+    await api(`/api/drafts/${id}/flags/${encodeURIComponent(selected)}`,
+              { method: 'DELETE' });
+    toast('已从稿里摘掉本开关'); await loadDrafts();
+  } catch (e) { toast('操作失败：' + e.message, true); }
 }
 
 // ---------------------------------------------------------------- 互斥组

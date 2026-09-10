@@ -56,6 +56,18 @@ scheduled_changes 表里，不参与求值）；到点之后，第一个进来�
 写到开关上（惰性应用，无需后台线程），此后按新规则求值、整包换新版本，
 到点前发出的整包版本随之过期。不带 effective_at 的改动仍然改完即生效。
 已约未生效的变更可取消；同一开关可约多个，到点按生效时间先后应用。
+
+发布稿（draft）：管理端可以把好几处改动先收进同一稿（draft_changes 按
+开关合并，同一字段后收的覆盖先收的）。稿只躺在 drafts / draft_changes
+两张表里，发布前来问（单查、带属性问、拿整包）一律按现在的配置算，稿里
+的改动一字不生效，整包版本也不动。发布时先把整稿与现网配置合并后统一
+校验：稿里的开关都还在、依赖目标都存在、合并后的依赖图不成环——任何一条
+不过，这一稿全都不生效（已写入的也回滚，稿仍是 open，可改可丢）；全部
+通过才一次性应用、统一重算已发整包：稿里的改动一起生效，整包换新版本，
+拿着发布前那包来问算过期。成环只在发布时按整稿合并图判（收入时各条改动
+单独看都合法，所以 A 依赖 B、B 依赖 A 能各自收进同一稿，发布时才被一起
+拒绝）。没发布的稿可以整条丢弃（不影响任何求值），也可以摘掉稿里某个
+开关的改动。稿不支持 effective_at：发布时刻就是生效时刻。
 """
 
 import hashlib
@@ -163,6 +175,28 @@ CREATE TABLE IF NOT EXISTS scheduled_changes (
     created_by   TEXT NOT NULL DEFAULT '',
     created_at   REAL NOT NULL,
     applied_at   REAL
+);
+-- 发布稿：好几处改动先收成一稿，发布时一起生效（原子）。
+-- status: open（未发布，可继续收改动 / 丢弃）/ published（已发布）/ discarded（已丢弃）。
+-- 稿只躺在本表里，不参与求值；只有发布才会写到开关上。
+CREATE TABLE IF NOT EXISTS drafts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    note        TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'open',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    published_at REAL
+);
+-- 稿内每个开关的改动：按 (稿, 开关) 合并（同一字段后收的覆盖先收的）。
+-- 不加外键到 flags：开关在发布前被删掉时，发布校验负责整稿拒绝，记录本身仍可读。
+CREATE TABLE IF NOT EXISTS draft_changes (
+    draft_id   INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    flag_name  TEXT NOT NULL,             -- 冗余名字，与 scheduled_changes 同理
+    changes    TEXT NOT NULL,             -- canonical JSON：合并后的字段与值
+    updated_by TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (draft_id, flag_name)
 );
 """
 
@@ -1143,6 +1177,389 @@ def cancel_scheduled_change(change_id):
                (change_id,))
     audit(actor(), r["flag_name"], "schedule", "cancel_scheduled",
           f"change_id={change_id} changes={r['changes']}")
+    db.commit()
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- drafts（发布稿）
+
+# 稿里允许收的开关字段（与立即生效 PATCH 支持的字段一致，但不含 effective_at：
+# 稿在发布的一刻统一生效，不能再约时间）
+DRAFT_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
+                "description", "targeting", "depends_on")
+
+
+def normalize_patch(db, body):
+    """校验并规范化「对一个开关的一次改动」，返回规范化后的 dict。
+
+    收入发布稿时用：只做字段级校验与归一化，**不判依赖环**——单条改动是否
+    会让依赖图成环，只有发布时把整稿与现网配置合并后才知道（稿里 A→B、B→A
+    各自单看都合法，得在发布时一起拒绝）。depends_on 这里只查目标开关是否
+    存在；沿链成环由发布前的整稿合并图校验负责。
+    无任何可应用字段抛 ValueError("nothing to apply")；字段非法抛 ValueError。
+    """
+    out = {}
+    if "depends_on" in body:
+        raw = body["depends_on"]
+        if not isinstance(raw, str):
+            raise ValueError("depends_on must be a flag name (string),"
+                             " or null/empty to clear")
+        dep = raw.strip()
+        if dep:
+            if db.execute("SELECT 1 FROM flags WHERE name=?", (dep,)).fetchone() is None:
+                raise ValueError(f"depends_on flag '{dep}' not found")
+        out["depends_on"] = dep  # "" = 解除依赖
+    if "targeting" in body:
+        out["targeting"] = validate_targeting(body["targeting"])  # "" = 清除条件
+    if "kill_switch" in body:
+        out["kill_switch"] = 1 if body["kill_switch"] else 0
+    if "default_enabled" in body:
+        out["default_enabled"] = 1 if body["default_enabled"] else 0
+    if "rollout_percent" in body:
+        v = body["rollout_percent"]
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 100:
+            raise ValueError("rollout_percent must be an int in [0,100]")
+        out["rollout_percent"] = v
+    if "description" in body:
+        if not isinstance(body["description"], str):
+            raise ValueError("description must be a string")
+        out["description"] = body["description"]
+    return out
+
+
+def draft_change_to_dict(ch):
+    """稿内改动存储格式 -> 对外 JSON（布尔还原、targeting 的 '' 还原为 {}）。"""
+    out = dict(ch)
+    if "targeting" in out:
+        out["targeting"] = json.loads(out["targeting"]) if out["targeting"] else {}
+    for k in ("kill_switch", "default_enabled"):
+        if k in out:
+            out[k] = bool(out[k])
+    return out
+
+
+def draft_to_dict(db, r):
+    changes = {}
+    for cr in db.execute(
+            "SELECT flag_name, changes, updated_by, updated_at FROM draft_changes"
+            " WHERE draft_id=? ORDER BY flag_name", (r["id"],)):
+        item = draft_change_to_dict(json.loads(cr["changes"]))
+        item["updated_by"] = cr["updated_by"]
+        item["updated_at"] = cr["updated_at"]
+        changes[cr["flag_name"]] = item
+    return {
+        "id": r["id"],
+        "note": r["note"],
+        "status": r["status"],
+        "created_by": r["created_by"],
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+        "published_at": r["published_at"],
+        "flags": changes,
+    }
+
+
+def merged_dependency_cycle(db, staged):
+    """发布前整稿校验：现网依赖图叠加整稿改动后是否成环。
+
+    staged 为 {flag_name: 合并后的改动 dict}。稿里改了 depends_on 的边以稿
+    为准（"" = 解除），其余边沿用现网。返回错误串；None 表示图无环、所有
+    被依赖目标都存在。成环 / 自依赖 / 指向不存在的开关都会让整稿不能发布。
+    """
+    name_of_dep_id = {r["id"]: r["name"]
+                      for r in db.execute("SELECT id, name FROM flags")}
+    graph = {}
+    for r in db.execute("SELECT name, depends_on_flag_id FROM flags"):
+        did = r["depends_on_flag_id"]
+        graph[r["name"]] = name_of_dep_id.get(did) if did is not None else None
+    for name, ch in staged.items():
+        if "depends_on" in ch:
+            graph[name] = ch["depends_on"] or None
+    for name, dep in graph.items():
+        if dep is not None and dep != name and dep not in graph:
+            return f"depends_on flag '{dep}' not found"
+    # 递归 DFS 三色判环（自依赖也在这里被抓：访问自己时自己还是灰色）
+    color = {}
+
+    def visit(node):
+        color[node] = 1
+        dep = graph[node]
+        if dep is not None:
+            if color.get(dep, 0) == 1:
+                return True
+            if color.get(dep, 0) == 0 and visit(dep):
+                return True
+        color[node] = 2
+        return False
+
+    for n in graph:
+        if color.get(n, 0) == 0 and visit(n):
+            return "circular dependency rejected: the draft as a whole would form a cycle"
+    return None
+
+
+def apply_patch_to_flag(db, flag, ch, now):
+    """发布时把稿内对一个开关的改动直接写到行上，返回 (layer, action, detail)
+    列表（值没变的字段不列；description 照写但不计变更）。
+
+    与 apply_flag_fields 的区别：不再单条做沿链环校验——目标存在与整图无环
+    已由发布前的 merged_dependency_cycle 统一保证；逐条按现网图校验会把
+    「边整体转向」这种最终无环的整稿误判成环。
+    """
+    changes = []
+    fid = flag["id"]
+    if "depends_on" in ch:
+        dep = ch["depends_on"]
+        old_id = flag["depends_on_flag_id"]
+        old_name = ""
+        if old_id is not None:
+            row = db.execute("SELECT name FROM flags WHERE id=?", (old_id,)).fetchone()
+            old_name = row["name"] if row else ""
+        if dep != old_name:
+            new_id = None
+            if dep:
+                row = db.execute("SELECT id FROM flags WHERE name=?", (dep,)).fetchone()
+                new_id = row["id"] if row else None
+            db.execute("UPDATE flags SET depends_on_flag_id=?, updated_at=? WHERE id=?",
+                       (new_id, now, fid))
+            if new_id is None:
+                changes.append(("depends_on", "clear_dependency",
+                                f"depends_on removed (was {old_name})"))
+            else:
+                detail = f"depends_on={dep}"
+                if old_name:
+                    detail = f"depends_on: {old_name} -> {dep}"
+                changes.append(("depends_on", "set_dependency", detail))
+    if "targeting" in ch:
+        new_rule = ch["targeting"]
+        if new_rule != flag["targeting_rule"]:
+            db.execute("UPDATE flags SET targeting_rule=?, updated_at=? WHERE id=?",
+                       (new_rule, now, fid))
+            if new_rule:
+                changes.append(("targeting", "set_targeting", f"targeting={new_rule}"))
+            else:
+                changes.append(("targeting", "clear_targeting",
+                                f"targeting removed (was {flag['targeting_rule']})"))
+    if "kill_switch" in ch:
+        new = ch["kill_switch"]
+        if new != flag["kill_switch"]:
+            db.execute("UPDATE flags SET kill_switch=?, updated_at=? WHERE id=?",
+                       (new, now, fid))
+            changes.append(("kill_switch",
+                            "enable_kill_switch" if new else "disable_kill_switch",
+                            f"kill_switch={bool(new)}"))
+    if "default_enabled" in ch:
+        new = ch["default_enabled"]
+        if new != flag["default_enabled"]:
+            db.execute("UPDATE flags SET default_enabled=?, updated_at=? WHERE id=?",
+                       (new, now, fid))
+            changes.append(("default", "set_default", f"default_enabled={bool(new)}"))
+    if "rollout_percent" in ch:
+        new = ch["rollout_percent"]
+        if new != flag["rollout_percent"]:
+            db.execute("UPDATE flags SET rollout_percent=?, updated_at=? WHERE id=?",
+                       (new, now, fid))
+            changes.append(("rollout", "set_rollout",
+                            f"rollout_percent: {flag['rollout_percent']} -> {new}"))
+    if "description" in ch:
+        db.execute("UPDATE flags SET description=?, updated_at=? WHERE id=?",
+                   (ch["description"], now, fid))
+    return changes
+
+
+def get_open_draft(db, draft_id):
+    """取稿并要求是 open；返回 (row, error_response)。"""
+    row = db.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone()
+    if row is None:
+        return None, (jsonify({"error": "draft not found"}), 404)
+    if row["status"] != "open":
+        return None, (jsonify({"error": f"draft is {row['status']}, not open"}), 409)
+    return row, None
+
+
+@app.post("/api/drafts")
+@require_admin
+def create_draft():
+    """管理端：开一个发布稿（空稿），之后往里收改动，攒够一起发布。"""
+    body = request.get_json(force=True, silent=True) or {}
+    note = body.get("note", "")
+    if not isinstance(note, str):
+        return jsonify({"error": "note must be a string"}), 400
+    db = get_db()
+    now = time.time()
+    cur = db.execute(
+        "INSERT INTO drafts (note, status, created_by, created_at, updated_at)"
+        " VALUES (?, 'open', ?, ?, ?)",
+        (note, actor(), now, now))
+    audit(actor(), f"draft:{cur.lastrowid}", "draft", "create_draft",
+          f"note={note}" if note else "")
+    db.commit()
+    return jsonify({"ok": True, "draft_id": cur.lastrowid}), 201
+
+
+@app.get("/api/drafts")
+@require_admin
+def list_drafts():
+    """管理端：发布稿列表。默认只列未发布（open）的；all=1 连已发布/已丢弃一起列。"""
+    db = get_db()
+    if request.args.get("all") in ("1", "true"):
+        rows = db.execute("SELECT * FROM drafts ORDER BY id DESC").fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM drafts WHERE status='open' ORDER BY id DESC").fetchall()
+    return jsonify([draft_to_dict(db, r) for r in rows])
+
+
+@app.get("/api/drafts/<int:draft_id>")
+@require_admin
+def get_draft(draft_id):
+    db = get_db()
+    r = db.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone()
+    if r is None:
+        return jsonify({"error": "draft not found"}), 404
+    return jsonify(draft_to_dict(db, r))
+
+
+@app.put("/api/drafts/<int:draft_id>/flags/<name>")
+@require_admin
+def stage_draft_change(draft_id, name):
+    """把对一个开关的改动收进稿：按字段并入该稿对此开关已收的改动
+    （同一字段后收的覆盖先收的）。稿不发布就一字不生效。"""
+    body = request.get_json(force=True, silent=True) or {}
+    if body.get("effective_at") is not None:
+        return jsonify({"error": "drafts do not support effective_at:"
+                                 " publishing applies the whole draft at once"}), 400
+    db = get_db()
+    draft, err = get_open_draft(db, draft_id)
+    if err:
+        return err
+    flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
+    if flag is None:
+        return jsonify({"error": "flag not found"}), 404
+    try:
+        patch = normalize_patch(db, body)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not patch:
+        return jsonify({"error": "nothing to stage"
+                                 " (kill_switch/default_enabled/rollout_percent"
+                                 "/description/targeting/depends_on)"}), 400
+    row = db.execute(
+        "SELECT changes FROM draft_changes WHERE draft_id=? AND flag_name=?",
+        (draft_id, name)).fetchone()
+    merged = json.loads(row["changes"]) if row else {}
+    merged.update(patch)
+    now = time.time()
+    db.execute(
+        "INSERT INTO draft_changes (draft_id, flag_name, changes, updated_by, updated_at)"
+        " VALUES (?,?,?,?,?)"
+        " ON CONFLICT(draft_id, flag_name) DO UPDATE SET changes=excluded.changes,"
+        " updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        (draft_id, name, canonical_json(merged), actor(), now))
+    db.execute("UPDATE drafts SET updated_at=? WHERE id=?", (now, draft_id))
+    audit(actor(), name, "draft", "stage_draft_change",
+          f"draft=#{draft_id} fields={','.join(patch)}")
+    db.commit()
+    return jsonify({"ok": True, "draft_id": draft_id, "flag": name,
+                    "changes": draft_change_to_dict(merged)})
+
+
+@app.delete("/api/drafts/<int:draft_id>/flags/<name>")
+@require_admin
+def unstage_draft_change(draft_id, name):
+    """把某个开关的整段改动从稿里摘掉；稿与其他开关的改动不受影响。"""
+    db = get_db()
+    _, err = get_open_draft(db, draft_id)
+    if err:
+        return err
+    cur = db.execute("DELETE FROM draft_changes WHERE draft_id=? AND flag_name=?",
+                     (draft_id, name))
+    if cur.rowcount == 0:
+        return jsonify({"error": "no staged change for that flag in the draft"}), 404
+    db.execute("UPDATE drafts SET updated_at=? WHERE id=?", (time.time(), draft_id))
+    audit(actor(), name, "draft", "unstage_draft_change", f"draft=#{draft_id}")
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/drafts/<int:draft_id>/publish")
+@require_admin
+def publish_draft(draft_id):
+    """发布整稿：合并校验通过才一次性应用所有改动（原子，要么全生效要么不动）。
+
+    校验：稿里每个开关都还在；合并现网配置后的依赖图不成环、依赖目标都存在。
+    任一不过：整稿不生效，一个字段都不写，稿仍是 open（可改可丢）。
+    通过：所有改动一次事务写入，随后像普通改动一样统一重算已发整包、记一次
+    失效——稿里的改动一起生效，整包换新版本，发布前发出的包随之过期。
+    """
+    db = get_db()
+    draft, err = get_open_draft(db, draft_id)
+    if err:
+        return err
+    staged_rows = db.execute(
+        "SELECT flag_name, changes FROM draft_changes WHERE draft_id=?",
+        (draft_id,)).fetchall()
+    staged = {r["flag_name"]: json.loads(r["changes"]) for r in staged_rows}
+    if not staged:
+        return jsonify({"error": "draft is empty"}), 400
+    missing = [n for n in staged
+               if db.execute("SELECT 1 FROM flags WHERE name=?", (n,)).fetchone() is None]
+    if missing:
+        audit(actor(), f"draft:{draft_id}", "draft", "publish_rejected",
+              f"flags missing: {','.join(missing)}")
+        db.commit()
+        return jsonify({"error": "draft targets flags that no longer exist"
+                                 f" ({', '.join(missing)}); remove them from the draft"
+                                 " before publishing"}), 400
+    cycle_err = merged_dependency_cycle(db, staged)
+    if cycle_err is not None:
+        audit(actor(), f"draft:{draft_id}", "draft", "publish_rejected", cycle_err)
+        db.commit()
+        return jsonify({"error": cycle_err}), 400
+    # 先抢占稿状态：并发发布只有一个能往下走
+    now = time.time()
+    cur = db.execute(
+        "UPDATE drafts SET status='published', published_at=?, updated_at=?"
+        " WHERE id=? AND status='open'",
+        (now, now, draft_id))
+    if cur.rowcount == 0:
+        return jsonify({"error": "draft is no longer open"}), 409
+    try:
+        applied = []
+        for name in sorted(staged):
+            flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
+            changes = apply_patch_to_flag(db, flag, staged[name], now)
+            for layer, action, detail in changes:
+                audit(actor(), name, layer, action,
+                      detail + f"（发布稿 #{draft_id}）")
+            applied.append((name, changes))
+    except Exception:
+        db.rollback()
+        raise
+    audit(actor(), f"draft:{draft_id}", "draft", "publish_draft",
+          "flags=" + ",".join(sorted(staged)))
+    db.commit()
+    n_changed = sum(len(cs) for _, cs in applied)
+    desc = f"publish_draft #{draft_id}"
+    details = [d for _, cs in applied for _, _, d in cs]
+    if details:
+        desc += ": " + ", ".join(details)
+    record_invalidations(db, actor(), desc)
+    return jsonify({"ok": True, "published": True, "draft_id": draft_id,
+                    "flags": sorted(staged), "changed": n_changed})
+
+
+@app.delete("/api/drafts/<int:draft_id>")
+@require_admin
+def discard_draft(draft_id):
+    """丢弃一个未发布的稿：稿里的改动全部作废，不影响任何求值与整包版本。"""
+    db = get_db()
+    draft, err = get_open_draft(db, draft_id)
+    if err:
+        return err
+    db.execute("UPDATE drafts SET status='discarded', updated_at=? WHERE id=?",
+               (time.time(), draft_id))
+    audit(actor(), f"draft:{draft_id}", "draft", "discard_draft", "")
     db.commit()
     return jsonify({"ok": True})
 
