@@ -234,6 +234,29 @@ CREATE TABLE IF NOT EXISTS draft_changes (
     updated_at REAL NOT NULL,
     PRIMARY KEY (draft_id, flag_name)
 );
+-- 历史流水（append-only，只增不改不删）：管理端每一次「已经生效」的变更都落一条，
+-- 供 GET /api/history 重放任意过去时刻的完整求值状态。
+--   kind:
+--     flag_upsert     开关新建 / 立即生效的 PATCH（payload 为写完后的求值字段整快照）
+--     flag_delete     开关删除（其强制 / 冻结 / 组成员关系 / 组落定一并按删除语义清）
+--     override / override_delete   单人强制的设置 / 移除（payload: {enabled}）
+--     freeze / freeze_delete       结果冻结 / 解冻（payload: {enabled, reason, config}）
+--     group_upsert / group_delete  互斥组建 / 解散
+--     member_add / member_remove   开关进组 / 出组（subject=组名，payload: {flag}）
+--     assignment                    某身份在组内落定（查询写副作用，payload: {flag}）
+-- 预约生效与发布稿不在这里：重放时直接读 scheduled_changes（到点且未取消）与
+-- drafts（status=published 且 published_at<=时刻），与本流水按时间合并。
+CREATE TABLE IF NOT EXISTS history_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at REAL NOT NULL,
+    kind        TEXT NOT NULL,
+    subject     TEXT NOT NULL DEFAULT '',   -- 开关名 / 组名
+    identity    TEXT NOT NULL DEFAULT '',   -- override/freeze/assignment 对应身份
+    payload     TEXT NOT NULL DEFAULT '',   -- canonical JSON
+    actor       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_history_time ON history_events(occurred_at, id);
+CREATE INDEX IF NOT EXISTS idx_history_identity ON history_events(identity, occurred_at);
 """
 
 LAYERS = ("kill_switch", "freeze", "depends_on", "override", "targeting",
@@ -434,6 +457,89 @@ def init_db():
     if "attrs_hash" not in inv_cols:
         conn.execute("ALTER TABLE bundle_invalidations"
                      " ADD COLUMN attrs_hash TEXT NOT NULL DEFAULT ''")
+    # 历史流水：老库第一次升级时把「此刻」的存量状态铺成一条基线（以各记录自己的
+    # 创建时间落事件），升级前发生过的中间改动无法追溯，但升级后新发生的每次
+    # 管理端改动都会进流水、可按任意过去时刻重放。新库（还没有任何开关）不铺。
+    hist_tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "history_events" in hist_tables:
+        n = conn.execute("SELECT COUNT(*) c FROM history_events").fetchone()["c"]
+        if n == 0:
+            for r in conn.execute("SELECT * FROM flags"):
+                conn.execute(
+                    "INSERT INTO history_events"
+                    " (occurred_at, kind, subject, identity, payload, actor)"
+                    " VALUES (?, 'flag_upsert', ?, '', ?, 'system-migration')",
+                    (r["created_at"], r["name"], canonical_json({
+                        "default_enabled": bool(r["default_enabled"]),
+                        "rollout_percent": r["rollout_percent"],
+                        "kill_switch": bool(r["kill_switch"]),
+                        "targeting": r["targeting_rule"],
+                        "config": r["flag_config"],
+                        "depends_on": "",   # 基线里的依赖名下面补
+                    })))
+            dep_partials = []
+            for r in conn.execute("SELECT * FROM flags"):
+                if r["depends_on_flag_id"] is not None:
+                    pname = conn.execute(
+                        "SELECT name FROM flags WHERE id=?",
+                        (r["depends_on_flag_id"],)).fetchone()
+                    if pname is not None:
+                        dep_partials.append((r["created_at"], r["name"],
+                                             pname["name"]))
+            for created_at, name, dep_name in dep_partials:
+                conn.execute(
+                    "INSERT INTO history_events"
+                    " (occurred_at, kind, subject, payload, actor)"
+                    " VALUES (?, 'flag_upsert', ?, ?, 'system-migration')",
+                    (created_at, name,
+                     canonical_json({"depends_on": dep_name})))
+            for r in conn.execute(
+                    "SELECT o.*, f.name AS fname FROM overrides o"
+                    " JOIN flags f ON f.id=o.flag_id"):
+                conn.execute(
+                    "INSERT INTO history_events"
+                    " (occurred_at, kind, subject, identity, payload, actor)"
+                    " VALUES (?, 'override', ?, ?, ?, 'system-migration')",
+                    (r["created_at"], r["fname"], r["identity"],
+                     canonical_json({"enabled": bool(r["enabled"])})))
+            for r in conn.execute(
+                    "SELECT z.*, f.name AS fname FROM freezes z"
+                    " JOIN flags f ON f.id=z.flag_id"):
+                conn.execute(
+                    "INSERT INTO history_events"
+                    " (occurred_at, kind, subject, identity, payload, actor)"
+                    " VALUES (?, 'freeze', ?, ?, ?, ?)",
+                    (r["created_at"], r["fname"], r["identity"],
+                     canonical_json({"enabled": bool(r["frozen_enabled"]),
+                                     "reason": r["frozen_reason"],
+                                     "config": r["frozen_config"]}),
+                     r["created_by"] or "system-migration"))
+            for r in conn.execute("SELECT * FROM mutex_groups"):
+                conn.execute(
+                    "INSERT INTO history_events"
+                    " (occurred_at, kind, subject, actor)"
+                    " VALUES (?, 'group_upsert', ?, ?)",
+                    (r["created_at"], r["name"], r["updated_by"] or "system-migration"))
+            for r in conn.execute(
+                    "SELECT g.name AS gname, f.name AS fname, g.created_at AS gat"
+                    " FROM group_members m JOIN mutex_groups g ON g.id=m.group_id"
+                    " JOIN flags f ON f.id=m.flag_id"):
+                conn.execute(
+                    "INSERT INTO history_events"
+                    " (occurred_at, kind, subject, payload, actor)"
+                    " VALUES (?, 'member_add', ?, ?, 'system-migration')",
+                    (r["gat"], r["gname"], canonical_json({"flag": r["fname"]})))
+            for r in conn.execute(
+                    "SELECT a.*, g.name AS gname, f.name AS fname"
+                    " FROM group_assignments a JOIN mutex_groups g ON g.id=a.group_id"
+                    " JOIN flags f ON f.id=a.flag_id"):
+                conn.execute(
+                    "INSERT INTO history_events"
+                    " (occurred_at, kind, subject, identity, payload, actor)"
+                    " VALUES (?, 'assignment', ?, ?, ?, 'system-migration')",
+                    (r["created_at"], r["gname"], r["identity"],
+                     canonical_json({"flag": r["fname"]})))
     conn.commit()
     conn.close()
 
@@ -443,6 +549,44 @@ def audit(actor, flag_name, layer, action, detail=""):
         "INSERT INTO audit_log (actor, flag_name, layer, action, detail, created_at)"
         " VALUES (?,?,?,?,?,?)",
         (actor, flag_name, layer, action, detail, time.time()),
+    )
+
+
+def flag_snapshot_payload(flag_row, dep_name=None):
+    """一个开关写完后的求值字段整快照（写进历史流水的 flag_upsert payload）。
+
+    立即生效的每次 PATCH 都存全量快照，历史重放时按时间序最后一条快照即该
+    时刻的开关状态；预约 / 发布稿在重放时只覆盖自己改的字段。targeting /
+    config 存库里那种 canonical 串（'' = 未定/未挂），depends_on 存名字
+    （'' = 不依赖）。
+    """
+    if dep_name is None:
+        dep_name = ""
+        if flag_row["depends_on_flag_id"] is not None:
+            row = get_db().execute(
+                "SELECT name FROM flags WHERE id=?",
+                (flag_row["depends_on_flag_id"],)).fetchone()
+            dep_name = row["name"] if row else ""
+    return {
+        "default_enabled": bool(flag_row["default_enabled"]),
+        "rollout_percent": flag_row["rollout_percent"],
+        "kill_switch": bool(flag_row["kill_switch"]),
+        "targeting": flag_row["targeting_rule"],
+        "config": flag_row["flag_config"],
+        "depends_on": dep_name,
+    }
+
+
+def record_history(db, occurred_at, kind, subject="", identity="", payload=None,
+                   actor_name=None):
+    """往 append-only 的历史流水落一条已经生效的变更。"""
+    db.execute(
+        "INSERT INTO history_events"
+        " (occurred_at, kind, subject, identity, payload, actor)"
+        " VALUES (?,?,?,?,?,?)",
+        (occurred_at, kind, subject, identity,
+         canonical_json(payload) if payload is not None else "",
+         actor_name if actor_name is not None else actor()),
     )
 
 
@@ -583,11 +727,20 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
     ).fetchone()
     if winner is None:
         # INSERT OR IGNORE + 重读：并发请求下也只有一个人能落定成功
+        now = time.time()
         db.execute(
             "INSERT OR IGNORE INTO group_assignments"
             " (group_id, identity, flag_id, created_at) VALUES (?,?,?,?)",
-            (group_id, identity, flag["id"], time.time()),
+            (group_id, identity, flag["id"], now),
         )
+        # 落定是查询的写副作用：同样落一条历史流水，历史重放到「这一刻真来问」
+        # 时才能还原这个身份当时在组内落给了谁（重放本身不写库，这里是写库路径）
+        gname_row = db.execute("SELECT name FROM mutex_groups WHERE id=?",
+                               (group_id,)).fetchone()
+        record_history(db, now, "assignment",
+                       subject=gname_row["name"] if gname_row else "",
+                       identity=identity, payload={"flag": flag["name"]},
+                       actor_name="")
         db.commit()
         winner = db.execute(
             "SELECT flag_id FROM group_assignments WHERE group_id=? AND identity=?",
@@ -780,6 +933,264 @@ def record_invalidations(db, actor_name, change):
     db.commit()
 
 
+# ---------------------------------------------------------------- 历史时刻重放
+
+# 同一时刻的确定性先后：先管理端立即生效的变更，再预约到点的变更，最后发布稿。
+# （真实系统里预约是惰性应用、理论上可能晚于同刻的立即改动；重放取这个固定序，
+# 让「那一刻会拿到什么」是一个确定的答案。）
+_HIST_RANK = {"imm": 0, "sched": 1, "draft": 2}
+_FLAG_DEFAULT = {"default_enabled": False, "rollout_percent": 0,
+                 "kill_switch": False, "targeting": "", "config": "",
+                 "depends_on": ""}
+
+
+def _normalize_replay_patch(changes):
+    """把预约 / 发布稿里存的字段值归一成重放用的覆盖 patch。
+
+    targeting / config 存的是 canonical 串（与 flags 列同口径，''=清除）；
+    布尔与比例还原成重放状态里的类型；depends_on 是名字串（''=解除）。
+    """
+    patch = {}
+    if "kill_switch" in changes:
+        patch["kill_switch"] = bool(changes["kill_switch"])
+    if "default_enabled" in changes:
+        patch["default_enabled"] = bool(changes["default_enabled"])
+    if "rollout_percent" in changes:
+        patch["rollout_percent"] = int(changes["rollout_percent"])
+    if "targeting" in changes:
+        patch["targeting"] = changes["targeting"] if changes["targeting"] else ""
+    if "config" in changes:
+        patch["config"] = changes["config"] if changes["config"] else ""
+    if "depends_on" in changes:
+        patch["depends_on"] = changes["depends_on"] or ""
+    return patch
+
+
+def replay_state(db, identity, at):
+    """重放身份 identity 在时刻 at 的完整求值状态（纯函数，不写库）。
+
+    数据源：
+    - history_events：管理端每一次「已生效」变更的 append-only 流水；
+    - scheduled_changes：status='applied' 或 pending 但 effective_at<=at，
+      且开关已删除时被取消的（cancelled/failed 一律不算）——预约到了点，
+      哪怕还没有任何请求惰性触发它，那一刻来问也必须按到点后算；
+    - drafts：status='published' 且 published_at<=at 的稿（没发布的稿不算）。
+
+    返回 dict：
+      flags:  name -> {default_enabled, rollout_percent, kill_switch,
+                       targeting(串), config(串), depends_on(名字串)}
+      overrides/frozen: (flag_name, identity) -> ...
+      groups: name -> set(成员 flag)；assignments: 组名 -> 落定 flag
+    """
+    ops = []  # (occurred_at, rank, 次序, 类型, 内容)
+
+    for r in db.execute(
+            "SELECT * FROM history_events WHERE occurred_at<=?"
+            " ORDER BY occurred_at, id", (at,)):
+        ops.append((r["occurred_at"], 0, r["id"], "event",
+                    (r["kind"], r["subject"], r["identity"],
+                     json.loads(r["payload"]) if r["payload"] else {})))
+
+    # 预约：已应用，或到点未取消（删除开关会把 pending 置为 cancelled）
+    for r in db.execute(
+            "SELECT * FROM scheduled_changes"
+            " WHERE ((status='applied') OR (status='pending' AND effective_at<=?))"
+            " AND effective_at<=? ORDER BY effective_at, id",
+            (at, at)):
+        ops.append((r["effective_at"], 1, r["id"], "sched",
+                    (r["flag_name"], json.loads(r["changes"]))))
+
+    # 发布稿：稿里每个开关的合并改动在 published_at 一起应用（按开关名定序）
+    for d in db.execute(
+            "SELECT id, published_at FROM drafts"
+            " WHERE status='published' AND published_at<=?"
+            " ORDER BY published_at, id", (at,)):
+        rows = db.execute(
+            "SELECT flag_name, changes FROM draft_changes WHERE draft_id=?"
+            " ORDER BY flag_name", (d["id"],)).fetchall()
+        for sub, cr in enumerate(rows):
+            ops.append((d["published_at"], 2, sub, "draft",
+                        (cr["flag_name"], json.loads(cr["changes"]))))
+
+    ops.sort(key=lambda o: (o[0], o[1], o[2]))
+
+    flags = {}
+    overrides = {}
+    frozen = {}
+    groups = {}
+    assignments = {}
+
+    for _, _, _, kind, body in ops:
+        if kind in ("sched", "draft"):
+            name, changes = body
+            if name not in flags:
+                # 开关当时还没建（或已删）：这条预约/稿对那一刻不生效
+                continue
+            flags[name].update(_normalize_replay_patch(changes))
+            continue
+
+        ev_kind, subject, ev_identity, payload = body
+
+        if ev_kind == "flag_upsert":
+            snap = dict(_FLAG_DEFAULT)
+            if subject in flags:
+                snap.update(flags[subject])
+            snap.update({k: payload[k] for k in _FLAG_DEFAULT if k in payload})
+            flags[subject] = snap
+        elif ev_kind == "flag_delete":
+            flags.pop(subject, None)
+            overrides.pop((subject, identity), None)
+            frozen.pop((subject, identity), None)
+            for gname, members in list(groups.items()):
+                members.discard(subject)
+                if assignments.get(gname) == subject:
+                    assignments.pop(gname, None)
+        elif ev_kind == "override" and ev_identity == identity:
+            overrides[(subject, identity)] = bool(payload["enabled"])
+        elif ev_kind == "override_delete" and ev_identity == identity:
+            overrides.pop((subject, identity), None)
+        elif ev_kind == "freeze" and ev_identity == identity:
+            frozen[(subject, identity)] = {
+                "enabled": bool(payload["enabled"]),
+                "config": payload.get("config", ""),
+            }
+        elif ev_kind == "freeze_delete" and ev_identity == identity:
+            frozen.pop((subject, identity), None)
+        elif ev_kind == "group_upsert":
+            groups.setdefault(subject, set())
+        elif ev_kind == "group_delete":
+            groups.pop(subject, None)
+            assignments.pop(subject, None)
+        elif ev_kind == "member_add":
+            groups.setdefault(subject, set()).add(payload["flag"])
+        elif ev_kind == "member_remove":
+            groups.get(subject, set()).discard(payload["flag"])
+            if assignments.get(subject) == payload["flag"]:
+                assignments.pop(subject, None)
+        elif ev_kind == "assignment" and ev_identity == identity:
+            members = groups.get(subject)
+            # 落定只在「组还在、该开关当时仍在组内」时有效
+            if members and payload["flag"] in members:
+                assignments.setdefault(subject, payload["flag"])
+
+    return {"flags": flags, "overrides": overrides, "frozen": frozen,
+            "groups": groups, "assignments": assignments}
+
+
+def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
+    """按固定优先级在重放状态上求一个开关的值，返回 (enabled, reason, config)。
+
+    与线上 evaluate 同一套口径（全关 > 冻结 > 依赖 > 强制 > 属性 > 组 >
+    放量 > 默认），区别只是输入来自 replay_state 的内存状态、且组落定不写库：
+    那一刻已经落定过（assginments 里有）就按落定算；没落定过就按名字序模拟
+    ——与「那一刻整包来问」时 compute_bundle 按 name 序求值、首个自然开的
+    组内开关落定的行为一字不差。
+    """
+    def ret(enabled, reason, config_json=""):
+        cfg = parse_flag_config(config_json) if enabled and config_json else None
+        return enabled, reason, cfg
+
+    flag = state["flags"].get(name)
+    if flag is None:
+        return False, "default", None  # 理论不可达：整包只遍历当时存在的开关
+
+    if flag["kill_switch"]:
+        return ret(False, "kill_switch")
+
+    fz = state["frozen"].get((name, identity))
+    if fz is not None:
+        if _memo is not None:
+            _memo[name] = fz["enabled"]
+        return ret(fz["enabled"], "freeze", fz["config"])
+
+    dep = flag["depends_on"]
+    if dep:
+        if _chain is not None and dep in _chain:
+            raise RuntimeError(f"dependency cycle through {dep}")
+        dep_enabled = False
+        if _memo is not None and dep in _memo:
+            dep_enabled = _memo[dep]
+        elif dep in state["flags"]:
+            next_chain = {name} if _chain is None else _chain | {name}
+            dep_enabled, _, _ = evaluate_at(state, dep, identity, attrs,
+                                            _memo, next_chain)
+        if not dep_enabled:
+            if _memo is not None:
+                _memo[name] = False
+            return ret(False, "depends_on")
+
+    if (name, identity) in state["overrides"]:
+        enabled = state["overrides"][(name, identity)]
+        if _memo is not None:
+            _memo[name] = enabled
+        return ret(enabled, "override", flag["config"])
+
+    if targeting_matches(flag["targeting"], attrs):
+        natural, reason = True, "targeting"
+    elif flag["rollout_percent"] > 0:
+        natural, reason = bucket_of(name, identity) < flag["rollout_percent"], "rollout"
+    else:
+        natural, reason = bool(flag["default_enabled"]), "default"
+
+    group_name = next((g for g, members in state["groups"].items()
+                       if name in members), None)
+    if group_name is None or not natural:
+        if _memo is not None:
+            _memo[name] = natural
+        return ret(natural, reason, flag["config"])
+
+    won = state["assignments"].get(group_name) == name
+    if _memo is not None:
+        _memo[name] = won
+    return ret(won, "group", flag["config"])
+
+
+def compute_history_bundle(db, identity, at, attrs=None):
+    """求该身份在时刻 at 所有「当时存在」的开关结果（按名字序，与线上整包同口径）。"""
+    state = replay_state(db, identity, at)
+    results = {}
+    memo = {}
+    for name in sorted(state["flags"]):
+        enabled, reason, config = evaluate_at(state, name, identity, attrs, memo)
+        item = {"enabled": enabled, "reason": reason}
+        if config is not None:
+            item["config"] = config
+        results[name] = item
+    return results
+
+
+@app.get("/api/history")
+def history_bundle():
+    """调用方接口：问某个人在过去某个时刻，每个开关当时开还是关。
+
+    GET /api/history?identity=<身份>&at=<unix 秒>[&attrs=<URL编码 JSON>]
+    开着的开关带当时那份配置（冻住的带冻住那一刻那份）；当时全关 / 判关的
+    不带 config。约了时间还没到点的改动、没发布的稿都不算；结果与那一刻
+    真来问（整包口径）拿到的一字不差。at 必须是不晚于现在的 unix 秒。
+    """
+    identity = request.args.get("identity")
+    if not identity:
+        return jsonify({"error": "identity is required"}), 400
+    raw_at = request.args.get("at")
+    if raw_at is None or raw_at == "":
+        return jsonify({"error": "at is required (unix timestamp in seconds)"}), 400
+    try:
+        at = float(raw_at)
+    except (TypeError, ValueError):
+        return jsonify({"error": "at must be a unix timestamp in seconds"}), 400
+    if not math.isfinite(at) or at > time.time():
+        return jsonify({"error": "at must be a past unix timestamp (not in the future)"}), 400
+    try:
+        attrs = parse_attrs(request.args.get("attrs"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    results = compute_history_bundle(get_db(), identity, at, attrs)
+    body = {"identity": identity, "at": at, "flags": results}
+    if attrs is not None:
+        body["attrs"] = attrs
+    return jsonify(body)
+
+
 # ---------------------------------------------------------------- admin auth
 
 def require_admin(fn):
@@ -961,7 +1372,7 @@ def create_flag():
         return jsonify({"error": str(e)}), 400
     now = time.time()
     default_enabled = 1 if body.get("default_enabled") else 0
-    db.execute(
+    cur = db.execute(
         "INSERT INTO flags (name, description, default_enabled, targeting_rule,"
         " flag_config, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
         (name, body.get("description", ""), default_enabled, targeting_json,
@@ -971,6 +1382,12 @@ def create_flag():
           f"default_enabled={bool(default_enabled)}"
           + (f" targeting={targeting_json}" if targeting_json else "")
           + (f" config={config_json}" if config_json else ""))
+    # 历史流水：新建即一条全量快照（不依赖任何开关）
+    record_history(
+        db, now, "flag_upsert", subject=name, actor_name=actor(),
+        payload={"default_enabled": bool(default_enabled), "rollout_percent": 0,
+                 "kill_switch": False, "targeting": targeting_json,
+                 "config": config_json, "depends_on": ""})
     db.commit()
     record_invalidations(db, actor(), f"create_flag {name}")
     return jsonify({"ok": True}), 201
@@ -1228,6 +1645,12 @@ def update_flag(name):
         return jsonify({"error": err}), 400
     for layer, action, detail in changes:
         audit(actor(), name, layer, action, detail)
+    if changes:
+        # 历史流水：立即生效的改动落一条「写完后」全量快照（description-only
+        # 不改求值，不落流水）
+        fresh = db.execute("SELECT * FROM flags WHERE id=?", (flag["id"],)).fetchone()
+        record_history(db, time.time(), "flag_upsert", subject=name,
+                       payload=flag_snapshot_payload(fresh), actor_name=actor())
     db.commit()
     desc = f"update_flag {name}"
     if changes:
@@ -1251,6 +1674,9 @@ def delete_flag(name):
     # 没有该动作，这里显式兜底，避免留下指向已删开关的依赖
     db.execute("UPDATE flags SET depends_on_flag_id=NULL"
                " WHERE depends_on_flag_id=?", (flag["id"],))
+    # 历史流水：删除事件（重放时该开关及其 override/freeze/组成员/落定从这一刻消失）
+    record_history(db, time.time(), "flag_delete", subject=name,
+                   actor_name=actor())
     audit(actor(), name, "default", "delete_flag")
     db.commit()
     record_invalidations(db, actor(), f"delete_flag {name}")
@@ -1291,13 +1717,16 @@ def put_override(name):
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
     enabled = 1 if body["enabled"] else 0
+    now = time.time()
     db.execute(
         "INSERT INTO overrides (flag_id, identity, enabled, created_at) VALUES (?,?,?,?)"
         " ON CONFLICT(flag_id, identity) DO UPDATE SET enabled=excluded.enabled",
-        (flag["id"], identity, enabled, time.time()),
+        (flag["id"], identity, enabled, now),
     )
     audit(actor(), name, "override", "set_override",
           f"identity={identity} enabled={bool(enabled)}")
+    record_history(db, now, "override", subject=name, identity=identity,
+                   payload={"enabled": bool(enabled)}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
                          f"set_override {name} identity={identity}")
@@ -1319,6 +1748,8 @@ def delete_override(name):
     db.execute("DELETE FROM overrides WHERE flag_id=? AND identity=?",
                (flag["id"], identity))
     audit(actor(), name, "override", "remove_override", f"identity={identity}")
+    record_history(db, time.time(), "override_delete", subject=name,
+                   identity=identity, payload={}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
                          f"remove_override {name} identity={identity}")
@@ -1405,6 +1836,10 @@ def put_freeze(name):
     )
     audit(actor(), name, "freeze", "freeze_result",
           f"identity={identity} enabled={enabled} reason={reason}")
+    record_history(db, now, "freeze", subject=name, identity=identity,
+                   payload={"enabled": bool(enabled), "reason": reason,
+                            "config": config_json},
+                   actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
                          f"freeze_result {name} identity={identity} -> {enabled}")
@@ -1435,6 +1870,8 @@ def delete_freeze(name):
     if cur.rowcount == 0:
         return jsonify({"ok": True, "changed": False})
     audit(actor(), name, "freeze", "unfreeze_result", f"identity={identity}")
+    record_history(db, time.time(), "freeze_delete", subject=name,
+                   identity=identity, payload={}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
                          f"unfreeze_result {name} identity={identity}")
@@ -1931,6 +2368,8 @@ def create_group():
         (name, body.get("description", ""), actor(), now, now),
     )
     audit(actor(), name, "group", "create_group")
+    record_history(db, now, "group_upsert", subject=name, payload={},
+                   actor_name=actor())
     db.commit()
     record_invalidations(db, actor(), f"create_group {name}")
     return jsonify({"ok": True}), 201
@@ -1945,6 +2384,8 @@ def delete_group(name):
         return jsonify({"error": "group not found"}), 404
     # 成员关系与落定记录随组级联删除，组内开关恢复按原规则求值
     audit(actor(), name, "group", "delete_group")
+    record_history(db, time.time(), "group_delete", subject=name, payload={},
+                   actor_name=actor())
     db.commit()
     record_invalidations(db, actor(), f"delete_group {name}")
     return jsonify({"ok": True})
@@ -1975,6 +2416,8 @@ def add_flag_to_group(name):
                (group["id"], flag["id"]))
     touch_group(db, group["id"])
     audit(actor(), name, "group", "add_flag", f"flag={flag_name}")
+    record_history(db, time.time(), "member_add", subject=name,
+                   payload={"flag": flag_name}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(), f"add_flag_to_group {name} flag={flag_name}")
     return jsonify({"ok": True})
@@ -2003,6 +2446,8 @@ def remove_flag_from_group(name):
                (group["id"], flag["id"]))
     touch_group(db, group["id"])
     audit(actor(), name, "group", "remove_flag", f"flag={flag_name}")
+    record_history(db, time.time(), "member_remove", subject=name,
+                   payload={"flag": flag_name}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(), f"remove_flag_from_group {name} flag={flag_name}")
     return jsonify({"ok": True})
