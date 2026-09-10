@@ -65,7 +65,7 @@
   <h1>🚩 特性开关管理</h1>
   <input id="token" type="password" placeholder="管理 Token">
   <input id="actor" type="text" placeholder="操作人（记入审计）">
-  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 单人强制 &gt; 互斥组 &gt; 比例放量 &gt; 默认值</span>
+  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 单人强制 &gt; 属性条件 &gt; 互斥组 &gt; 比例放量 &gt; 默认值</span>
 </header>
 
 <main>
@@ -100,7 +100,13 @@
     <div class="card" style="margin-bottom:16px">
       <h2>调用方结果验证</h2>
       <div class="row">
-        <input id="checkIdentity" type="text" placeholder="身份 identity" style="max-width:240px">
+        <input id="checkIdentity" type="text" placeholder="身份 identity" style="max-width:200px">
+      </div>
+      <div class="row">
+        <input id="checkAttrs" type="text" style="flex:1"
+          placeholder='属性 attrs（可选，JSON 对象），如 {"plan":"pro","level":3}'>
+      </div>
+      <div class="row">
         <button onclick="checkIdentity()">查询当前开关</button>
         <button onclick="checkBundle()">查询整包</button>
       </div>
@@ -187,6 +193,8 @@ async function loadFlags() {
     const badges = [];
     if (f.kill_switch) badges.push('<span class="badge off">全关</span>');
     if (f.rollout_percent > 0) badges.push(`<span class="badge roll">${f.rollout_percent}%</span>`);
+    if (f.targeting && Object.keys(f.targeting).length)
+      badges.push('<span class="badge on">属性条件</span>');
     badges.push(f.default_enabled
       ? '<span class="badge on">默认开</span>' : '<span class="badge">默认关</span>');
     if (f.override_count) badges.push(`<span class="badge">${f.override_count} 人强制</span>`);
@@ -226,7 +234,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>② 单人强制 <span class="prio">对指定身份强制开/关，覆盖放量与默认值</span></h3>
+      <h3>② 单人强制 <span class="prio">对指定身份强制开/关，覆盖属性条件、放量与默认值</span></h3>
       <div class="row">
         <input id="ovIdentity" type="text" placeholder="身份 identity" style="max-width:220px">
         <button onclick="setOverride(true)">强制开</button>
@@ -237,7 +245,19 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>③ 比例放量 <span class="prio">比例 &gt; 0 时此层定论：命中开、未命中关；同一身份结果恒定</span></h3>
+      <h3>③ 属性打开条件 <span class="prio">来问带上的属性全对上则开；对不上、没带属性都按下面的放量/默认值算。命中算自然为开，仍过互斥组裁决</span></h3>
+      <div class="row">
+        <input id="tgtRule" type="text" style="flex:1"
+          placeholder='JSON 条件，如 {"plan":"pro","level":[3,5]}；多键 AND，值给列表是任一；清空填 {}'
+          value="${f.targeting && Object.keys(f.targeting).length ? esc(JSON.stringify(f.targeting)) : ''}">
+        <button class="primary" onclick="setTargeting()">保存条件</button>
+        <button onclick="clearTargeting()">清除</button>
+      </div>
+      <div class="muted">调用方来问时带 <code>attrs</code>（URL 编码的 JSON 对象），值支持字符串/数字/布尔/null。同一人同一身属性结果恒定。</div>
+    </div>
+
+    <div class="layer">
+      <h3>④ 比例放量 <span class="prio">属性对不上时才看这里：比例 &gt; 0 时此层定论，命中开、未命中关；同一身份结果恒定</span></h3>
       <div class="row">
         <input type="range" min="0" max="100" value="${f.rollout_percent}"
                oninput="$('pctLabel').textContent=this.value+'%'"
@@ -247,7 +267,7 @@ async function renderDetail() {
     </div>
 
     <div class="layer">
-      <h3>④ 默认值 <span class="prio">仅当放量比例为 0 时兜底</span></h3>
+      <h3>⑤ 默认值 <span class="prio">属性对不上且放量比例为 0 时兜底</span></h3>
       <label><input type="checkbox" ${f.default_enabled ? 'checked' : ''}
         onchange="setDefault(this.checked)"> 默认开</label>
     </div>
@@ -256,7 +276,7 @@ async function renderDetail() {
       <h3>⏰ 定时生效 <span class="prio">可选：约个时间再应用；不填时间则改完立即生效。到点前求值与整包版本都不变</span></h3>
       <div class="row">
         <input id="scheduleAt" type="datetime-local" step="1" style="max-width:230px">
-        <span class="muted">填了时间后，再点上方「全关 / 放量 / 默认值」的改动会约到该时刻生效</span>
+        <span class="muted">填了时间后，再点上方「全关 / 属性条件 / 放量 / 默认值」的改动会约到该时刻生效</span>
       </div>
       <div id="scheduledList">${renderScheduled(f)}</div>
     </div>`;
@@ -264,7 +284,8 @@ async function renderDetail() {
 }
 
 const FIELD_NAMES = { kill_switch: '全关', default_enabled: '默认开',
-                      rollout_percent: '放量比例', description: '描述' };
+                      rollout_percent: '放量比例', description: '描述',
+                      targeting: '属性打开条件' };
 
 function renderScheduled(f) {
   const list = f.scheduled_changes || [];
@@ -343,6 +364,17 @@ const toggleKill  = () => patch({ kill_switch: !current().kill_switch });
 const setDefault  = v  => patch({ default_enabled: v });
 const setRollout  = v  => patch({ rollout_percent: parseInt(v, 10) });
 
+async function setTargeting() {
+  let rule;
+  const raw = $('tgtRule').value.trim();
+  if (!raw) return toast('条件为空：要清除请点「清除」', true);
+  try { rule = JSON.parse(raw); } catch (e) { return toast('条件不是合法 JSON', true); }
+  if (typeof rule !== 'object' || Array.isArray(rule))
+    return toast('条件必须是 JSON 对象', true);
+  await patch({ targeting: rule });
+}
+const clearTargeting = () => patch({ targeting: {} });
+
 async function setOverride(enabled) {
   const id = $('ovIdentity').value;  // 不 trim：首尾空格也是身份的一部分
   if (!id) return toast('请填写身份', true);
@@ -358,13 +390,26 @@ async function removeOverride(identity) {
   toast('已移除'); loadAll();
 }
 
+function readAttrs() {
+  const raw = $('checkAttrs').value.trim();
+  if (!raw) return '';
+  let attrs;
+  try { attrs = JSON.parse(raw); } catch (e) { throw new Error('属性不是合法 JSON'); }
+  if (typeof attrs !== 'object' || Array.isArray(attrs))
+    throw new Error('属性必须是 JSON 对象');
+  return encodeURIComponent(JSON.stringify(attrs));
+}
+
 async function checkIdentity() {
   const id = $('checkIdentity').value.trim();
   if (!selected || !id) return toast('先选开关并填写身份', true);
-  const r = await fetch(`/api/flags/${encodeURIComponent(selected)}/check?identity=${encodeURIComponent(id)}`)
-    .then(r => r.json());
-  const layerNames = { kill_switch: '全关', override: '单人强制', group: '互斥组',
-                       rollout: '比例放量', default: '默认值' };
+  let aq;
+  try { aq = readAttrs(); } catch (e) { return toast(e.message, true); }
+  const url = `/api/flags/${encodeURIComponent(selected)}/check?identity=${encodeURIComponent(id)}`
+    + (aq ? `&attrs=${aq}` : '');
+  const r = await fetch(url).then(r => r.json());
+  const layerNames = { kill_switch: '全关', override: '单人强制', targeting: '属性条件',
+                       group: '互斥组', rollout: '比例放量', default: '默认值' };
   $('checkResult').innerHTML = r.error ? esc(r.error)
     : `结果：<b style="color:${r.enabled ? 'var(--ok)' : 'var(--danger)'}">${r.enabled ? '开' : '关'}</b>
        <span class="muted">（由「${layerNames[r.reason] || r.reason}」层决定）</span>`;
@@ -373,7 +418,10 @@ async function checkIdentity() {
 // ---------------------------------------------------------------- 整包
 
 async function fetchBundle(id, version) {
+  let aq;
+  try { aq = readAttrs(); } catch (e) { throw e; }
   let url = `/api/bundle?identity=${encodeURIComponent(id)}`;
+  if (aq) url += `&attrs=${aq}`;
   if (version) url += `&version=${encodeURIComponent(version)}`;
   return fetch(url).then(r => r.json());
 }
@@ -390,7 +438,8 @@ function renderBundle(r) {
 async function checkBundle() {
   const id = $('checkIdentity').value.trim();
   if (!id) return toast('请填写身份', true);
-  const r = await fetchBundle(id);
+  let r;
+  try { r = await fetchBundle(id); } catch (e) { return toast(e.message, true); }
   if (!r.error) $('bundleVersion').value = r.version;
   $('bundleResult').innerHTML = renderBundle(r);
   $('bundleValid').innerHTML = '';
@@ -400,7 +449,8 @@ async function validateBundle() {
   const id = $('checkIdentity').value.trim();
   const v = $('bundleVersion').value.trim();
   if (!id || !v) return toast('请填写身份与手中的整包版本', true);
-  const r = await fetchBundle(id, v);
+  let r;
+  try { r = await fetchBundle(id, v); } catch (e) { return toast(e.message, true); }
   if (r.error) { $('bundleValid').innerHTML = esc(r.error); return; }
   $('bundleValid').innerHTML = r.valid
     ? `<span style="color:var(--ok)">✔ 版本 ${esc(v)} 仍然有效，包内容可继续用</span>`
@@ -421,7 +471,8 @@ async function loadInvalidations() {
         byKey.set(key, g);
         grouped.push(g);
       }
-      byKey.get(key).identities.push(r.identity);
+      byKey.get(key).identities.push(
+        r.attrs_hash ? r.identity + '（属性包 ' + r.attrs_hash.slice(0, 6) + '…）' : r.identity);
     }
     $('invBody').innerHTML = grouped.map(g => `<tr>
       <td>${new Date(g.created_at * 1000).toLocaleString()}</td>

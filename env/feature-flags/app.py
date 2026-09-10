@@ -3,27 +3,41 @@
 求值优先级（固定，不可配置）：
     1. 全关（kill switch）        -> 一律关
     2. 单人强制（override）        -> 强制开 / 强制关
-    3. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关
-    4. 默认值（default_enabled）   -> 仅当放量比例为 0（未启用放量）时兜底
+    3. 属性打开条件（targeting）   -> 来问带的属性全对上则开；对不上落到下面
+    4. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关
+    5. 默认值（default_enabled）   -> 仅当放量比例为 0（未启用放量）时兜底
+
+属性打开条件：调用方来问时可以带上「这个人身上的属性」（attrs，一个 JSON
+对象，如 {"plan":"pro","level":3}）。管理端给开关定一个条件（targeting，
+同样是 JSON 对象）：条件里每个键都在来问属性里且值相等才算对上（多键 AND），
+条件值写成列表表示任一对上即可（同键 OR）。对上了这一层直接开；对不上、
+没带属性或开关没定条件，都按原来的规则（放量 / 默认值）算。判定是纯函数，
+同一人、同一身属性，问多少次结果都一样。属性命中与放量命中一样算「自然
+结果为开」，开关若在互斥组内仍要过组规则；全关与单人强制仍然优先于它。
 
 互斥组（mutex group）：管理端可把多个开关编入同一组，一个开关最多进一组。
-对同一身份，组内最多一个开关为开：第 3/4 层判开后，若开关在组内，则由
+对同一身份，组内最多一个开关为开：第 3/4/5 层判开后，若开关在组内，则由
 组规则裁决——该身份在组内已落定过别的开关则判关，否则落定为本开关并
-写库；之后身份不变，落定的开关不变。全关与单人强制优先于组规则
+写库；之后身份不变，落定的开关不变（落定只认身份，与本次带没带属性、
+带了什么属性无关）。全关与单人强制优先于组规则
 （强制开不受组内已有人开着的限制，全关仍然全关）；未进组的开关按原
 规则求值，不参与组规则。
 
 放量分桶：sha256("{flag_name}:{identity}") % 100，同一身份对同一开关
 永远落在同一侧，与进程、机器、重启无关。
 
-整包（bundle）：调用方只带身份，一次拿走所有开关的开/关结果与整包版本。
-版本 = 求值输入摘要（会影响此身份求值的全部输入）+ 单调递增的内容序号：
-配置不变时同一身份反复来拿，结果与版本都不变；管理端改动任何会影响此
-身份的一层后，序号 +1，版本必变；配置改回去摘要虽复原，但序号不回头，
-旧版本永远不会再有效。带 version 参数来问可校验手中的包是否过期。
+整包（bundle）：调用方带身份（可再带一身属性），一次拿走所有开关的开/关
+结果与整包版本。整包按 (身份, 属性) 分别记账：同一人带不同属性来拿是不同
+的包、各自有版本；不带属性的包不受任何属性条件影响（管理端增改条件时它的
+版本一字不变）。
+版本 = 求值输入摘要（会影响此身份此身属性求值的全部输入）+ 单调递增的内容
+序号：配置不变时同一 (身份, 属性) 反复来拿，结果与版本都不变；管理端改动
+任何会影响此包的一层后，序号 +1，版本必变；配置改回去摘要虽复原，但序号
+不回头，旧版本永远不会再有效。带 version 参数来问可校验手中的包是否过期。
 已发出的整包落库，管理端每次变更后用与调用方来拿时完全相同的求值重算
-各整包，内容变了的身份记入 bundle_invalidations——记下的新版本与本人
-再来拿时拿到的是同一个。管理端可看到「谁改了什么、让哪些人的整包失效了」。
+各整包，内容变了的 (身份, 属性) 记入 bundle_invalidations——记下的新版本
+与本人带同一身属性再来拿时拿到的是同一个。管理端可看到「谁改了什么、
+让哪些人的整包失效了」。
 
 定时生效（scheduled change）：管理端改开关配置时可带 effective_at 约一个
 未来时刻。到点之前，求值、整包结果与整包版本都按原样（定时变更只躺在
@@ -55,6 +69,7 @@ CREATE TABLE IF NOT EXISTS flags (
     default_enabled INTEGER NOT NULL DEFAULT 0,
     rollout_percent INTEGER NOT NULL DEFAULT 0,
     kill_switch     INTEGER NOT NULL DEFAULT 0,
+    targeting_rule  TEXT NOT NULL DEFAULT '',  -- 属性打开条件（canonical JSON）；''=未定条件
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
@@ -98,21 +113,26 @@ CREATE TABLE IF NOT EXISTS group_assignments (
     created_at REAL NOT NULL,
     PRIMARY KEY (group_id, identity)
 );
--- 已发出的整包：身份 -> 最近一次整包的版本与结果
+-- 已发出的整包：(身份, 属性) -> 最近一次整包的版本与结果。
+-- 同人带不同属性来拿是不同的包；attrs_hash 为 '' 表示没带属性的包。
 CREATE TABLE IF NOT EXISTS bundles (
-    identity     TEXT PRIMARY KEY,
+    identity     TEXT NOT NULL,
+    attrs_hash   TEXT NOT NULL DEFAULT '',
+    attrs_json   TEXT NOT NULL DEFAULT '',   -- 属性原文（canonical JSON），管理端展示用
     version      TEXT NOT NULL,              -- 最近一次发出的整包版本
     content_hash TEXT NOT NULL DEFAULT '',   -- 当前求值输入的内容摘要
     generation   INTEGER NOT NULL DEFAULT 0, -- 内容变化序号，只增不减
     results      TEXT NOT NULL,
-    updated_at   REAL NOT NULL
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (identity, attrs_hash)
 );
--- 整包失效记录：哪次变更（谁、改了什么）让哪个身份的整包过期了
+-- 整包失效记录：哪次变更（谁、改了什么）让哪个 (身份, 属性) 的整包过期了
 CREATE TABLE IF NOT EXISTS bundle_invalidations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     actor       TEXT NOT NULL,
     change      TEXT NOT NULL,
     identity    TEXT NOT NULL,
+    attrs_hash  TEXT NOT NULL DEFAULT '',
     old_version TEXT NOT NULL,
     new_version TEXT NOT NULL,
     created_at  REAL NOT NULL
@@ -132,7 +152,96 @@ CREATE TABLE IF NOT EXISTS scheduled_changes (
 );
 """
 
-LAYERS = ("kill_switch", "override", "group", "rollout", "default")
+LAYERS = ("kill_switch", "override", "targeting", "group", "rollout", "default")
+
+
+# ---------------------------------------------------------------- attrs / targeting
+
+def parse_attrs(raw):
+    """解析调用方来问时带的属性（查询参数 attrs，URL 编码的 JSON 对象）。
+
+    只接受「键为字符串、值为标量（string/number/bool/null）」的扁平对象；
+    返回规范化后的 dict（原样大小写，不做 strip——属性值也是精确匹配的一部分）。
+    缺省 / 空串表示没带属性；非法输入抛 ValueError，由接口转 400。
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        attrs = json.loads(raw)
+    except (ValueError, TypeError):
+        raise ValueError("attrs must be URL-encoded JSON, e.g. %7B%22plan%22%3A%22pro%22%7D")
+    if not isinstance(attrs, dict):
+        raise ValueError("attrs must be a JSON object")
+    for k, v in attrs.items():
+        if not isinstance(k, str) or k == "":
+            raise ValueError("attr keys must be non-empty strings")
+        if isinstance(v, bool) or v is None or isinstance(v, (str, int, float)):
+            continue
+        raise ValueError(f"attr '{k}' must be a scalar (string/number/bool/null)")
+    return attrs
+
+
+def scalar_equal(a, b):
+    """属性值精确相等：bool 与 number 不互等（True ≠ 1），其余按 JSON 语义。"""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    return a == b
+
+
+def canonical_json(obj):
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+
+
+def validate_targeting(rule):
+    """校验管理端定的属性打开条件，返回规范化 JSON 串。
+
+    形式：{键: 标量} 或 {键: [标量, …]}；多个键之间是 AND，
+    一个键给多个值时是 OR。None / {} 表示清除条件。非法抛 ValueError。
+    """
+    if rule is None:
+        return ""
+    if not isinstance(rule, dict):
+        raise ValueError("targeting must be a JSON object"
+                         " (use {} or null to clear)")
+    if not rule:
+        return ""  # 空对象 = 清除条件
+
+    def check_scalar(v, where):
+        if isinstance(v, bool) or v is None or isinstance(v, (str, int, float)):
+            return
+        raise ValueError(f"targeting value at {where} must be a scalar"
+                         " (string/number/bool/null)")
+
+    norm = {}
+    for k, v in rule.items():
+        if not isinstance(k, str) or k == "":
+            raise ValueError("targeting keys must be non-empty strings")
+        if isinstance(v, list):
+            if not v:
+                raise ValueError(f"targeting list for '{k}' must not be empty")
+            for item in v:
+                check_scalar(item, f"'{k}'")
+            norm[k] = v
+        else:
+            check_scalar(v, f"'{k}'")
+            norm[k] = v
+    return canonical_json(norm)
+
+
+def targeting_matches(rule_json, attrs):
+    """属性对没对上条件：条件每个键都在属性里且值相等（列表值任一即可）。"""
+    if not rule_json or not attrs:
+        return False
+    rule = json.loads(rule_json)
+    for k, wanted in rule.items():
+        if k not in attrs:
+            return False
+        got = attrs[k]
+        values = wanted if isinstance(wanted, list) else [wanted]
+        if not any(scalar_equal(got, w) for w in values):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------- db helpers
@@ -165,6 +274,32 @@ def init_db():
         conn.execute("ALTER TABLE bundles ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
     if "generation" not in cols:
         conn.execute("ALTER TABLE bundles ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
+    # 属性条件：flags 增加 targeting_rule
+    flag_cols = {r[1] for r in conn.execute("PRAGMA table_info(flags)")}
+    if "targeting_rule" not in flag_cols:
+        conn.execute("ALTER TABLE flags ADD COLUMN targeting_rule TEXT NOT NULL DEFAULT ''")
+    # 整包按 (身份, 属性) 分别记账：把旧的「身份主键」整包表重建为复合主键，
+    # 已发的老包原样保留（它们是不带属性的包，attrs_hash=''）
+    pk = conn.execute("PRAGMA table_info(bundles)").fetchall()
+    if any(r[5] for r in pk) and "attrs_hash" not in cols:
+        conn.executescript(
+            "ALTER TABLE bundles RENAME TO bundles_old;"
+            "CREATE TABLE bundles ("
+            " identity TEXT NOT NULL, attrs_hash TEXT NOT NULL DEFAULT '',"
+            " attrs_json TEXT NOT NULL DEFAULT '', version TEXT NOT NULL,"
+            " content_hash TEXT NOT NULL DEFAULT '',"
+            " generation INTEGER NOT NULL DEFAULT 0, results TEXT NOT NULL,"
+            " updated_at REAL NOT NULL, PRIMARY KEY (identity, attrs_hash));"
+            "INSERT INTO bundles (identity, attrs_hash, attrs_json, version,"
+            " content_hash, generation, results, updated_at)"
+            " SELECT identity, '', '', version, content_hash, generation,"
+            " results, updated_at FROM bundles_old;"
+            "DROP TABLE bundles_old;"
+        )
+    inv_cols = {r[1] for r in conn.execute("PRAGMA table_info(bundle_invalidations)")}
+    if "attrs_hash" not in inv_cols:
+        conn.execute("ALTER TABLE bundle_invalidations"
+                     " ADD COLUMN attrs_hash TEXT NOT NULL DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -184,6 +319,7 @@ def flag_to_dict(row):
         "default_enabled": bool(row["default_enabled"]),
         "rollout_percent": row["rollout_percent"],
         "kill_switch": bool(row["kill_switch"]),
+        "targeting": json.loads(row["targeting_rule"]) if row["targeting_rule"] else {},
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -205,8 +341,12 @@ def group_of(db, flag_id):
     return row["group_id"] if row else None
 
 
-def evaluate(db, flag, identity):
-    """按固定优先级求值，返回 (enabled, reason)。"""
+def evaluate(db, flag, identity, attrs=None):
+    """按固定优先级求值，返回 (enabled, reason)。
+
+    attrs 为来问时带的属性（dict）。属性条件命中时这一层直接定论为开；
+    对不上 / 没带属性 / 开关没定条件，都按原来的放量 / 默认值算。
+    """
     if flag["kill_switch"]:
         return False, "kill_switch"
 
@@ -217,8 +357,12 @@ def evaluate(db, flag, identity):
     if override is not None:
         return bool(override["enabled"]), "override"
 
+    # 属性打开条件：来问属性全对上则开，且不落到放量 / 默认值
+    if targeting_matches(flag["targeting_rule"], attrs):
+        natural = True
+        reason = "targeting"
     # 放量比例 > 0 时这一层直接定论：命中开、未命中关，不再落到默认值
-    if flag["rollout_percent"] > 0:
+    elif flag["rollout_percent"] > 0:
         natural = bucket_of(flag["name"], identity) < flag["rollout_percent"]
         reason = "rollout"
     else:
@@ -229,8 +373,8 @@ def evaluate(db, flag, identity):
     if group_id is None or not natural:
         return natural, reason
 
-    # 互斥组裁决：仅当自然结果为开才参与。组内同一身份最多一个开，
-    # 先到先得；落定写库后，身份不变，开着的那个不换。
+    # 互斥组裁决：仅当自然结果为开才参与（属性命中也算）。组内同一身份
+    # 最多一个开，先到先得，落定只认身份、与本次带的属性无关。
     winner = db.execute(
         "SELECT flag_id FROM group_assignments WHERE group_id=? AND identity=?",
         (group_id, identity),
@@ -252,16 +396,27 @@ def evaluate(db, flag, identity):
 
 # ---------------------------------------------------------------- bundle
 
-def bundle_content_hash(db, identity):
-    """求值输入摘要：对「会影响此身份求值结果的全部输入」做确定性摘要。
+def attrs_hash_of(attrs):
+    """一身属性的确定性摘要；空属性（没带属性）记为空串。"""
+    if not attrs:
+        return ""
+    return hashlib.sha256(canonical_json(attrs).encode("utf-8")).hexdigest()[:16]
+
+
+def bundle_content_hash(db, identity, attrs=None):
+    """求值输入摘要：对「会影响此身份此身属性求值结果的全部输入」做确定性摘要。
 
     覆盖：所有开关的求值相关字段、此身份的单人强制、互斥组成员关系、
-    此身份在组内的落定记录。任一变化都会改变摘要；与求值无关的字段
-    （如描述、时间戳）不影响摘要；只与别人相关的改动（如给他人的
-    单人强制）也不影响此身份的摘要。
+    此身份在组内的落定记录。带属性来拿时，某个开关的属性条件只在此人
+    属性对得上（即该条件实际参与了此人求值）时才进摘要——改一个此人
+    对不上的条件不影响他的包，对得上的条件增删改必换版本；不带属性时
+    摘要与没有「属性条件」这一层时一字不差——管理端怎么增改条件，
+    不带属性的老包都不失效。
+    与求值无关的字段（如描述、时间戳）不影响摘要；只与别人相关的改动
+    （如给他人的单人强制）也不影响此身份的摘要。
     """
     flags = db.execute(
-        "SELECT name, default_enabled, rollout_percent, kill_switch"
+        "SELECT name, default_enabled, rollout_percent, kill_switch, targeting_rule"
         " FROM flags ORDER BY name"
     ).fetchall()
     overrides = db.execute(
@@ -288,6 +443,17 @@ def bundle_content_hash(db, identity):
         "groups": [[r["g"], r["f"]] for r in members],
         "assignments": [[r["g"], r["f"]] for r in assignments],
     }
+    if attrs:
+        # 带属性的包：属性本身进摘要；属性条件只在「对此人对得上」时进摘要
+        # （实际参与了求值才算求值输入，对不上的条件改动不波及此人）
+        payload["attrs"] = attrs
+        with_rules = []
+        for row, r in zip(payload["flags"], flags):
+            if r["targeting_rule"] and targeting_matches(r["targeting_rule"], attrs):
+                with_rules.append(row + [json.loads(r["targeting_rule"])])
+            else:
+                with_rules.append(row)
+        payload["flags"] = with_rules
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
@@ -303,49 +469,53 @@ def make_version(content_hash, generation):
     ).hexdigest()[:16]
 
 
-def compute_bundle(db, identity):
-    """求出此身份所有开关的结果与求值输入摘要。先求值（可能写入组落定
-    记录），再取摘要，保证摘要覆盖本次求值产生的落定记录——管理端失效
-    扫描与调用方来拿走同一套求值，记下的版本与本人来拿时拿到的才一致。"""
+def compute_bundle(db, identity, attrs=None):
+    """求出此身份此身属性下所有开关的结果与求值输入摘要。先求值（可能写入
+    组落定记录），再取摘要，保证摘要覆盖本次求值产生的落定记录——管理端
+    失效扫描与调用方来拿走同一套求值，记下的版本与本人来拿时拿到的才一致。"""
     flags = db.execute("SELECT * FROM flags ORDER BY name").fetchall()
     results = {}
     for flag in flags:
-        enabled, reason = evaluate(db, flag, identity)
+        enabled, reason = evaluate(db, flag, identity, attrs)
         results[flag["name"]] = {"enabled": enabled, "reason": reason}
-    return results, bundle_content_hash(db, identity)
+    return results, bundle_content_hash(db, identity, attrs)
 
 
 def record_invalidations(db, actor_name, change):
     """配置变更后调用：用与调用方来拿时完全相同的求值重算每个已发整包。
 
-    求值输入变了的身份：内容序号 +1、记一条失效记录（谁改的、哪次变更、
-    让谁的整包从哪个版本变成哪个版本），并把 bundles 行推进到新摘要与
-    新序号——记下的新版本与本人再来拿时拿到的是同一个。序号只增不减，
-    配置改回去旧版本也不会复活。与求值无关的改动（如描述）不会改变任何
-    人的摘要，自然不会产生记录。
+    整包按 (身份, 属性) 记账，逐包重算：求值输入变了的包，内容序号 +1、
+    记一条失效记录（谁改的、哪次变更、让谁的哪身属性的整包从哪个版本变成
+    哪个版本），并把 bundles 行推进到新摘要与新序号——记下的新版本与本人
+    带同一身属性再来拿时拿到的是同一个。序号只增不减，配置改回去旧版本
+    也不会复活。与某包无关的改动（如改属性条件时的无属性包、改描述）不会
+    改变它的摘要，自然不会产生记录。
     """
     rows = db.execute(
-        "SELECT identity, content_hash, generation FROM bundles"
+        "SELECT identity, attrs_hash, attrs_json, content_hash, generation"
+        " FROM bundles"
     ).fetchall()
     if not rows:
         return
     now = time.time()
     for r in rows:
-        _, content_hash = compute_bundle(db, r["identity"])
+        attrs = json.loads(r["attrs_json"]) if r["attrs_json"] else None
+        _, content_hash = compute_bundle(db, r["identity"], attrs)
         if content_hash == r["content_hash"]:
             continue
         new_generation = r["generation"] + 1
         db.execute(
             "INSERT INTO bundle_invalidations"
-            " (actor, change, identity, old_version, new_version, created_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (actor_name, change, r["identity"],
+            " (actor, change, identity, attrs_hash, old_version, new_version, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (actor_name, change, r["identity"], r["attrs_hash"],
              make_version(r["content_hash"], r["generation"]),
              make_version(content_hash, new_generation), now),
         )
         db.execute(
-            "UPDATE bundles SET content_hash=?, generation=? WHERE identity=?",
-            (content_hash, new_generation, r["identity"]),
+            "UPDATE bundles SET content_hash=?, generation=?"
+            " WHERE identity=? AND attrs_hash=?",
+            (content_hash, new_generation, r["identity"], r["attrs_hash"]),
         )
     db.commit()
 
@@ -370,43 +540,62 @@ def actor():
 
 @app.get("/api/flags/<name>/check")
 def check(name):
-    """调用方接口：只带身份，得到 开/关。
+    """调用方接口：带身份（可再带一身属性 attrs），得到 开/关。
 
     identity 走查询参数（调用方需做 URL 编码），允许包含斜杠、空格、
     引号等任意字符；不做 strip，首尾空格也是身份的一部分。
+    attrs 为 URL 编码的扁平 JSON 对象，如 attrs=%7B%22plan%22%3A%22pro%22%7D；
+    带了属性且对上管理端定的打开条件时，结果由属性条件层决定。
     """
     identity = request.args.get("identity")
     if not identity:
         return jsonify({"error": "identity is required"}), 400
+    try:
+        attrs = parse_attrs(request.args.get("attrs"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     db = get_db()
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
-    enabled, reason = evaluate(db, flag, identity)
-    return jsonify({
+    enabled, reason = evaluate(db, flag, identity, attrs)
+    body = {
         "flag": name,
         "identity": identity,
         "enabled": enabled,
         "reason": reason,
-    })
+    }
+    if attrs is not None:
+        body["attrs"] = attrs
+    return jsonify(body)
 
 
 @app.get("/api/bundle")
 def bundle():
-    """调用方整包接口：只带身份，一次拿走所有开关的开/关与整包版本。
+    """调用方整包接口：带身份（可再带一身属性 attrs），一次拿走所有开关的
+    开/关与整包版本。
 
-    配置不变时，同一身份多次来拿，每个开关的结果与版本都不变。
+    整包按 (身份, 属性) 分别记账：同一人带不同属性是不同的包、各自有版本；
+    配置不变时同一 (身份, 属性) 多次来拿，每个开关的结果与版本都不变。
     带上 version 参数可校验手中的包是否仍然有效：valid=false 即已过期，
-    响应里同时附带按当前规则重算的新版本与新结果。
+    响应里同时附带按当前规则重算的新版本与新结果。注意版本必须是拿着
+    同一身属性领到的，属性不同的两个包互不算过期。
     """
     identity = request.args.get("identity")
     if not identity:
         return jsonify({"error": "identity is required"}), 400
+    try:
+        attrs = parse_attrs(request.args.get("attrs"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     db = get_db()
-    results, content_hash = compute_bundle(db, identity)
+    results, content_hash = compute_bundle(db, identity, attrs)
+    a_hash = attrs_hash_of(attrs)
+    a_json = canonical_json(attrs) if attrs else ""
     row = db.execute(
-        "SELECT content_hash, generation FROM bundles WHERE identity=?",
-        (identity,),
+        "SELECT content_hash, generation FROM bundles"
+        " WHERE identity=? AND attrs_hash=?",
+        (identity, a_hash),
     ).fetchone()
     if row is None:
         generation = 1
@@ -419,16 +608,20 @@ def bundle():
     version = make_version(content_hash, generation)
     db.execute(
         "INSERT INTO bundles"
-        " (identity, version, content_hash, generation, results, updated_at)"
-        " VALUES (?,?,?,?,?,?)"
-        " ON CONFLICT(identity) DO UPDATE SET version=excluded.version,"
-        " content_hash=excluded.content_hash, generation=excluded.generation,"
-        " results=excluded.results, updated_at=excluded.updated_at",
-        (identity, version, content_hash, generation,
+        " (identity, attrs_hash, attrs_json, version, content_hash, generation,"
+        " results, updated_at)"
+        " VALUES (?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(identity, attrs_hash) DO UPDATE SET attrs_json=excluded.attrs_json,"
+        " version=excluded.version, content_hash=excluded.content_hash,"
+        " generation=excluded.generation, results=excluded.results,"
+        " updated_at=excluded.updated_at",
+        (identity, a_hash, a_json, version, content_hash, generation,
          json.dumps(results, ensure_ascii=False), time.time()),
     )
     db.commit()
     body = {"identity": identity, "version": version, "flags": results}
+    if attrs is not None:
+        body["attrs"] = attrs
     held = request.args.get("version")
     if held is not None:
         body["valid"] = held == version
@@ -483,26 +676,33 @@ def create_flag():
     db = get_db()
     if db.execute("SELECT 1 FROM flags WHERE name=?", (name,)).fetchone():
         return jsonify({"error": "flag already exists"}), 409
+    try:
+        targeting_json = validate_targeting(body.get("targeting"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     now = time.time()
     default_enabled = 1 if body.get("default_enabled") else 0
     db.execute(
-        "INSERT INTO flags (name, description, default_enabled, created_at, updated_at)"
-        " VALUES (?,?,?,?,?)",
-        (name, body.get("description", ""), default_enabled, now, now),
+        "INSERT INTO flags (name, description, default_enabled, targeting_rule,"
+        " created_at, updated_at) VALUES (?,?,?,?,?,?)",
+        (name, body.get("description", ""), default_enabled, targeting_json, now, now),
     )
     audit(actor(), name, "default", "create_flag",
-          f"default_enabled={bool(default_enabled)}")
+          f"default_enabled={bool(default_enabled)}"
+          + (f" targeting={targeting_json}" if targeting_json else ""))
     db.commit()
     record_invalidations(db, actor(), f"create_flag {name}")
     return jsonify({"ok": True}), 201
 
 
 # 可预约定时生效的开关字段（与 PATCH 立即生效支持的字段一致）
-SCHEDULABLE_FIELDS = ("kill_switch", "default_enabled", "rollout_percent", "description")
+SCHEDULABLE_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
+                      "description", "targeting")
 
 
 def apply_flag_fields(db, flag, body):
-    """把 kill_switch / default_enabled / rollout_percent / description 写到开关上。
+    """把 kill_switch / default_enabled / rollout_percent / description /
+    targeting 写到开关上。
 
     立即生效与定时生效到点应用共用这一段。返回 (changes, error)：
     changes 是 (layer, action, detail) 列表（值没变的字段不在列）；
@@ -510,6 +710,19 @@ def apply_flag_fields(db, flag, body):
     """
     changes = []
 
+    if "targeting" in body:
+        try:
+            new_rule = validate_targeting(body["targeting"])
+        except ValueError as e:
+            return None, str(e)
+        if new_rule != flag["targeting_rule"]:
+            db.execute("UPDATE flags SET targeting_rule=?, updated_at=? WHERE id=?",
+                       (new_rule, time.time(), flag["id"]))
+            if new_rule:
+                changes.append(("targeting", "set_targeting", f"targeting={new_rule}"))
+            else:
+                changes.append(("targeting", "clear_targeting",
+                                f"targeting removed (was {flag['targeting_rule']})"))
     if "kill_switch" in body:
         new = 1 if body["kill_switch"] else 0
         if new != flag["kill_switch"]:
@@ -557,6 +770,11 @@ def schedule_flag_change(db, flag, body, effective_at):
         v = payload["rollout_percent"]
         if not isinstance(v, int) or not 0 <= v <= 100:
             return jsonify({"error": "rollout_percent must be an int in [0,100]"}), 400
+    if "targeting" in payload:
+        try:
+            validate_targeting(payload["targeting"])
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
     cur = db.execute(
         "INSERT INTO scheduled_changes"
         " (flag_id, flag_name, changes, effective_at, created_by, created_at)"
@@ -923,14 +1141,19 @@ def list_audit():
 @app.get("/api/bundles")
 @require_admin
 def list_bundles():
-    """管理端：已发出的整包清单，stale=true 表示配置已变、此人还没来拿新包。"""
+    """管理端：已发出的整包清单，按 (身份, 属性) 逐行列出；
+    stale=true 表示配置已变、此人带这身属性还没来拿新包。"""
     db = get_db()
     rows = db.execute(
-        "SELECT identity, version, content_hash, generation, updated_at FROM bundles"
+        "SELECT identity, attrs_hash, attrs_json, version, content_hash,"
+        " generation, updated_at FROM bundles"
         " ORDER BY updated_at DESC LIMIT 500"
     ).fetchall()
     return jsonify([
-        {"identity": r["identity"], "version": r["version"],
+        {"identity": r["identity"],
+         "attrs_hash": r["attrs_hash"],
+         "attrs": json.loads(r["attrs_json"]) if r["attrs_json"] else {},
+         "version": r["version"],
          "stale": make_version(r["content_hash"], r["generation"]) != r["version"],
          "updated_at": r["updated_at"]}
         for r in rows
@@ -940,10 +1163,10 @@ def list_bundles():
 @app.get("/api/bundles/invalidations")
 @require_admin
 def list_bundle_invalidations():
-    """管理端：整包失效记录——谁改了什么、让哪些人的整包过期了。"""
+    """管理端：整包失效记录——谁改了什么、让哪些人哪身属性的整包过期了。"""
     limit = min(int(request.args.get("limit", 100)), 500)
     rows = get_db().execute(
-        "SELECT actor, change, identity, old_version, new_version, created_at"
+        "SELECT actor, change, identity, attrs_hash, old_version, new_version, created_at"
         " FROM bundle_invalidations ORDER BY id DESC LIMIT ?", (limit,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])

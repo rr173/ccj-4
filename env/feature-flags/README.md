@@ -5,11 +5,12 @@
 ## 求值优先级（固定，代码中不可调整）
 
 ```
-全关(kill_switch) > 单人强制(override) > 互斥组(group) > 比例放量(rollout) > 默认值(default)
+全关(kill_switch) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout) > 默认值(default)
 ```
 
 - **全关**：打开后所有身份一律为关，覆盖一切。
-- **单人强制**：对指定 identity 强制开/关，覆盖互斥组、放量与默认值。
+- **单人强制**：对指定 identity 强制开/关，覆盖属性条件、互斥组、放量与默认值。
+- **属性打开条件**：见下节。
 - **互斥组**：见下节。
 - **比例放量**：`sha256("{flag}:{identity}") % 100 < percent` 则开，未命中则关。
   只要比例 > 0，这一层就给出定论，不再落到默认值；比例为 0 表示未启用放量。
@@ -17,13 +18,46 @@
   调高比例只会**新增**命中者，已命中者不会掉出。
 - **默认值**：仅当放量比例为 0 时兜底。
 
+## 属性打开条件（targeting）
+
+调用方来问开关时，可以在身份之外再带上**这个人身上的属性**（`attrs`，一个扁平
+JSON 对象）；管理端可以给开关定一个「打开条件」，来问属性与条件**全对上了才开**，
+对不上、没带属性或开关没定条件，都按原来的规则（互斥组/放量/默认值）继续算：
+
+```bash
+# 管理端定条件：套餐为 pro，且等级是 3 或 5（多键 AND，值给列表是任一）
+curl -X PATCH http://localhost:8000/api/flags/new-checkout \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"targeting": {"plan": "pro", "level": [3, 5]}}'
+
+# 调用方来问时带属性（attrs 是 URL 编码的 JSON）
+curl "http://localhost:8000/api/flags/new-checkout/check?identity=u123&attrs=%7B%22plan%22%3A%22pro%22%2C%22level%22%3A3%7D"
+# => {"flag":"new-checkout","identity":"u123","attrs":{"plan":"pro","level":3},
+#     "enabled":true,"reason":"targeting"}
+```
+
+- **条件形式**：`{"键": 标量}` 或 `{"键": [标量, …]}`。多个键之间是 **AND**
+  （每个键都得来问属性里有且值相等），一个键给多个值时是 **OR**（任一相等即可）。
+  属性里多带条件没要求的键不影响对上；条件的值支持字符串、数字、布尔、`null`，
+  按 JSON 语义精确匹配（`true` ≠ `1`，`3` = `3.0`，`3` ≠ `"3"`）。
+- **结果恒定**：判定是纯函数，同一人、同一身属性，问多少次、从哪台机器问，
+  结果都一样；JSON 键的书写顺序不影响判定与整包版本。
+- **优先级**：全关与单人强制仍然压过属性条件；属性命中与放量命中一样算
+  「自然结果为开」——开关若在互斥组内，命中后仍要过组规则（见下节）。
+- **整包按属性分包**：同一身份带不同属性来拿整包，是各自独立的包、各自有版本；
+  不带属性的老包不受任何属性条件影响。管理端增改条件后，只有「此条件实际参与过
+  求值」的属性包（即属性对得上的那些）才换新版本、记失效；对不上的属性包和不带
+  属性的包版本一字不变。
+- `targeting` 同样支持 `effective_at` 预约定时生效；传 `{}` 或 `null` 清除条件。
+
 ## 互斥组
 
 管理端可把多个开关编入同一互斥组（一个开关最多进一个组）。对同一身份，
 **组内最多一个开关为开，且身份不变时开着的那个不会换**：
 
-- 开关先按「比例放量 / 默认值」算出自然结果；自然结果为关时不参与组规则、
-  不在组内占位。
+- 开关先按「属性打开条件 / 比例放量 / 默认值」算出自然结果；自然结果为关时
+  不参与组规则、不在组内占位（落定只认身份，与本次带没带属性、带了什么属性无关）。
 - 自然结果为开且开关在组内时，由组规则裁决：该身份在组内已落定过别的开关
   则判关；否则落定为本开关并写库（`group_assignments` 表），此后恒定。
   并发请求下同一身份也只会有一个开关落定成功。
@@ -39,40 +73,47 @@
 
 ## 整包（bundle）
 
-调用方可以一次只带身份，把这个身份此刻**所有开关**的开/关结果连同**整包版本**一次拿走：
+调用方可以带身份（可再带一身属性 `attrs`），把这个身份此刻**所有开关**的开/关结果
+连同**整包版本**一次拿走。整包按 **(身份, 属性)** 分别记账：同一人带不同属性是
+不同的包、各自有版本；不带属性的包不受任何属性条件影响。
 
 ```bash
-GET /api/bundle?identity=<用户身份>
-# => {"identity":"u123","version":"9f2c…","flags":{"new-checkout":{"enabled":true,"reason":"rollout"}, …}}
+GET '/api/bundle?identity=<用户身份>&attrs=<URL编码的JSON属性>'
+# => {"identity":"u123","attrs":{"plan":"pro"},"version":"9f2c…",
+#     "flags":{"new-checkout":{"enabled":true,"reason":"targeting"}, …}}
 ```
 
-- **版本恒定**：版本 = 求值输入摘要（会影响此身份求值的全部输入：所有开关的
-  求值字段、此人的单人强制、互斥组成员关系、此人的组内落定记录）+ 单调递增的
-  内容序号。配置没变时，同一人多次来拿，每个开关的结果和版本都不变。
-- **变了必新版本**：管理端改了任何会影响此人的一层（开关配置、对此人的强制、
-  互斥组变动），序号 +1，他再来拿一定是新版本、按改完后的规则重算。
-  与他无关的改动（如给别人的单人强制、改描述）不影响他的版本。
+- **版本恒定**：版本 = 求值输入摘要（会影响此身份此身属性求值的全部输入：所有开关的
+  求值字段、此人的单人强制、互斥组成员关系、此人的组内落定记录；带属性时还包括属性
+  本身与对此人实际生效的属性条件）+ 单调递增的内容序号。配置没变时，同一
+  (身份, 属性) 多次来拿，每个开关的结果和版本都不变。
+- **变了必新版本**：管理端改了任何会影响此包的一层（开关配置、对此人的强制、
+  互斥组变动、对此人生效的属性条件），序号 +1，他再来拿一定是新版本、按改完后的
+  规则重算。与他无关的改动（如给别人的单人强制、改描述、他对不上的属性条件）
+  不影响他的版本。
 - **改回不复活**：序号只增不减——把配置改回去，摘要虽复原，版本也不会回到
   旧值；改过一次，旧包就永远失效，不存在"改回去旧包又能用"。
 - **记录即所得**：管理端变更后系统用与调用方来拿时完全相同的求值重算每个
-  已发整包，失效记录里记下的新版本，与本人再来拿时拿到的版本一字不差。
-- **过期校验**：拿着旧版本来问，会明确告知是否已过期，并附带按当前规则重算的新包：
+  已发整包，失效记录里记下的新版本，与本人带同一身属性再来拿时拿到的版本一字不差。
+- **过期校验**：拿着旧版本来问，会明确告知是否已过期，并附带按当前规则重算的新包。
+  版本必须与同一身属性配对使用，属性不同的两个包互不算过期：
 
 ```bash
-GET /api/bundle?identity=<用户身份>&version=<手中的版本>
+GET '/api/bundle?identity=<用户身份>&attrs=<URL编码的JSON属性>&version=<手中的版本>'
 # => {…, "valid": false}   # valid=false 即已过期，响应里是新版本与新结果
 ```
 
-- **失效可见**：已发出的整包落库（`bundles` 表）。管理端每次变更配置后，
-  系统重算每个已发整包的版本，版本变了的身份记入 `bundle_invalidations`，
-  管理端可查到「谁、何时、改了什么、让哪些人的整包失效了」。
+- **失效可见**：已发出的整包落库（`bundles` 表，按身份 + 属性哈希分行）。管理端
+  每次变更配置后，系统重算每个已发整包的版本，版本变了的包记入
+  `bundle_invalidations`，管理端可查到「谁、何时、改了什么、让哪些人的哪身属性的
+  整包失效了」。
 
 > 与单开关 `check` 一样，整包查询对组内开关可能写入落定记录（GET 有写副作用）。
 
 ## 定时生效（约个时间再生效）
 
-管理端改开关配置（全关 / 默认值 / 放量比例 / 描述）时，可以带一个 `effective_at`
-（unix 秒）把改动约到未来某个时刻生效：
+管理端改开关配置（全关 / 默认值 / 放量比例 / 属性打开条件 / 描述）时，可以带一个
+`effective_at`（unix 秒）把改动约到未来某个时刻生效：
 
 ```bash
 # 把放量比例约到 2026-09-12 09:00:00（服务器时间）生效
@@ -114,14 +155,16 @@ docker run -d -p 8000:8000 -e ADMIN_TOKEN=你的强随机串 \
 ### 调用方（无需鉴权）
 
 ```bash
-GET /api/flags/<name>/check?identity=<用户身份>
+GET '/api/flags/<name>/check?identity=<用户身份>[&attrs=<URL编码的JSON属性>]'
 # => {"flag":"new-checkout","identity":"u123","enabled":true,"reason":"rollout"}
-#    reason ∈ kill_switch | override | group | rollout | default，表示结果由哪一层决定
-#    identity 需 URL 编码；允许包含斜杠、空格、引号等任意字符
+#    reason ∈ kill_switch | override | targeting | group | rollout | default，表示结果由哪一层决定
+#    identity / attrs 需 URL 编码；identity 允许包含斜杠、空格、引号等任意字符
+#    attrs 必须是扁平 JSON 对象，值为标量（字符串/数字/布尔/null）；非法返回 400
 
-GET /api/bundle?identity=<用户身份>[&version=<手中的整包版本>]
+GET '/api/bundle?identity=<用户身份>[&attrs=<URL编码的JSON属性>][&version=<手中的整包版本>]'
 # => {"identity":"u123","version":"9f2c…","flags":{"new-checkout":{"enabled":true,"reason":"rollout"}, …}}
-#    带 version 时响应多一个 valid 字段：false 即该版本已过期，响应里是新版本与新结果
+#    带了 attrs 时响应多一个 attrs 字段；整包按 (身份, 属性) 分别记账
+#    带 version 时响应多一个 valid 字段：false 即该版本对此身属性已过期，响应里是新版本与新结果
 ```
 
 ### 管理端（需请求头 `X-Admin-Token`，可选 `X-Actor` 记录操作人）
@@ -129,8 +172,8 @@ GET /api/bundle?identity=<用户身份>[&version=<手中的整包版本>]
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/flags` | 列出所有开关 |
-| POST | `/api/flags` | 新建 `{name, description, default_enabled}` |
-| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, kill_switch, description}`；带 `effective_at`（unix 秒）则约到该时刻生效 |
+| POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting}` |
+| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, kill_switch, targeting, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；带 `effective_at`（unix 秒）则约到该时刻生效 |
 | DELETE | `/api/flags/<name>` | 删除开关（其未生效的定时变更一并取消） |
 | GET | `/api/flags/<name>/overrides` | 列出单人强制 |
 | PUT | `/api/flags/<name>/overrides` | 设置 `{identity, enabled}` |
@@ -146,8 +189,8 @@ GET /api/bundle?identity=<用户身份>[&version=<手中的整包版本>]
 | GET | `/api/audit?limit=100` | 最近操作记录（谁、何时、改了哪一层） |
 | GET | `/api/scheduled-changes` | 还没到点的定时变更（开关、改动内容、生效时刻、预约人） |
 | DELETE | `/api/scheduled-changes/<id>` | 取消一个还没到点的定时变更 |
-| GET | `/api/bundles` | 已发出的整包（身份、版本、是否已过期 stale） |
-| GET | `/api/bundles/invalidations?limit=100` | 整包失效记录：谁改了什么、让哪些身份的整包从哪个版本变成哪个版本 |
+| GET | `/api/bundles` | 已发出的整包（身份、属性哈希、版本、是否已过期 stale） |
+| GET | `/api/bundles/invalidations?limit=100` | 整包失效记录：谁改了什么、让哪些人的哪身属性的整包从哪个版本变成哪个版本 |
 
 示例：
 
@@ -160,6 +203,14 @@ curl -X PATCH http://localhost:8000/api/flags/new-checkout \
 # 50% 放量
 curl -X PATCH http://localhost:8000/api/flags/new-checkout \
   -H "X-Admin-Token: $TOKEN" -d '{"rollout_percent": 50}'
+
+# 按属性定打开条件：pro 套餐且等级为 3 或 5 的人来问才开，其他人按原规则
+curl -X PATCH http://localhost:8000/api/flags/new-checkout \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"targeting": {"plan": "pro", "level": [3, 5]}}'
+curl 'http://localhost:8000/api/flags/new-checkout/check?identity=u123&attrs=%7B%22plan%22%3A%22pro%22%2C%22level%22%3A3%7D'
+# => {"flag":"new-checkout","identity":"u123","attrs":{"plan":"pro","level":3},"enabled":true,"reason":"targeting"}
 
 # 建互斥组并把两个开关编进去
 curl -X POST http://localhost:8000/api/groups \
