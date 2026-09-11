@@ -23,6 +23,15 @@ os.environ["ADMIN_TOKEN"] = "test-token"
 import app as flag_app  # noqa: E402
 
 flag_app.app.config["TESTING"] = True
+
+flag_app.init_environment_db("test", "test")
+class _EnvClient(flag_app.FlaskClient):
+    def open(self, *args, **kwargs):
+        headers = dict(kwargs.get("headers") or {})
+        headers.setdefault("X-Environment", "test")
+        kwargs["headers"] = headers
+        return super().open(*args, **kwargs)
+flag_app.app.test_client_class = _EnvClient
 c = flag_app.app.test_client()
 H = {"X-Admin-Token": "test-token", "X-Actor": "alice"}
 H_BOB = {"X-Admin-Token": "test-token", "X-Actor": "bob"}
@@ -235,7 +244,7 @@ import sqlite3
 patch("foff", {"default_enabled": False})
 t_before_sched = time.time()
 effective = t_before_sched + 0.01
-_dbb = sqlite3.connect(os.environ["FLAG_DB"])
+_dbb = sqlite3.connect(flag_app.environment_db_path("test"))
 _fid = _dbb.execute("SELECT id FROM flags WHERE name='foff'").fetchone()[0]
 _dbb.execute(
     "INSERT INTO scheduled_changes"

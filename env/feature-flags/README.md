@@ -2,6 +2,46 @@
 
 一套自包含的特性开关系统：管理页面 + 调用方查询接口，Flask + SQLite，单容器部署。
 
+## 多环境隔离
+
+管理端可以创建多个环境。每个环境都有独立的开关配置、冻结 / 强制 / 互斥组 /
+发布稿 / 定时变更 / 历史，以及独立的整包账本和版本序号；一个环境里的改动不会
+影响另一个环境。
+
+```bash
+# 创建环境（管理接口）
+curl -X POST http://localhost:8000/api/environments \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" -d '{"name":"prod"}'
+curl -X POST http://localhost:8000/api/environments \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" -d '{"name":"staging"}'
+
+# 查询已有环境
+curl http://localhost:8000/api/environments -H "X-Admin-Token: $TOKEN"
+```
+
+除 `/healthz`、管理页与创建环境接口外，所有接口都必须显式指定环境，二选一：
+
+- 查询参数：`?environment=prod`（也接受短参数 `?env=prod`）
+- 请求头：`X-Environment: prod`（也接受 `X-Env: prod`）
+
+漏带环境返回 `400 {"error":"environment is required ..."}`；环境不存在返回
+`404 {"error":"environment not found: ..."}`。调用方单查与拿整包都必须说环境；
+环境决定访问哪份配置，普通查询响应不额外改变原有字段：
+
+```bash
+curl "http://localhost:8000/api/flags/new-checkout/check?environment=prod&identity=u123"
+curl -H "X-Environment: staging" \
+  "http://localhost:8000/api/bundle?identity=u123"
+```
+
+版本校验只在同一环境、同一身份、同一身属性内有效：
+在 staging 改配置只会让 staging 的旧包过期；同一个人拿 prod 的包仍有效。
+同一人、同一身属性、同一环境多次查询结果恒定。
+
+环境名最长 64 个字符，首尾不能是空白，不能包含 `/`、`\\` 或控制字符。
+
 ## 求值优先级（固定，代码中不可调整）
 
 ```
@@ -516,7 +556,7 @@ curl -X PUT http://localhost:8000/api/flags/new-checkout/overrides \
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `ADMIN_TOKEN` | `dev-admin-token` | 管理端令牌，**生产必须覆盖** |
-| `FLAG_DB` | `/data/flags.db` | SQLite 路径 |
+| `FLAG_DB` | `/data/flags.db` | 环境目录库路径前缀；环境目录在 `<前缀>_environments.db`，各环境库在 `<前缀>_envs/` |
 | `PORT` | `8000` | 监听端口 |
 
 ## 本地开发

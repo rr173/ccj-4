@@ -1,5 +1,15 @@
 """特性开关服务：管理端 + 调用方查询接口。
 
+环境隔离：管理端可以创建多个环境（POST /api/environments）。每个环境使用独立
+SQLite 库，开关、配置、冻结、强制、互斥组、发布稿、定时变更、历史与整包账本
+都完全隔离。除健康检查、环境列表 / 创建和管理页外，所有接口都必须显式带环境：
+?environment=<名字>（也接受 ?env）或 X-Environment 请求头（也接受 X-Env）；
+漏带返回 400，环境不存在返回 404。
+管理端在一个环境内改了会影响求值的东西，只会推进这个环境里相关整包的版本；
+拿着这个环境改前的版本来问得到 valid=false，同一人在另一个环境里拿自己的包
+仍然 valid=true。求值输入摘要里也带环境名，版本不能跨环境冒充。同一人、同一身
+属性、同一环境多次查询仍是纯函数结果。
+
 求值优先级（固定，不可配置）：
     1. 全关（kill switch）        -> 一律关
     2. 结果冻结（freeze）          -> 此人对本开关冻住的那一刻的结果，与之后的一切配置改动无关
@@ -126,16 +136,31 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import time
 from functools import wraps
 
 from flask import Flask, g, jsonify, render_template, request
+from flask.testing import FlaskClient
 
 DB_PATH = os.environ.get("FLAG_DB", "/data/flags.db")
+_DB_BASE, _ = os.path.splitext(DB_PATH)
+CATALOG_DB_PATH = _DB_BASE + "_environments.db"
+ENV_DB_DIR = _DB_BASE + "_envs"
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "dev-admin-token")
 
 app = Flask(__name__)
+
+ENVIRONMENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS environments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    db_file    TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flags (
@@ -500,16 +525,118 @@ def parse_flag_config(flag_config_json):
     return json.loads(flag_config_json) if flag_config_json else None
 
 
-# ---------------------------------------------------------------- db helpers
+# ---------------------------------------------------------------- environment / db helpers
+
+def validate_environment_name(name):
+    """校验环境名：每个环境是独立配置与整包账本，名字只允许安全的短标识。"""
+    if not isinstance(name, str) or not name.strip() or name != name.strip():
+        raise ValueError("environment is required and must not have surrounding whitespace")
+    if len(name) > 64:
+        raise ValueError("environment must be at most 64 characters")
+    if re.search(r"[\x00-\x1f\x7f/\\]", name):
+        raise ValueError("environment must not contain control characters, '/' or '\\'")
+    return name
+
+
+def environment_db_path(name):
+    """环境物理库路径：只由校验后的名字摘要决定，避免路径穿越并保持文件名稳定。"""
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+    return os.path.join(ENV_DB_DIR, f"{digest}.db")
+
+
+def connect_sqlite(path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def get_catalog_db():
+    if "catalog_db" not in g:
+        g.catalog_db = connect_sqlite(CATALOG_DB_PATH)
+    return g.catalog_db
+
+
+def init_catalog():
+    conn = connect_sqlite(CATALOG_DB_PATH)
+    conn.executescript(ENVIRONMENT_SCHEMA)
+    conn.commit()
+    conn.close()
+
+
+def init_environment_db(name, actor_name="system"):
+    """创建环境登记与独立 SQLite 库；已存在时直接返回现有路径。"""
+    validate_environment_name(name)
+    path = environment_db_path(name)
+    init_catalog()
+    conn = connect_sqlite(CATALOG_DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO environments (name, db_file, created_by, created_at)"
+            " VALUES (?,?,?,?)",
+            (name, path, actor_name, time.time()),
+        )
+        conn.commit()
+        created = True
+    except sqlite3.IntegrityError:
+        created = False
+    conn.close()
+    env_conn = connect_sqlite(path)
+    env_conn.executescript(SCHEMA)
+    env_conn.commit()
+    env_conn.close()
+    return path, created
+
+
+def get_environment_record(name):
+    if not name:
+        return None
+    return get_catalog_db().execute(
+        "SELECT * FROM environments WHERE name=?", (name,)
+    ).fetchone()
+
+
+def request_environment():
+    """读取本次请求显式指定的环境。查询参数 / 头都可用，给了多个且不一致则拒绝。"""
+    candidates = [request.args.get("environment"), request.args.get("env"),
+                  request.headers.get("X-Environment"), request.headers.get("X-Env")]
+    values = [v for v in candidates if v]
+    if len(set(values)) > 1:
+        raise ValueError("environment parameters must match"
+                         " (use environment/env or X-Environment/X-Env)")
+    raw = values[0] if values else None
+    if raw is None or raw == "":
+        return None
+    return validate_environment_name(raw)
+
+
+def require_request_environment():
+    """所有开关与整包接口都必须显式指定一个已存在的环境。"""
+    try:
+        name = request_environment()
+    except ValueError as e:
+        return None, (jsonify({"error": str(e)}), 400)
+    if name is None:
+        return None, (jsonify({"error": "environment is required"
+                                          " (use ?environment=<name>, ?env=<name>,"
+                                          " X-Environment or X-Env header)"}), 400)
+    rec = get_environment_record(name)
+    if rec is None:
+        return None, (jsonify({"error": f"environment not found: {name}"}), 404)
+    return name, None
+
 
 def get_db():
     if "db" not in g:
-        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        g.db = conn
+        name = getattr(g, "environment", None)
+        if not name:
+            raise RuntimeError("database access requires a request environment")
+        rec = get_environment_record(name)
+        if rec is None:
+            raise RuntimeError(f"environment not found: {name}")
+        g.db = connect_sqlite(rec["db_file"])
     return g.db
 
 
@@ -518,12 +645,23 @@ def close_db(_exc):
     conn = g.pop("db", None)
     if conn is not None:
         conn.close()
+    catalog = g.pop("catalog_db", None)
+    if catalog is not None:
+        catalog.close()
 
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    """初始化环境目录；每个已登记环境独立执行建表 / 老库迁移。"""
+    init_catalog()
+    catalog = connect_sqlite(CATALOG_DB_PATH)
+    env_rows = catalog.execute("SELECT name, db_file FROM environments ORDER BY id").fetchall()
+    catalog.close()
+    for env in env_rows:
+        _init_environment_schema(env["db_file"])
+
+
+def _init_environment_schema(path):
+    conn = connect_sqlite(path)
     conn.executescript(SCHEMA)
     # 老库迁移：bundles 增加 content_hash / generation（旧行下次来拿时按新规则重算）
     cols = {r[1] for r in conn.execute("PRAGMA table_info(bundles)")}
@@ -977,6 +1115,7 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
         (identity,),
     ).fetchall()
     payload = {
+        "environment": getattr(g, "environment", "") if g else "",
         "identity": identity,
         # 冻住的开关：默认值/放量在冻住期间不参与求值，摘要里恒为中性值，
         # 全关仍压过冻结、照常参与，故保留真实值。
@@ -1426,6 +1565,37 @@ def actor():
     return request.headers.get("X-Actor", "unknown").strip() or "unknown"
 
 
+@app.get("/api/environments")
+@app.get("/api/environment")
+@app.get("/api/envs")
+@require_admin
+def list_environments():
+    db = get_catalog_db()
+    rows = db.execute(
+        "SELECT name, created_by, created_at FROM environments ORDER BY name"
+    ).fetchall()
+    return jsonify({"environments": [
+        {"name": r["name"], "created_by": r["created_by"],
+         "created_at": r["created_at"]} for r in rows]})
+
+
+@app.post("/api/environments")
+@app.post("/api/environment")
+@app.post("/api/envs")
+@require_admin
+def create_environment():
+    body = request.get_json(force=True)
+    raw = body.get("name") if isinstance(body, dict) else None
+    try:
+        name = validate_environment_name(raw)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if get_environment_record(name) is not None:
+        return jsonify({"error": f"environment already exists: {name}"}), 409
+    init_environment_db(name, actor())
+    return jsonify({"ok": True, "environment": name}), 201
+
+
 # ---------------------------------------------------------------- public API
 
 @app.get("/api/flags/<name>/check")
@@ -1526,6 +1696,8 @@ def bundle():
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True})
+
+
 
 
 # ---------------------------------------------------------------- admin API
@@ -1900,7 +2072,14 @@ def apply_due_scheduled_changes():
 
 
 @app.before_request
-def _apply_due_scheduled_changes():
+def _select_environment_and_apply_due_changes():
+    if request.method == "OPTIONS" or request.url_rule is None or request.endpoint in {
+        "healthz", "list_environments", "create_environment", "admin_page"}:
+        return
+    name, err = require_request_environment()
+    if err is not None:
+        return err
+    g.environment = name
     apply_due_scheduled_changes()
 
 

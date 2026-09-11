@@ -63,9 +63,11 @@
 <body>
 <header>
   <h1>🚩 特性开关管理</h1>
+  <input id="env" type="text" placeholder="环境 environment" style="width:150px">
+  <button type="button" onclick="switchOrCreateEnv()" style="padding:4px 10px">切换/新建</button>
   <input id="token" type="password" placeholder="管理 Token">
   <input id="actor" type="text" placeholder="操作人（记入审计）">
-  <span class="hint">Token 与操作人保存在本机浏览器；优先级固定：全关 &gt; 结果冻结 &gt; 开关依赖 &gt; 单人强制 &gt; 属性条件 &gt; 互斥组 &gt; 比例放量 &gt; 默认值</span>
+  <span class="hint">所有单查与整包都必须显式指定环境；各环境开关、配置、包版本互不影响</span>
 </header>
 
 <main>
@@ -174,11 +176,50 @@ let flags = [];
 let groups = [];
 let drafts = [];
 let selected = null;
+let currentEnv = localStorage.getItem('ff_env') || '';
 
+$('env').value = currentEnv;
 $('token').value = localStorage.getItem('ff_token') || '';
 $('actor').value = localStorage.getItem('ff_actor') || '';
+$('env').addEventListener('change', saveEnv);
 $('token').addEventListener('change', () => { localStorage.setItem('ff_token', $('token').value); loadAll(); });
 $('actor').addEventListener('change', () => localStorage.setItem('ff_actor', $('actor').value));
+
+function saveEnv() {
+  currentEnv = $('env').value.trim();
+  $('env').value = currentEnv;
+  if (currentEnv) localStorage.setItem('ff_env', currentEnv);
+  else localStorage.removeItem('ff_env');
+  selected = null;
+  loadAll();
+}
+
+async function switchOrCreateEnv() {
+  const name = $('env').value.trim();
+  if (!name) { return toast('请先填写环境名', true); }
+  const opts = { method:'POST', headers: headers(), body: JSON.stringify({ name }) };
+  let res = await fetch('/api/environments', opts);
+  if (res.status === 409) { currentEnv = name; saveEnv(); return toast('已切换到环境 ' + name); }
+  if (!res.ok) {
+    let msg = res.status;
+    try { msg = (await res.json()).error || msg; } catch (e) {}
+    return toast(msg, true);
+  }
+  currentEnv = name;
+  localStorage.setItem('ff_env', currentEnv);
+  selected = null;
+  toast('环境已创建并切换：' + name);
+  loadAll();
+}
+
+function envName() {
+  if (!currentEnv) throw new Error('请先填写并切换环境');
+  return currentEnv;
+}
+
+function envQuery() {
+  return new URLSearchParams({ environment: envName() }).toString();
+}
 
 function headers() {
   return { 'Content-Type': 'application/json',
@@ -195,7 +236,10 @@ function toast(msg, isErr) {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: headers() });
+  if (!currentEnv) throw new Error('请先填写并切换环境');
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${path}${sep}${envQuery()}`;
+  const res = await fetch(url, { ...opts, headers: headers() });
   if (!res.ok) {
     let msg = res.status;
     try { msg = (await res.json()).error || msg; } catch (e) {}
@@ -204,7 +248,13 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
-async function loadAll() { await loadFlags(); await loadGroups(); await loadDrafts(); await loadAudit(); await loadInvalidations(); }
+async function loadAll() {
+  if (!currentEnv) {
+    $('flagList').innerHTML = '<span class="muted">请先在顶部填写并切换/新建环境</span>';
+    return;
+  }
+  await loadFlags(); await loadGroups(); await loadDrafts(); await loadAudit(); await loadInvalidations();
+}
 
 async function loadFlags() {
   try {
@@ -642,7 +692,7 @@ async function checkIdentity() {
   if (!selected || !id) return toast('先选开关并填写身份', true);
   let aq;
   try { aq = readAttrs(); } catch (e) { return toast(e.message, true); }
-  const url = `/api/flags/${encodeURIComponent(selected)}/check?identity=${encodeURIComponent(id)}`
+  const url = `/api/flags/${encodeURIComponent(selected)}/check?identity=${encodeURIComponent(id)}&${envQuery()}`
     + (aq ? `&attrs=${aq}` : '');
   const r = await fetch(url).then(r => r.json());
   $('checkResult').innerHTML = r.error ? esc(r.error)
@@ -657,7 +707,7 @@ async function checkIdentity() {
 async function fetchBundle(id, version) {
   let aq;
   try { aq = readAttrs(); } catch (e) { throw e; }
-  let url = `/api/bundle?identity=${encodeURIComponent(id)}`;
+  let url = `/api/bundle?identity=${encodeURIComponent(id)}&${envQuery()}`;
   if (aq) url += `&attrs=${aq}`;
   if (version) url += `&version=${encodeURIComponent(version)}`;
   return fetch(url).then(r => r.json());
