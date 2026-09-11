@@ -21,6 +21,8 @@
   调高比例只会**新增**命中者，已命中者不会掉出。
   若定了**放量条件**（`rollout_condition`），比例只对来问属性对上条件的人生效，
   没对上的直接落到默认值（见「条件按比例放量」一节）。
+  若定了**有序放量规矩**（`rollout_rules`），放量层只看规矩：从上往下第一条
+  对上的按它的比例定论，一条都对不上落到默认值（见「有序放量规矩」一节）。
 - **默认值**：放量比例为 0（未启用放量），或定了放量条件但没对上时兜底。
 
 ## 结果冻结（freeze）
@@ -162,6 +164,45 @@ curl "http://localhost:8000/api/flags/new-checkout/check?identity=u456&attrs=%7B
 - `rollout_condition` 同样支持 `effective_at` 预约定时生效、可收进发布稿、
   可在预演里试；建开关时也可以直接带上。
 
+## 有序放量规矩（rollout_rules）
+
+管理端可以给一个开关定**好几条放量规矩**，一条一条往下写——每条是**一串要对上
+的条件**（与 `targeting` 同形的非空 JSON 对象）和**一个比例**（0-100）：
+
+```bash
+# pro 套餐放 30%，free 套餐放 10%，其余人按默认值
+curl -X PATCH http://localhost:8000/api/flags/new-checkout \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"rollout_rules": [{"condition": {"plan": "pro"}, "percent": 30},
+                         {"condition": {"plan": "free"}, "percent": 10}]}'
+
+curl "http://localhost:8000/api/flags/new-checkout/check?identity=u123&attrs=%7B%22plan%22%3A%22pro%22%7D"
+# 对上第一条：{"enabled":true|false,"reason":"rollout"}（按 30% 分桶，这一层定论）
+curl "http://localhost:8000/api/flags/new-checkout/check?identity=u456&attrs=%7B%22plan%22%3A%22ent%22%7D"
+# 一条都对不上：{"enabled":…,"reason":"default"}（不看任何比例，按默认值）
+```
+
+- **从上往下对**：来问时按列表顺序对条件，**对上哪条就按那条的比例**分桶——
+  命中开、未命中关（`reason=rollout`，这一层定论，不再看后面的规矩，也不落
+  默认值）；**一条都对不上**（含没带属性来问的）不看任何比例，还按这个开关
+  原来的默认值走（`reason=default`）。
+- **条件形式**：与 `targeting` 完全相同（多键 AND、值列表 OR、标量精确匹配），
+  每条的条件必须非空；比例是 0-100 的整数（0 = 对上的全关，100 = 对上的全开）。
+  传 `[]` 或 `null` 清除全部规矩。
+- **结果恒定**：分桶只认开关与身份（`sha256("{flag}:{identity}") % 100`），
+  条件只认来问属性——同一个人、同一身属性，问多少次、从哪台机器问都一样。
+- **优先级**：全关、结果冻结、开关依赖、单人强制都排在它前面，照样压过它；
+  对上的命中与放量命中一样算「自然结果为开」，在互斥组内仍要过组规则。
+- **与单条比例的关系**：定了规矩时，单条的 `rollout_percent` / `rollout_condition`
+  **不参与求值**；清空规矩后老路恢复（没定规矩时与只有单条比例时一字不差）。
+- **改任何一条 → 整包换新版本**：定了规矩时，哪个人走放量层、按哪条的比例走，
+  都由这些规矩决定，因此它们是**所有人**（含不带属性的包）的求值输入——改任何
+  一条的条件或比例（含增删、调序、清空），所有已发整包序号 +1 换新版本，拿着
+  改前那包来问得到 `valid=false`。
+- `rollout_rules` 同样支持 `effective_at` 预约定时生效、可收进发布稿、可在预演
+  里试；建开关时也可以直接带上。
+
 ## 互斥组
 
 管理端可把多个开关编入同一互斥组（一个开关最多进一个组）。对同一身份，
@@ -284,7 +325,8 @@ curl -s -X POST http://localhost:8000/api/drafts/$DID/publish \
 - **多稿并存**：可以同时开多个稿；发布其中一个不影响其他稿。已发布 / 已丢弃的稿
   保留记录（`GET /api/drafts?all=1`），但不能再改、再发布。
 - 稿里可收的字段与立即生效 PATCH 一致：`kill_switch`、`default_enabled`、
-  `rollout_percent`、`rollout_condition`（`{}` 清放量条件）、`targeting`
+  `rollout_percent`、`rollout_condition`（`{}` 清放量条件）、`rollout_rules`
+  （`[]` 清放量规矩）、`targeting`
   （`{}` 清条件）、`depends_on`（`""`/`null` 解除）、
   `description`。**稿不支持 `effective_at`**：发布的一刻就是整稿的生效时刻。
 - 若稿里某个开关在发布前被删除，发布会被整稿拒绝（先把该开关的改动从稿里摘掉即可）。
@@ -401,8 +443,8 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/flags` | 列出所有开关 |
-| POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting, rollout_condition}` |
-| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, rollout_condition, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`rollout_condition` 为放量条件 JSON（`{}`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |
+| POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting, rollout_condition, rollout_rules}` |
+| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, rollout_condition, rollout_rules, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`rollout_condition` 为放量条件 JSON（`{}`/`null` 清除）；`rollout_rules` 为有序放量规矩列表（`[]`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |
 | DELETE | `/api/flags/<name>` | 删除开关（其未生效的定时变更一并取消） |
 | GET | `/api/flags/<name>/overrides` | 列出单人强制 |
 | PUT | `/api/flags/<name>/overrides` | 设置 `{identity, enabled}` |

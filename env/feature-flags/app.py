@@ -7,11 +7,14 @@
     4. 单人强制（override）        -> 强制开 / 强制关
     5. 属性打开条件（targeting）   -> 来问带的属性全对上则开；对不上落到下面
     6. 互斥组（group）            -> 组内同一身份最多一个开
-    7. 比例放量（rollout_percent） -> 比例 > 0 时此层定论：命中开、未命中关；
-       若定了放量条件（rollout_condition），只有来问属性对上条件的人走这一层，
-       没对上的（含没带属性）直接落到默认值
-    8. 默认值（default_enabled）   -> 放量比例为 0（未启用放量），或定了放量
-       条件但来问属性没对上时兜底
+    7. 比例放量（rollout）         -> 定了有序放量规矩（rollout_rules）时只看规矩：
+       从上往下第一条对上的按它的比例定论（命中开、未命中关），一条都对不上落到
+       默认值；没定规矩时走单条比例（rollout_percent，可再定放量条件
+       rollout_condition）：比例 > 0 时此层定论，命中开、未命中关；定了放量
+       条件时只有来问属性对上条件的人走这一层，没对上的（含没带属性）直接落到
+       默认值
+    8. 默认值（default_enabled）   -> 没启用放量（比例为 0 且没定规矩），或定了
+       放量条件 / 规矩但来问属性一条都没对上时兜底
 
 结果冻结（freeze）：管理端可以把某个人对某个开关「此刻」的结果冻住。冻住时
 系统先按当时的全部规则（依赖、强制、属性以不带属性的口径、互斥组、放量、默认）
@@ -62,6 +65,20 @@
 输入的一部分：比例 > 0 且定了条件时，改比例或改条件都让已发出的整包
 （含不带属性的包——没对上的人走哪一层也由这个条件决定）换新版本，拿着
 改前那包来问算过期；比例为 0 时条件不参与求值，改它不动任何版本。
+
+有序放量规矩（rollout_rules）：管理端可以给一个开关定好几条放量规矩，一条
+一条往下写——每条是一串要对上的条件（与属性打开条件同形的非空 JSON 对象）
+和一个比例（0-100）。来问时从上往下对：对上哪条就按那条的比例分桶，命中开、
+未命中关（reason=rollout，这一层定论，不再看后面的规矩）；一条都对不上
+（含没带属性来问的）不看任何比例，还按这个开关原来的默认值走
+（reason=default）。定了规矩时，单条的放量比例与放量条件不参与求值；清空
+规矩（[] / null）后老路恢复。判定仍是纯函数：分桶只认开关与身份，条件只认
+来问属性——同一个人、同一身属性，问多少次结果都不变。全关、结果冻结、开关
+依赖、单人强制都排在它前面，照样压过它；对上的命中与放量命中一样算「自然
+结果为开」，在互斥组内仍要过组规则。规矩是求值输入的一部分：定了规矩时，
+改任何一条的条件或比例（含增删、调序、清空）都让已发出的整包（含不带属性
+的包——走哪一层由规矩决定）换新版本，拿着改前那包来问算过期；没定规矩时
+它不参与求值，摘要保持没这功能时的原样。
 
 整包（bundle）：调用方带身份（可再带一身属性），一次拿走所有开关的开/关
 结果与整包版本。整包按 (身份, 属性) 分别记账：同一人带不同属性来拿是不同
@@ -130,6 +147,9 @@ CREATE TABLE IF NOT EXISTS flags (
     -- 放量条件（canonical JSON）：''=没定，比例放量对所有人分桶；定了之后
     -- 只有来问属性对上条件的人按比例分桶，没对上的落到默认值
     rollout_condition TEXT NOT NULL DEFAULT '',
+    -- 有序放量规矩（canonical JSON 列表）：''=没定。定了之后放量层只看规矩：
+    -- 来问时从上往下对，第一条对上的按它的比例分桶定论；一条都对不上落到默认值
+    rollout_rules TEXT NOT NULL DEFAULT '',
     kill_switch     INTEGER NOT NULL DEFAULT 0,
     targeting_rule  TEXT NOT NULL DEFAULT '',  -- 属性打开条件（canonical JSON）；''=未定条件
     -- 开关挂的配置（canonical JSON）：''=没挂。开关对此人判开时，这份配置随
@@ -380,12 +400,47 @@ def validate_rollout_condition(rule):
     return validate_attr_condition(rule, "rollout_condition")
 
 
-def targeting_matches(rule_json, attrs):
-    """属性对没对上条件：条件每个键都在属性里且值相等（列表值任一即可）。"""
-    if not rule_json or not attrs:
+def validate_rollout_rules(rules):
+    """校验「有序放量规矩」，返回规范化 JSON 串（'' = 没定规矩）。
+
+    形式：[{"condition": {键: 标量|[…]}, "percent": 0-100}, …]；列表顺序即
+    优先级——来问时从上往下对，第一条对上的按它的比例分桶。每条的条件必须是
+    非空的属性条件（与 targeting 同形；空条件对不上任何人，不如不写这条）。
+    None / [] 表示清除规矩。非法抛 ValueError。
+    """
+    if rules is None:
+        return ""
+    if not isinstance(rules, list):
+        raise ValueError("rollout_rules must be a list of rules"
+                         ' ({"condition": {...}, "percent": 0-100});'
+                         " use [] or null to clear")
+    if not rules:
+        return ""
+    if len(rules) > 100:
+        raise ValueError("rollout_rules: at most 100 rules")
+    norm = []
+    for i, r in enumerate(rules):
+        where = f"rollout_rules[{i}]"
+        if not isinstance(r, dict) or set(r) != {"condition", "percent"}:
+            raise ValueError(f"{where} must be an object with exactly"
+                             ' "condition" and "percent"')
+        cond_json = validate_attr_condition(r["condition"], f"{where}.condition")
+        if not cond_json:
+            raise ValueError(f"{where}.condition must be a non-empty condition"
+                             " ({} matches no one; drop the rule instead)")
+        pct = r["percent"]
+        if isinstance(pct, bool) or not isinstance(pct, int) or not 0 <= pct <= 100:
+            raise ValueError(f"{where}.percent must be an int in [0,100]")
+        norm.append({"condition": json.loads(cond_json), "percent": pct})
+    return canonical_json(norm)
+
+
+def condition_dict_matches(cond, attrs):
+    """条件（dict 形态）对不对得上来问属性：条件每个键都在属性里且值相等
+    （列表值任一即可）。空条件 / 没带属性一律算对不上。"""
+    if not cond or not attrs:
         return False
-    rule = json.loads(rule_json)
-    for k, wanted in rule.items():
+    for k, wanted in cond.items():
         if k not in attrs:
             return False
         got = attrs[k]
@@ -393,6 +448,13 @@ def targeting_matches(rule_json, attrs):
         if not any(scalar_equal(got, w) for w in values):
             return False
     return True
+
+
+def targeting_matches(rule_json, attrs):
+    """属性对没对上条件：条件每个键都在属性里且值相等（列表值任一即可）。"""
+    if not rule_json:
+        return False
+    return condition_dict_matches(json.loads(rule_json), attrs)
 
 
 def rollout_gate_open(rollout_condition_json, attrs):
@@ -477,6 +539,10 @@ def init_db():
     # 求值与整包摘要与升级前一字不差）
     if "rollout_condition" not in flag_cols:
         conn.execute("ALTER TABLE flags ADD COLUMN rollout_condition TEXT NOT NULL DEFAULT ''")
+    # 有序放量规矩：flags 增加 rollout_rules（老库一律从没定规矩起步，
+    # 求值与整包摘要与升级前一字不差）
+    if "rollout_rules" not in flag_cols:
+        conn.execute("ALTER TABLE flags ADD COLUMN rollout_rules TEXT NOT NULL DEFAULT ''")
     # 开关依赖：flags 增加 depends_on_flag_id（老库一律从无依赖起步；
     # 不能在 ALTER 上加外键，但删除路径里同样会把指向已删开关的依赖置空）
     if "depends_on_flag_id" not in flag_cols:
@@ -528,6 +594,7 @@ def init_db():
                         "default_enabled": bool(r["default_enabled"]),
                         "rollout_percent": r["rollout_percent"],
                         "rollout_condition": r["rollout_condition"],
+                        "rollout_rules": r["rollout_rules"],
                         "kill_switch": bool(r["kill_switch"]),
                         "targeting": r["targeting_rule"],
                         "config": r["flag_config"],
@@ -626,6 +693,7 @@ def flag_snapshot_payload(flag_row, dep_name=None):
         "default_enabled": bool(flag_row["default_enabled"]),
         "rollout_percent": flag_row["rollout_percent"],
         "rollout_condition": flag_row["rollout_condition"],
+        "rollout_rules": flag_row["rollout_rules"],
         "kill_switch": bool(flag_row["kill_switch"]),
         "targeting": flag_row["targeting_rule"],
         "config": flag_row["flag_config"],
@@ -654,6 +722,8 @@ def flag_to_dict(row, dep_name=None):
         "rollout_percent": row["rollout_percent"],
         "rollout_condition": (json.loads(row["rollout_condition"])
                               if row["rollout_condition"] else {}),
+        "rollout_rules": (json.loads(row["rollout_rules"])
+                          if row["rollout_rules"] else []),
         "kill_switch": bool(row["kill_switch"]),
         "targeting": json.loads(row["targeting_rule"]) if row["targeting_rule"] else {},
         "config": parse_flag_config(row["flag_config"]),
@@ -669,6 +739,28 @@ def bucket_of(flag_name, identity):
     """确定性分桶：同一 (flag, identity) 永远得到 0-99 中同一个数。"""
     digest = hashlib.sha256(f"{flag_name}:{identity}".encode("utf-8")).hexdigest()
     return int(digest, 16) % 100
+
+
+def rollout_layer_verdict(name, identity, rollout_percent, rollout_condition_json,
+                          rollout_rules_json, attrs):
+    """放量层的定论：命中返回 (enabled, "rollout")；本层不定论（落默认值）返回 None。
+
+    定了有序放量规矩（rollout_rules 非空）时只看规矩：从上往下第一条对上的
+    规矩按它的比例分桶，命中开、未命中关，这一层定论；一条都对不上（含没带
+    属性）本层不定论——不看任何比例，落默认值。没定规矩时走老路：比例 > 0
+    且过了放量条件的门（没定条件 = 对所有人开）时按 rollout_percent 分桶定论，
+    否则本层不定论。分桶只认开关与身份，条件只认来问属性——同一个人、同一身
+    属性，问多少次结果都不变。evaluate 与 evaluate_at 共用这一段，保证线上
+    求值与历史重放 / 预演同一口径。
+    """
+    if rollout_rules_json:
+        for r in json.loads(rollout_rules_json):
+            if condition_dict_matches(r["condition"], attrs):
+                return bucket_of(name, identity) < r["percent"], "rollout"
+        return None
+    if rollout_percent > 0 and rollout_gate_open(rollout_condition_json, attrs):
+        return bucket_of(name, identity) < rollout_percent, "rollout"
+    return None
 
 
 def group_of(db, flag_id):
@@ -690,8 +782,11 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
 
     attrs 为来问时带的属性（dict）。属性条件命中时这一层直接定论为开；
     对不上 / 没带属性 / 开关没定条件，都按原来的放量 / 默认值算。
-    放量层带放量条件（rollout_condition）时，只有来问属性对上条件的人才
-    按比例分桶；没对上的（含没带属性）不看比例，直接落到默认值。
+    放量层定了有序放量规矩（rollout_rules）时只看规矩：从上往下第一条
+    对上的按它的比例分桶定论；一条都对不上（含没带属性）不看任何比例，
+    直接落到默认值。没定规矩时走老路：放量层带放量条件（rollout_condition）
+    时，只有来问属性对上条件的人才按比例分桶；没对上的（含没带属性）不看
+    比例，直接落到默认值。
 
     结果冻结在全关之后、开关依赖之前：冻住后直接返回冻住那一刻的结果
     （reason=freeze），不再看依赖、强制、属性、组、放量与默认值；因此
@@ -765,15 +860,18 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
     if targeting_matches(flag["targeting_rule"], attrs):
         natural = True
         reason = "targeting"
-    # 放量比例 > 0 且过了放量条件的门（没定条件=对所有人开）时这一层直接
-    # 定论：命中开、未命中关；定了条件但没对上的人不看比例，落到默认值
-    elif (flag["rollout_percent"] > 0
-          and rollout_gate_open(flag["rollout_condition"], attrs)):
-        natural = bucket_of(flag["name"], identity) < flag["rollout_percent"]
-        reason = "rollout"
     else:
-        natural = bool(flag["default_enabled"])
-        reason = "default"
+        # 放量层：定了有序规矩只看规矩（从上往下第一条对上的定论，都对不上
+        # 落默认）；没定规矩走老路（比例 > 0 且过了放量条件的门才定论，
+        # 定了条件但没对上的人不看比例，落到默认值）
+        verdict = rollout_layer_verdict(
+            flag["name"], identity, flag["rollout_percent"],
+            flag["rollout_condition"], flag["rollout_rules"], attrs)
+        if verdict is not None:
+            natural, reason = verdict
+        else:
+            natural = bool(flag["default_enabled"])
+            reason = "default"
 
     group_id = group_of(db, flag["id"])
     if group_id is None or not natural:
@@ -840,6 +938,10 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
     层还是默认值层（对上的人被它分进放量，没对上的被它挡回默认），因此是
     所有人（含不带属性的包）的求值输入——改比例或改条件，所有已发整包都换
     新版本；比例为 0 时条件不参与求值，不进摘要（改它不动任何版本）。
+    有序放量规矩（rollout_rules）：定了规矩时同理——走哪一层、按哪条的比例
+    走都由规矩决定，因此是所有人（含不带属性的包）的求值输入：改任何一条的
+    条件或比例（含增删、调序、清空），所有已发整包都换新版本；没定规矩
+    （''）时不进摘要（摘要保持没这功能时的原样）。
     冻住的开关对此人只认 freezes 行：它的默认值/放量/属性条件/依赖边/单人强制
     在冻住期间都不参与求值，因此这些改动不进此人的摘要（不换版本），它挂的
     配置也只认冻住那一刻的快照 frozen_config；它的全关仍压过冻结，所以全关
@@ -849,7 +951,8 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
     """
     flags = db.execute(
         "SELECT name, default_enabled, rollout_percent, rollout_condition,"
-        " kill_switch, targeting_rule, flag_config FROM flags ORDER BY name"
+        " rollout_rules, kill_switch, targeting_rule, flag_config"
+        " FROM flags ORDER BY name"
     ).fetchall()
     overrides = db.execute(
         "SELECT f.name, o.enabled FROM overrides o"
@@ -934,6 +1037,13 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
                 and r["rollout_condition"]):
             payload["flags"][i] = payload["flags"][i] + [
                 ["rollout_condition", json.loads(r["rollout_condition"])]]
+    # 有序放量规矩：定了规矩时进所有人的摘要（含不带属性的包——走哪一层、按
+    # 哪条的比例走都由规矩决定）。以标记元素追加在放量条件位之后；没定规矩或
+    # 开关被冻住时不进摘要（摘要保持没这功能时的原样）。
+    for i, r in enumerate(flags):
+        if r["name"] not in frozen_names and r["rollout_rules"]:
+            payload["flags"][i] = payload["flags"][i] + [
+                ["rollout_rules", json.loads(r["rollout_rules"])]]
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
@@ -1015,7 +1125,8 @@ def record_invalidations(db, actor_name, change):
 # 让「那一刻会拿到什么」是一个确定的答案。）
 _HIST_RANK = {"imm": 0, "sched": 1, "draft": 2}
 _FLAG_DEFAULT = {"default_enabled": False, "rollout_percent": 0,
-                 "rollout_condition": "", "kill_switch": False, "targeting": "",
+                 "rollout_condition": "", "rollout_rules": "",
+                 "kill_switch": False, "targeting": "",
                  "config": "", "depends_on": ""}
 
 
@@ -1037,6 +1148,10 @@ def _normalize_replay_patch(changes):
         v = changes["rollout_condition"]
         patch["rollout_condition"] = (v if isinstance(v, str)
                                       else validate_rollout_condition(v))
+    if "rollout_rules" in changes:
+        v = changes["rollout_rules"]
+        patch["rollout_rules"] = (v if isinstance(v, str)
+                                  else validate_rollout_rules(v))
     if "targeting" in changes:
         v = changes["targeting"]
         patch["targeting"] = v if isinstance(v, str) else validate_targeting(v)
@@ -1060,7 +1175,8 @@ def replay_state(db, identity, at, attrs=None):
 
     返回 dict：
       flags:  name -> {default_enabled, rollout_percent, rollout_condition(串),
-                       kill_switch, targeting(串), config(串), depends_on(名字串)}
+                       rollout_rules(串), kill_switch, targeting(串), config(串),
+                       depends_on(名字串)}
       overrides/frozen: (flag_name, identity) -> ...
       groups: name -> set(成员 flag)；assignments: 组名 -> 落定 flag
     """
@@ -1219,11 +1335,14 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
 
     if targeting_matches(flag["targeting"], attrs):
         natural, reason = True, "targeting"
-    elif (flag["rollout_percent"] > 0
-          and rollout_gate_open(flag["rollout_condition"], attrs)):
-        natural, reason = bucket_of(name, identity) < flag["rollout_percent"], "rollout"
     else:
-        natural, reason = bool(flag["default_enabled"]), "default"
+        verdict = rollout_layer_verdict(
+            name, identity, flag["rollout_percent"], flag["rollout_condition"],
+            flag["rollout_rules"], attrs)
+        if verdict is not None:
+            natural, reason = verdict
+        else:
+            natural, reason = bool(flag["default_enabled"]), "default"
 
     group_name = next((g for g, members in state["groups"].items()
                        if name in members), None)
@@ -1472,6 +1591,10 @@ def create_flag():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     try:
+        rollout_rules_json = validate_rollout_rules(body.get("rollout_rules"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
         config_json = validate_config(body.get("config"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1479,22 +1602,24 @@ def create_flag():
     default_enabled = 1 if body.get("default_enabled") else 0
     cur = db.execute(
         "INSERT INTO flags (name, description, default_enabled, targeting_rule,"
-        " rollout_condition, flag_config, created_at, updated_at)"
-        " VALUES (?,?,?,?,?,?,?,?)",
+        " rollout_condition, rollout_rules, flag_config, created_at, updated_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
         (name, body.get("description", ""), default_enabled, targeting_json,
-         rollout_condition_json, config_json, now, now),
+         rollout_condition_json, rollout_rules_json, config_json, now, now),
     )
     audit(actor(), name, "default", "create_flag",
           f"default_enabled={bool(default_enabled)}"
           + (f" targeting={targeting_json}" if targeting_json else "")
           + (f" rollout_condition={rollout_condition_json}"
              if rollout_condition_json else "")
+          + (f" rollout_rules={rollout_rules_json}" if rollout_rules_json else "")
           + (f" config={config_json}" if config_json else ""))
     # 历史流水：新建即一条全量快照（不依赖任何开关）
     record_history(
         db, now, "flag_upsert", subject=name, actor_name=actor(),
         payload={"default_enabled": bool(default_enabled), "rollout_percent": 0,
                  "rollout_condition": rollout_condition_json,
+                 "rollout_rules": rollout_rules_json,
                  "kill_switch": False, "targeting": targeting_json,
                  "config": config_json, "depends_on": ""})
     db.commit()
@@ -1504,8 +1629,8 @@ def create_flag():
 
 # 可预约定时生效的开关字段（与 PATCH 立即生效支持的字段一致）
 SCHEDULABLE_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
-                      "rollout_condition", "description", "targeting",
-                      "depends_on", "config")
+                      "rollout_condition", "rollout_rules", "description",
+                      "targeting", "depends_on", "config")
 
 
 def validate_depends_on(db, flag, raw):
@@ -1542,8 +1667,8 @@ def validate_depends_on(db, flag, raw):
 
 
 def apply_flag_fields(db, flag, body):
-    """把 kill_switch / default_enabled / rollout_percent / description /
-    targeting / depends_on / config 写到开关上。
+    """把 kill_switch / default_enabled / rollout_percent / rollout_condition /
+    rollout_rules / description / targeting / depends_on / config 写到开关上。
 
     立即生效与定时生效到点应用共用这一段。返回 (changes, error)：
     changes 是 (layer, action, detail) 列表（值没变的字段不在列）；
@@ -1604,6 +1729,21 @@ def apply_flag_fields(db, flag, body):
                 changes.append(("rollout", "clear_rollout_condition",
                                 "rollout_condition removed"
                                 f" (was {flag['rollout_condition']})"))
+    if "rollout_rules" in body:
+        try:
+            new_rules = validate_rollout_rules(body["rollout_rules"])
+        except ValueError as e:
+            return None, str(e)
+        if new_rules != flag["rollout_rules"]:
+            db.execute("UPDATE flags SET rollout_rules=?, updated_at=? WHERE id=?",
+                       (new_rules, time.time(), flag["id"]))
+            if new_rules:
+                changes.append(("rollout", "set_rollout_rules",
+                                f"rollout_rules={new_rules}"))
+            else:
+                changes.append(("rollout", "clear_rollout_rules",
+                                "rollout_rules removed"
+                                f" (was {flag['rollout_rules']})"))
     if "config" in body:
         try:
             new_config = validate_config(body["config"])
@@ -1658,8 +1798,8 @@ def schedule_flag_change(db, flag, body, effective_at):
     if not payload:
         return jsonify({"error": "nothing to schedule"
                                  " (no kill_switch/default_enabled/rollout_percent"
-                                 "/rollout_condition/description/depends_on/config"
-                                 " given)"}), 400
+                                 "/rollout_condition/rollout_rules/description"
+                                 "/depends_on/config given)"}), 400
     # 与立即生效同一套校验，避免约了一个到点应用不了的值
     if "rollout_percent" in payload:
         v = payload["rollout_percent"]
@@ -1673,6 +1813,11 @@ def schedule_flag_change(db, flag, body, effective_at):
     if "rollout_condition" in payload:
         try:
             validate_rollout_condition(payload["rollout_condition"])
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+    if "rollout_rules" in payload:
+        try:
+            validate_rollout_rules(payload["rollout_rules"])
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
     if "config" in payload:
@@ -2060,8 +2205,8 @@ def cancel_scheduled_change(change_id):
 # 稿里允许收的开关字段（与立即生效 PATCH 支持的字段一致，但不含 effective_at：
 # 稿在发布的一刻统一生效，不能再约时间）
 DRAFT_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
-                "rollout_condition", "description", "targeting", "depends_on",
-                "config")
+                "rollout_condition", "rollout_rules", "description",
+                "targeting", "depends_on", "config")
 
 
 def normalize_patch(db, body):
@@ -2089,6 +2234,9 @@ def normalize_patch(db, body):
     if "rollout_condition" in body:
         out["rollout_condition"] = validate_rollout_condition(
             body["rollout_condition"])  # "" = 清除放量条件
+    if "rollout_rules" in body:
+        out["rollout_rules"] = validate_rollout_rules(
+            body["rollout_rules"])  # "" = 清除放量规矩
     if "config" in body:
         out["config"] = validate_config(body["config"])  # "" = 清除配置
     if "kill_switch" in body:
@@ -2109,13 +2257,16 @@ def normalize_patch(db, body):
 
 def draft_change_to_dict(ch):
     """稿内改动存储格式 -> 对外 JSON（布尔还原；targeting/rollout_condition/config
-    的 '' 还原为 None 或 {}）。"""
+    的 '' 还原为 None 或 {}，rollout_rules 的 '' 还原为 []）。"""
     out = dict(ch)
     if "targeting" in out:
         out["targeting"] = json.loads(out["targeting"]) if out["targeting"] else {}
     if "rollout_condition" in out:
         out["rollout_condition"] = (json.loads(out["rollout_condition"])
                                     if out["rollout_condition"] else {})
+    if "rollout_rules" in out:
+        out["rollout_rules"] = (json.loads(out["rollout_rules"])
+                                if out["rollout_rules"] else [])
     if "config" in out:
         out["config"] = json.loads(out["config"]) if out["config"] else None
     for k in ("kill_switch", "default_enabled"):
@@ -2238,6 +2389,18 @@ def apply_patch_to_flag(db, flag, ch, now):
                 changes.append(("rollout", "clear_rollout_condition",
                                 "rollout_condition removed"
                                 f" (was {flag['rollout_condition']})"))
+    if "rollout_rules" in ch:
+        new_rules = ch["rollout_rules"]
+        if new_rules != flag["rollout_rules"]:
+            db.execute("UPDATE flags SET rollout_rules=?, updated_at=? WHERE id=?",
+                       (new_rules, now, fid))
+            if new_rules:
+                changes.append(("rollout", "set_rollout_rules",
+                                f"rollout_rules={new_rules}"))
+            else:
+                changes.append(("rollout", "clear_rollout_rules",
+                                "rollout_rules removed"
+                                f" (was {flag['rollout_rules']})"))
     if "config" in ch:
         new_config = ch["config"]
         if new_config != flag["flag_config"]:
@@ -2351,8 +2514,8 @@ def stage_draft_change(draft_id, name):
     if not patch:
         return jsonify({"error": "nothing to stage"
                                  " (kill_switch/default_enabled/rollout_percent"
-                                 "/rollout_condition/description/targeting"
-                                 "/depends_on/config)"}), 400
+                                 "/rollout_condition/rollout_rules/description"
+                                 "/targeting/depends_on/config)"}), 400
     row = db.execute(
         "SELECT changes FROM draft_changes WHERE draft_id=? AND flag_name=?",
         (draft_id, name)).fetchone()
@@ -2494,6 +2657,7 @@ def snapshot_current_state(db, identity):
             "default_enabled": bool(r["default_enabled"]),
             "rollout_percent": r["rollout_percent"],
             "rollout_condition": r["rollout_condition"],
+            "rollout_rules": r["rollout_rules"],
             "kill_switch": bool(r["kill_switch"]),
             "targeting": r["targeting_rule"],
             "config": r["flag_config"],
@@ -2560,6 +2724,8 @@ def apply_patch_to_state(state, flag_name, patch):
         flag["rollout_percent"] = int(patch["rollout_percent"])
     if "rollout_condition" in patch:
         flag["rollout_condition"] = patch["rollout_condition"]
+    if "rollout_rules" in patch:
+        flag["rollout_rules"] = patch["rollout_rules"]
     if "targeting" in patch:
         flag["targeting"] = patch["targeting"]
     if "config" in patch:
@@ -2636,7 +2802,7 @@ def preview():
         if not patch:
             return jsonify({"error": "nothing to preview (no kill_switch"
                                      "/default_enabled/rollout_percent"
-                                     "/rollout_condition/description"
+                                     "/rollout_condition/rollout_rules/description"
                                      "/targeting/depends_on/config given)"}), 400
         # 与立即生效 PATCH 同一口径：依赖目标要存在、自依赖与成环直接拒
         if "depends_on" in patch:

@@ -226,6 +226,8 @@ async function loadFlags() {
     if (f.rollout_percent > 0) badges.push(`<span class="badge roll">${f.rollout_percent}%</span>`);
     if (f.rollout_condition && Object.keys(f.rollout_condition).length)
       badges.push('<span class="badge roll">条件放量</span>');
+    if (f.rollout_rules && f.rollout_rules.length)
+      badges.push(`<span class="badge roll">规矩×${f.rollout_rules.length}</span>`);
     if (f.targeting && Object.keys(f.targeting).length)
       badges.push('<span class="badge on">属性条件</span>');
     if (f.config != null) badges.push('<span class="badge on">挂配置</span>');
@@ -343,6 +345,16 @@ async function renderDetail() {
       </div>
       <div class="muted">定了条件后：对上的人按比例分桶（命中开、未命中关），没对上的（含没带属性）直接按下面的默认值。
         改比例或改条件都会让已发出的整包（含不带属性的包）换新版本。</div>
+      <div class="row" style="margin-top:8px">
+        <input id="rolloutRules" type="text" style="flex:1"
+          placeholder='有序放量规矩 JSON（可选），如 [{"condition":{"plan":"pro"},"percent":30},{"condition":{"plan":"free"},"percent":10}]；[] 或留空 = 不定规矩'
+          value="${f.rollout_rules && f.rollout_rules.length ? esc(JSON.stringify(f.rollout_rules)) : ''}">
+        <button class="primary" onclick="setRolloutRules()">保存规矩</button>
+        <button onclick="clearRolloutRules()">清除</button>
+      </div>
+      <div class="muted">规矩一条一条往下写，每条是一串要对上的条件和一个比例：来问时从上往下对，对上哪条就按那条的比例
+        开一部分、剩下的关；一条都对不上（含没带属性）还按下面的默认值。<b>定了规矩后只看规矩</b>，上面的比例与放量条件
+        不参与求值，清除后恢复。改任何一条的条件或比例都会让已发出的整包（含不带属性的包）换新版本。</div>
     </div>
 
     <div class="layer">
@@ -361,7 +373,7 @@ async function renderDetail() {
         <button onclick="unstageFromDraft()">从稿里摘掉本开关</button>
         <span id="draftStaged" class="muted"></span>
       </div>
-      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 放量条件 / 属性条件 / 开关配置（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
+      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 放量条件 / 放量规矩 / 属性条件 / 开关配置（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
     </div>
 
     <div class="layer">
@@ -412,6 +424,7 @@ function populateDraftSelect() {
 
 const FIELD_NAMES = { kill_switch: '全关', default_enabled: '默认开',
                       rollout_percent: '放量比例', rollout_condition: '放量条件',
+                      rollout_rules: '放量规矩',
                       description: '描述', targeting: '属性打开条件',
                       depends_on: '开关依赖', config: '开关配置' };
 
@@ -525,6 +538,16 @@ const setRolloutCondition = async function() {
   await patch({ rollout_condition: rule });
 };
 const clearRolloutCondition = () => patch({ rollout_condition: {} });
+
+const setRolloutRules = async function() {
+  let rules;
+  const raw = $('rolloutRules').value.trim();
+  if (!raw) return toast('规矩为空：要清除请点「清除」', true);
+  try { rules = JSON.parse(raw); } catch (e) { return toast('放量规矩不是合法 JSON', true); }
+  if (!Array.isArray(rules)) return toast('放量规矩必须是 JSON 数组', true);
+  await patch({ rollout_rules: rules });
+};
+const clearRolloutRules = () => patch({ rollout_rules: [] });
 
 async function setFlagConfig() {
   const raw = $('flagConfig').value.trim();
@@ -896,6 +919,11 @@ async function stageToDraft() {
   if (rcRaw) {
     try { patch.rollout_condition = JSON.parse(rcRaw); }
     catch (e) { return toast('放量条件不是合法 JSON，无法收入稿', true); }
+  }
+  const rrRaw = $('rolloutRules').value.trim();
+  if (rrRaw) {
+    try { patch.rollout_rules = JSON.parse(rrRaw); }
+    catch (e) { return toast('放量规矩不是合法 JSON，无法收入稿', true); }
   }
   const cfgRaw = $('flagConfig').value.trim();
   if (cfgRaw) {
