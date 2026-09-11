@@ -12,6 +12,9 @@ SQLite 库，开关、配置、冻结、强制、互斥组、发布稿、定时�
 
 求值优先级（固定，不可配置）：
     1. 全关（kill switch）        -> 一律关
+    1.5 对照组（control group）   -> 被管理端点进对照组的人，不看冻结 / 依赖 /
+       强制 / 属性 / 组 / 放量 / 定档，每个开关只走它自己的默认开或关
+       （reason=control）；没进的人不受这层影响
     2. 结果冻结（freeze）          -> 此人对本开关冻住的那一刻的结果，与之后的一切配置改动无关
     3. 开关依赖（depends_on）     -> 依赖的开关对此人此身属性不是开，本开关必须关
     4. 单人强制（override）        -> 强制开 / 强制关
@@ -357,6 +360,9 @@ CREATE TABLE IF NOT EXISTS draft_changes (
 --                                      （payload: {identities:[…], primary:"…"}，
 --                                      merge 的迁移副作用不单独进流水，重放时按组
 --                                      状态还原「那一刻这几个身份算同一个人」）
+--     control_add / control_remove    点名进对照组 / 移出对照组（identity=主身份；
+--                                      重放按时间序回放即还原那一刻的对照名单；
+--                                      在对照层默认值接管一切，全关仍压过）
 -- 预约生效与发布稿不在这里：重放时直接读 scheduled_changes（到点且未取消）与
 -- drafts（status=published 且 published_at<=时刻），与本流水按时间合并。
 CREATE TABLE IF NOT EXISTS history_events (
@@ -389,10 +395,21 @@ CREATE TABLE IF NOT EXISTS identity_members (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_member_unique
     ON identity_members(identity);
+-- 对照组：管理端点名的一拨人（identity 存主身份，与强制 / 冻结同口径）。
+-- 进了对照组的人来问时不再按人分开算（不看冻结 / 依赖 / 强制 / 属性 / 组 /
+-- 放量 / 定档），每个开关只走它自己的默认开或关（reason=control），全关仍压
+-- 过一切。没进的人照旧走各开关原来的算法。点名 / 改名单立即生效，相关已发
+-- 整包换新版本。老库从空名单起步，与升级前一字不差。
+CREATE TABLE IF NOT EXISTS control_group (
+    identity   TEXT NOT NULL PRIMARY KEY,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
-LAYERS = ("kill_switch", "freeze", "depends_on", "override", "targeting",
-          "group", "rollout", "default")
+LAYERS = ("kill_switch", "control", "freeze", "depends_on", "override",
+          "targeting", "group", "rollout", "default")
 
 
 # ---------------------------------------------------------------- attrs / targeting
@@ -1118,6 +1135,23 @@ def _rekey_person_state(db, aliases, primary):
             (group_id, primary, winner["flag_id"], winner["created_at"]),
         )
 
+    # 对照组归属也是「按人存的状态」：任一成员在对照组里，合并后这拨人（主
+    # 身份）就在；重复行用 INSERT OR IGNORE 收敛成一行。别名名下的旧行删掉，
+    # 不留下「拆开后别名还在对照组里」的影子——与强制 / 冻结的迁移口径一致。
+    now_ctrl = time.time()
+    ctrl_rows = db.execute(
+        f"SELECT identity FROM control_group WHERE identity IN"
+        f" ({','.join('?' * len(members))})", members).fetchall()
+    ctrl_before = {r["identity"] for r in ctrl_rows}
+    db.execute(
+        f"DELETE FROM control_group WHERE identity IN"
+        f" ({','.join('?' * len(members))})", members)
+    if ctrl_before:
+        db.execute(
+            "INSERT OR IGNORE INTO control_group"
+            " (identity, created_by, created_at, updated_at) VALUES (?,?,?,?)",
+            (primary, "identity-merge", now_ctrl, now_ctrl))
+
     # 整包账本：作用域是 (identity, attrs_hash)。主身份名下的包优先；都在别名
     # 名下时取最近一次来拿的（updated_at 最大）那行，并把同属性的旧别名行删掉。
     rekeyed = []
@@ -1153,6 +1187,26 @@ def _rekey_person_state(db, aliases, primary):
              keep["updated_at"]),
         )
     return rekeyed
+
+
+# ---------------------------------------------------------------- 对照组（control group）
+
+def in_control_group(db, identity):
+    """此人（主身份）此刻是否在管理端点进的对照组里。
+
+    在对照组里的人来问不再按人分开算：冻结 / 依赖 / 单人强制 / 属性条件 /
+    互斥组 / 放量 / 定档一律不看，每个开关只走它自己的默认开或关（全关仍压
+    过一切）。点名 / 改名单立即生效，所以这里只认 control_group 当前行。
+    """
+    return db.execute(
+        "SELECT 1 FROM control_group WHERE identity=?", (identity,),
+    ).fetchone() is not None
+
+
+def list_control_group(db):
+    """列出对照组现在点着哪些人（主身份，名字序）。"""
+    return [r["identity"] for r in db.execute(
+        "SELECT identity FROM control_group ORDER BY identity")]
 
 
 # ---------------------------------------------------------------- evaluation
@@ -1238,6 +1292,10 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
     或改档都不动他；冻在关则两者都不带。
     被别的开关依赖时，依赖者沿备忘拿到的就是这个冻住的结果。全关仍在更
     前面，冻住也压不过全关（全关一律关、不带配置与档名）。
+
+    对照组排在全关之后、冻结之前：此人在对照组里时，冻结 / 依赖 / 强制 /
+    属性 / 组 / 放量 / 定档一概不看，本开关直接给默认值（reason=control，
+    不带档名、不写组落定）；离开对照组后这些层立刻恢复。
     _skip_freeze_id 仅供「重新冻住」时顶层使用：按假设此开关没冻的口径
     求它此刻的结果（沿依赖递归时被依赖开关的冻结照常生效）。
     依赖链上的结果在单次求值内备忘，保证链上每个开关只算一次、结果一致；
@@ -1258,6 +1316,13 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
 
     if flag["kill_switch"]:
         return ret(False, "kill_switch")
+
+    # 对照组：管理端点进对照组的人不再按人分开算——不看冻结 / 依赖 / 强制 /
+    # 属性 / 互斥组 / 放量 / 定档，每个开关只走它自己的默认开或关。全关已在
+    # 更前面压过；对照组里没有档名（不定论档），也不会写入组落定。
+    if in_control_group(db, identity):
+        return ret(bool(flag["default_enabled"]), "control",
+                   flag["flag_config"], None)
 
     # 结果冻结：只认冻住那一刻存下的开/关（连同配置与档名快照），此后其他层
     # 怎么改都不影响它。
@@ -1411,9 +1476,14 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
     单人强制在冻住期间都不参与求值，因此这些改动不进此人的摘要（不换版本），
     它挂的配置与档名也只认冻住那一刻的快照 frozen_config / frozen_variant；
     它的全关仍压过冻结，所以全关字段保留，冻住期间开全关仍让包换版本。
+    对照组里的人同理且更彻底：每个开关都只走自己的默认值（全关仍压过），
+    冻结 / 依赖 / 强制 / 属性 / 组 / 落定 / 放量 / 档一概不参与求值，因此
+    这些输入对他都中性化；改名单（进 / 出对照组）以 control_group 标记位
+    进摘要，他的包必换新版本，没进对照组的人摘要一字不变。
     与求值无关的字段（如描述、时间戳）不影响摘要；只与别人相关的改动
     （如给他人的单人强制）也不影响此身份的摘要。
     """
+    is_control = in_control_group(db, identity)
     flags = db.execute(
         "SELECT name, default_enabled, rollout_percent, rollout_condition,"
         " rollout_rules, variants, kill_switch, targeting_rule, flag_config"
@@ -1431,6 +1501,11 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
         (identity,),
     ).fetchall()
     frozen_names = {r["name"] for r in freezes}
+    # 对照组里的人：每个开关都被「默认值层」接管，放量 / 档 / 依赖 / 强制 /
+    # 组 / 落定一律中性化，与冻住的开关走同一套中性化口径。
+    masked_names = set(frozen_names)
+    if is_control:
+        masked_names.update(r["name"] for r in flags)
     members = db.execute(
         "SELECT g.name AS g, f.name AS f FROM group_members m"
         " JOIN mutex_groups g ON g.id = m.group_id"
@@ -1449,37 +1524,47 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
         # 全关仍压过冻结、照常参与，故保留真实值。
         # 定档开关：默认值/放量比例被档层取代（恒为中性值），档本身在下面
         # 以标记元素追加。
+        # 对照组里的人：放量 / 档恒中性（只走默认值），默认值与全关保留真值。
         "flags": [[r["name"],
-                   False if (r["name"] in frozen_names or r["variants"])
+                   False if (r["name"] in masked_names or r["variants"])
                    else bool(r["default_enabled"]),
-                   0 if (r["name"] in frozen_names or r["variants"])
+                   0 if (r["name"] in masked_names or r["variants"])
                    else r["rollout_percent"],
                    bool(r["kill_switch"])] for r in flags],
-        # 冻住的开关不看单人强制，给它的强制不进摘要
+        # 冻住的开关不看单人强制，给它的强制不进摘要；对照组里所有强制都不看
         "overrides": [[r["name"], bool(r["enabled"])] for r in overrides
-                      if r["name"] not in frozen_names],
+                      if r["name"] not in masked_names],
         # 冻住的开关：第三个元素是冻住那一刻挂着的配置快照（冻在关时为 ''），
         # 第四个元素是冻住那一刻的档名快照（没有档/冻在关时为 ''）
         "freezes": [[r["name"], bool(r["frozen_enabled"]), r["frozen_config"],
                      r["frozen_variant"]]
-                    for r in freezes],
-        "groups": [[r["g"], r["f"]] for r in members],
-        "assignments": [[r["g"], r["f"]] for r in assignments],
+                    for r in freezes if not is_control],
+        # 对照组里的人不看互斥组与落定（每个开关直接走默认值），这两组输入
+        # 对他恒为空
+        "groups": ([[r["g"], r["f"]] for r in members] if not is_control else []),
+        "assignments": ([[r["g"], r["f"]] for r in assignments]
+                        if not is_control else []),
+        # 只在真在对照组里时出现：改名单（进 / 出对照组）让此人包换新版本，
+        # 没进对照组的人的摘要里没有这个键，与上线前一字不差
     }
+    if is_control:
+        payload["control_group"] = True
     # 开关依赖关系是全局求值输入：改了谁依赖谁（含解除、被依赖开关删除）
     # 相关已发整包都要换新版本。冻住的开关不看自己的出边依赖（冻住在依赖层
     # 之前直接定论），所以它自己那条边不进摘要；别人对它的依赖保留——依赖者
     # 求值时会沿备忘拿到它冻住的结果。按依赖者名字排序，保证摘要确定。
+    # 对照组里的人不看任何依赖，所有边都不进摘要。
     dependencies = db.execute(
         "SELECT f.name AS child, p.name AS parent FROM flags f"
         " JOIN flags p ON p.id = f.depends_on_flag_id ORDER BY f.name"
     ).fetchall()
     payload["dependencies"] = [[r["child"], r["parent"]] for r in dependencies
-                               if r["child"] not in frozen_names]
+                               if r["child"] not in masked_names]
     # 开关挂的配置只在该开关对此人此刻判开时下发，才是此人整包的求值输入：
     # 判开且挂了配置 -> 配置内容进摘要（改配置必换版本）；判关或没挂 -> 不进
     # （改配置不波及他，全关期间所有开关判关，与「全关后不要带」一致）。
     # 冻住的开关配置走 freezes 里的快照，这里不重复计。
+    # 对照组里的人在判开（默认开且没被全关压）时同样带这份配置。
     configs = []
     if results is not None:
         for r in flags:
@@ -1492,10 +1577,11 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
         # 带属性的包：属性本身进摘要；属性条件只在「对此人对得上」时进摘要
         # （实际参与了求值才算求值输入，对不上的条件改动不波及此人）。
         # 冻住的开关连属性条件层也不看，条件永不进摘要。
+        # 对照组里的人不看属性条件，属性仍随包记账（同人不同属性是不同的包）。
         payload["attrs"] = attrs
         with_rules = []
         for row, r in zip(payload["flags"], flags):
-            if (r["name"] not in frozen_names and r["targeting_rule"]
+            if (r["name"] not in masked_names and r["targeting_rule"]
                     and targeting_matches(r["targeting_rule"], attrs)):
                 with_rules.append(row + [json.loads(r["targeting_rule"])])
             else:
@@ -1505,25 +1591,27 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
     # 的人被它挡去默认值层，走哪一层由它决定，所以它也是这些人的求值输入）。
     # 以标记元素追加在属性条件位之后，与属性打开条件区分开；没定条件、比例为
     # 0、开关被冻住或定了档时不进摘要（定了档时这些字段不参与求值）。
+    # 对照组里的人不看放量，一律不进。
     for i, r in enumerate(flags):
-        if (r["name"] not in frozen_names and not r["variants"]
+        if (r["name"] not in masked_names and not r["variants"]
                 and r["rollout_percent"] > 0 and r["rollout_condition"]):
             payload["flags"][i] = payload["flags"][i] + [
                 ["rollout_condition", json.loads(r["rollout_condition"])]]
     # 有序放量规矩：定了规矩时进所有人的摘要（含不带属性的包——走哪一层、按
     # 哪条的比例走都由规矩决定）。以标记元素追加在放量条件位之后；没定规矩、
     # 开关被冻住或定了档时不进摘要（定了档时规矩不参与求值）。
+    # 对照组里的人不看规矩，一律不进。
     for i, r in enumerate(flags):
-        if (r["name"] not in frozen_names and not r["variants"]
+        if (r["name"] not in masked_names and not r["variants"]
                 and r["rollout_rules"]):
             payload["flags"][i] = payload["flags"][i] + [
                 ["rollout_rules", json.loads(r["rollout_rules"])]]
     # 定档：定了档时档是所有人（含不带属性的包）的求值输入——改任何一档的
     # 名字或比例（含增删、调序、清空）都让整包换新版本。以标记元素追加在
     # 放量规矩位之后；没定档或开关被冻住时不进摘要（冻住的人只认 freezes 里
-    # 的档名快照）。
+    # 的档名快照）。对照组里的人不落档，一律不进。
     for i, r in enumerate(flags):
-        if r["name"] not in frozen_names and r["variants"]:
+        if r["name"] not in masked_names and r["variants"]:
             payload["flags"][i] = payload["flags"][i] + [
                 ["variants", json.loads(r["variants"])]]
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -1729,6 +1817,18 @@ def replay_state(db, identity, at, attrs=None):
         person = grp["primary"]
         person_members = grp["members"]
 
+    # 对照组同样按「那一刻」还原：只扫 at 之前的 control_add / control_remove
+    # 流水（名单是整拨替换语义，重放时按增删事件回放即可）。事件里的身份是
+    # 当时的主身份，与单人强制 / 冻结同口径——那一刻这个人收在合并拨里时，
+    # 拨内任一身份来问都要按同一个人的对照归属算。
+    control = False
+    for r in db.execute(
+            "SELECT kind, identity FROM history_events"
+            " WHERE kind IN ('control_add','control_remove')"
+            " AND occurred_at<=? ORDER BY occurred_at, id", (at,)):
+        if r["identity"] in person_members:
+            control = r["kind"] == "control_add"
+
     flags = {}
     overrides = {}
     frozen = {}
@@ -1805,6 +1905,7 @@ def replay_state(db, identity, at, attrs=None):
              "groups": groups, "assignments": assignments}
     state["person"] = person
     state["person_members"] = person_members
+    state["control"] = control
     return state
 
 
@@ -1833,6 +1934,12 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
 
     if flag["kill_switch"]:
         return ret(False, "kill_switch")
+
+    # 对照组：那一刻这个人在对照组里时，不看冻结 / 依赖 / 强制 / 属性 / 组 /
+    # 放量 / 定档，每个开关只走自己的默认值（reason=control，不带档名），
+    # 与线上 evaluate 同一口径；全关已在更前面压过。
+    if state.get("control"):
+        return ret(bool(flag["default_enabled"]), "control", flag["config"], None)
 
     fz = state["frozen"].get((name, identity))
     if fz is not None:
@@ -3542,8 +3649,12 @@ def snapshot_current_state(db, identity):
             " JOIN mutex_groups g ON g.id=a.group_id"
             " JOIN flags f ON f.id=a.flag_id WHERE a.identity=?", (identity,)):
         assignments[r["gname"]] = r["fname"]
+    # 预演只改开关配置、不改对照组名单：此人此刻在不在对照组里，current 与
+    # preview 同一口径（evaluate_at 看 state["control"]）。
+    control = in_control_group(db, identity)
     return {"flags": flags, "overrides": overrides, "frozen": frozen,
-            "groups": groups, "assignments": assignments}
+            "groups": groups, "assignments": assignments,
+            "control": control}
 
 
 def evaluate_state_bundle(state, identity, attrs=None):
@@ -4009,6 +4120,22 @@ def merge_identities():
     record_history(db, now, "identity_merge", subject=primary,
                    payload={"identities": sorted(idents), "primary": primary},
                    actor_name=actor())
+    # 对照组归属随人迁到主身份：把「合并这一刻起对照归属按主身份算」补进流水，
+    # 历史重放合并期时拨内任一身份才能还原同一个对照归属（与强制 / 冻结迁移
+    # 同口径；主身份本就在对照组里时无需重复加）。
+    ctrl_members = [i for i in idents
+                    if db.execute("SELECT 1 FROM control_group WHERE identity=?",
+                                  (i,)).fetchone()]
+    if ctrl_members:
+        if not db.execute(
+                "SELECT 1 FROM control_group WHERE identity=?",
+                (primary,)).fetchone():
+            record_history(db, now, "control_add", identity=primary,
+                           payload={}, actor_name=actor())
+        for ident in idents:
+            if ident != primary:
+                record_history(db, now, "control_remove", identity=ident,
+                               payload={}, actor_name=actor())
     db.commit()
 
     # 统一重算已发整包：合并是求值输入（身份→主身份）的变化，相关的人都要换
@@ -4050,7 +4177,9 @@ def split_identities(group_id):
 
     拆开不迁移、不删除任何状态：之前合并迁到主身份名下的强制 / 冻结 / 落定 /
     整包仍挂在主身份身上，其余身份回到「自己名下没有这些状态」的独立状态——
-    与「拆开以后各算各的」一致。整包随后统一重算、换新版本。
+    与「拆开以后各算各的」一致。对照组归属同理：行留在主身份名下，但要给每个
+    旧别名补一条 control_remove 流水，历史重放拆开后这些别名不再算对照组里的
+    人。整包随后统一重算、换新版本。
     """
     db = get_db()
     row = db.execute("SELECT * FROM identity_groups WHERE id=?",
@@ -4067,10 +4196,186 @@ def split_identities(group_id):
     record_history(db, now, "identity_split",
                    subject=members[0] if members else "",
                    payload={"identities": members}, actor_name=actor())
+    # 主身份在对照组里时，旧别名从这一刻起不再随主身份算对照（行本身留在
+    # 主身份名下，与强制 / 冻结迁移后留在主身份名下同一口径）。
+    primary = members[0] if members else ""
+    if primary and db.execute(
+            "SELECT 1 FROM control_group WHERE identity=?",
+            (primary,)).fetchone():
+        for ident in members[1:]:
+            record_history(db, now, "control_remove", identity=ident,
+                           payload={}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
                          "split_identities " + ",".join(members))
     return jsonify({"ok": True, "changed": True, "identities": members})
+
+
+# ---------------------------------------------------------------- 对照组（control group）
+
+@app.get("/api/control-group")
+@require_admin
+def get_control_group():
+    """管理端：查看对照组现在点着哪些人（主身份，名字序）。"""
+    db = get_db()
+    rows = db.execute(
+        "SELECT identity, created_by, created_at, updated_at FROM control_group"
+        " ORDER BY identity").fetchall()
+    return jsonify({"identities": [r["identity"] for r in rows],
+                    "members": [{"identity": r["identity"],
+                                 "created_by": r["created_by"],
+                                 "created_at": r["created_at"],
+                                 "updated_at": r["updated_at"]} for r in rows]})
+
+
+def _parse_roster(raw, min_count):
+    """校验「一拨人」名单：非空字符串列表、至少 min_count 个、不能重复。
+
+    与身份合并同一口径：少写了 / 不是列表 / 成员不是非空字符串 / 有重复，
+    这次都点不成——ValueError 文案直接说清楚，调用方转 400，一个人都不写库。
+    返回去重保序后的名单。"""
+    if not isinstance(raw, list):
+        raise ValueError("identities is required (a list of non-empty identity"
+                         " strings)")
+    if len(raw) < min_count:
+        raise ValueError(f"at least {min_count} identit{'y' if min_count == 1 else 'ies'}"
+                         f" {'is' if min_count == 1 else 'are'} required")
+    for ident in raw:
+        if not isinstance(ident, str) or ident == "":
+            raise ValueError("identities must be non-empty strings")
+    if len(set(raw)) != len(raw):
+        dup = sorted({x for x in raw if raw.count(x) > 1})
+        raise ValueError(f"identities must be unique (duplicated: {', '.join(dup)})")
+    return list(dict.fromkeys(raw))
+
+
+@app.put("/api/control-group")
+@require_admin
+def replace_control_group():
+    """点名一拨人进对照组（整拨替换为新名单）。
+
+    body: {"identities": ["u1", "u2", …]}，至少一个；少写了 / 不是非空字符串
+    列表 / 有重复，这次点不成（400）并说清楚，一个人都不写库。
+
+    进了对照组的人来问不再按人分开算：冻结 / 依赖 / 强制 / 属性 / 组 / 放量 /
+    定档一概不看，每个开关只走它自己的默认开或关（reason=control），全关仍
+    压过；没进的人照旧走各开关原来的算法。身份按主身份记名（与强制 / 冻结同
+    口径）；同一份名单再点一次是幂等 no-op，什么都不换。改了谁在对照组里
+    （加入 / 移出）立即生效，相关已发整包统一重算、换新版本。
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be a JSON object"
+                                 ' ({"identities": [...]})'}), 400
+    try:
+        idents = _parse_roster(body.get("identities"), 1)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    db = get_db()
+    # 归主身份：写进合并拨里某个别名 = 点的是这拨人（与单人强制 / 冻结同口径）。
+    # 归并后撞到同一个主身份也算重复，这次点不成并说清楚。
+    people = []
+    for ident in idents:
+        person = canonical_identity(db, ident)
+        if person in people:
+            return jsonify({"error": "identities must be unique after merging"
+                                     f" aliases ('{ident}' is the same person as"
+                                     f" '{people[-1]}' via identity merge)"}), 400
+        people.append(person)
+
+    current = list_control_group(db)
+    if set(current) == set(people):
+        # 同一拨人再点一次（主身份集合一致，书写顺序无关）：幂等 no-op
+        return jsonify({"ok": True, "changed": False, "identities": current})
+
+    now = time.time()
+    cur_people = set(current)
+    new_people = set(people)
+    added = sorted(new_people - cur_people)
+    removed = sorted(cur_people - new_people)
+    # 整拨替换在一个事务里：删掉不在新名单里的，插入新进来的（老行的
+    # created_at / created_by 保留，updated_at 更新）
+    db.execute("DELETE FROM control_group WHERE identity NOT IN"
+               f" ({','.join('?' * len(people))})", people)
+    for person in people:
+        db.execute(
+            "INSERT INTO control_group (identity, created_by, created_at, updated_at)"
+            " VALUES (?,?,?,?)"
+            " ON CONFLICT(identity) DO UPDATE SET updated_at=excluded.updated_at",
+            (person, actor(), now, now))
+    audit(actor(), "", "control", "replace_control_group",
+          "identities=" + ",".join(people)
+          + (f" added={','.join(added)}" if added else "")
+          + (f" removed={','.join(removed)}" if removed else ""))
+    # 历史重放按增删事件还原「那一刻谁在对照组里」
+    for person in added:
+        record_history(db, now, "control_add", subject="", identity=person,
+                       payload={}, actor_name=actor())
+    for person in removed:
+        record_history(db, now, "control_remove", subject="", identity=person,
+                       payload={}, actor_name=actor())
+    db.commit()
+    record_invalidations(db, actor(),
+                         "replace_control_group"
+                         + (f" added={','.join(added)}" if added else "")
+                         + (f" removed={','.join(removed)}" if removed else ""))
+    db.commit()
+    return jsonify({"ok": True, "changed": True, "identities": people,
+                    "added": added, "removed": removed})
+
+
+@app.delete("/api/control-group")
+@require_admin
+def remove_from_control_group():
+    """把人移出对照组；不带 body 或 identities 为空 = 清空整拨。
+
+    移出后该人立即按各开关原来的算法算，相关已发整包换新版本。带 body
+    {"identities": [...]} 时只移点名的人（成员必须是非空字符串；写了重复
+    这次移不成并说清楚），没在对照组里的点出来但不报错；一个都没移掉是
+    no-op（changed=false）。
+    """
+    body = request.get_json(force=True, silent=True)
+    idents = None
+    if body is not None:
+        if not isinstance(body, dict):
+            return jsonify({"error": "body must be a JSON object"
+                                     ' ({"identities": [...]}) or empty'}), 400
+        if "identities" in body and body["identities"] is not None:
+            try:
+                idents = _parse_roster(body["identities"], 1)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+
+    db = get_db()
+    current = set(list_control_group(db))
+    if idents is None:
+        removed = sorted(current)
+    else:
+        people = []
+        for ident in idents:
+            people.append(canonical_identity(db, ident))
+        if len(set(people)) != len(people):
+            dup = sorted({x for x in people if people.count(x) > 1})
+            return jsonify({"error": "identities must be unique after merging"
+                                     f" aliases (duplicated: {', '.join(dup)})"}), 400
+        removed = sorted(set(people) & current)
+
+    if not removed:
+        return jsonify({"ok": True, "changed": False, "removed": []})
+    now = time.time()
+    db.execute(f"DELETE FROM control_group WHERE identity IN"
+               f" ({','.join('?' * len(removed))})", removed)
+    audit(actor(), "", "control", "remove_control_group",
+          "identities=" + ",".join(removed))
+    for person in removed:
+        record_history(db, now, "control_remove", subject="", identity=person,
+                       payload={}, actor_name=actor())
+    db.commit()
+    record_invalidations(db, actor(),
+                         "remove_control_group " + ",".join(removed))
+    db.commit()
+    return jsonify({"ok": True, "changed": True, "removed": removed})
 
 
 # ---------------------------------------------------------------- admin page

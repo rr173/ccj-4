@@ -95,6 +95,15 @@
       <div id="mergeList"></div>
     </div>
     <div class="card" style="margin-bottom:16px">
+      <h2>对照组 <span class="muted" style="font-weight:normal">点进对照组的人来问时不再按人分开算：每个开关只走它自己的默认开或关（全关仍压过）；没进的人照旧走各开关原来的算法</span></h2>
+      <div class="row"><input id="controlIds" type="text" placeholder="点名进对照组的身份，逗号分隔，至少一个，如 u1, u2, u3（整拨替换为新名单）"></div>
+      <div class="row">
+        <button class="primary" onclick="replaceControlGroup()">点名进对照组（替换名单）</button>
+        <button class="danger" onclick="clearControlGroup()">清空对照组</button>
+      </div>
+      <div id="controlList"></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
       <h2>发布稿 <span class="muted" style="font-weight:normal">好几处改动收成一稿，发布时一起生效；稿在发布前不影响任何结果</span></h2>
       <div class="row"><input id="newDraftNote" type="text" placeholder="这稿要做什么（备注，可选）"></div>
       <div class="row"><button class="primary" onclick="createDraft()">开新稿</button></div>
@@ -267,6 +276,7 @@ async function loadAll() {
     return;
   }
   await loadFlags(); await loadGroups(); await loadMerges();
+  await loadControlGroup();
   await loadDrafts(); await loadAudit(); await loadInvalidations();
 }
 
@@ -666,7 +676,7 @@ async function removeOverride(identity) {
 
 // ---------------------------------------------------------------- 结果冻结
 
-const REASON_NAMES = { kill_switch: '全关', freeze: '结果冻结', depends_on: '开关依赖',
+const REASON_NAMES = { kill_switch: '全关', control: '对照组', freeze: '结果冻结', depends_on: '开关依赖',
                        override: '单人强制', targeting: '属性条件',
                        group: '互斥组', rollout: '比例放量', variants: '定档',
                        default: '默认值' };
@@ -1135,6 +1145,50 @@ async function splitIdentities(id, identities) {
     toast('已拆开，之后各算各的');
     await loadMerges();
   } catch (e) { toast('拆开失败：' + e.message, true); }
+}
+
+// ---------------------------------------------------------------- 对照组
+
+async function loadControlGroup() {
+  let info;
+  try {
+    info = await api('/api/control-group');
+  } catch (e) {
+    $('controlList').innerHTML = '<span class="muted">加载失败：' + esc(e.message) + '</span>';
+    return;
+  }
+  const el = $('controlList');
+  if (!info.identities.length) { el.innerHTML = '<span class="muted">对照组里还没有人</span>'; return; }
+  const chips = info.identities.map(id =>
+    `<span class="badge" title="对照组成员：每个开关只走默认开/关">${esc(id)}</span>`).join('');
+  el.innerHTML = `<div class="members">${chips}</div>
+    <div class="muted">共 ${info.identities.length} 人 · 这些人来问每个开关都走自己的默认值（reason=control）</div>`;
+}
+
+async function replaceControlGroup() {
+  const ids = $('controlIds').value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!ids.length) return toast('至少要点名一个身份，这次点不成', true);
+  if (new Set(ids).size !== ids.length) return toast('身份不能重复，这次点不成', true);
+  try {
+    const r = await api('/api/control-group',
+      { method: 'PUT', body: JSON.stringify({ identities: ids }) });
+    if (r.changed === false) toast('对照组名单本来就是这样，未改动');
+    else {
+      $('controlIds').value = '';
+      toast(`已按新名单点名：新增 ${r.added.length} 人，移出 ${r.removed.length} 人，再来问按新的算`);
+    }
+    await loadControlGroup();
+  } catch (e) { toast('点不成：' + e.message, true); }
+}
+
+async function clearControlGroup() {
+  if (!confirm('确定清空对照组？清空后这些人重新按各开关原来的算法算。')) return;
+  try {
+    await api('/api/control-group', { method: 'DELETE' });
+    toast('已清空对照组');
+    $('controlIds').value = '';
+    await loadControlGroup();
+  } catch (e) { toast('清空失败：' + e.message, true); }
 }
 
 // ---------------------------------------------------------------- 互斥组

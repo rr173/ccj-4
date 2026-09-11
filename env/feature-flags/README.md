@@ -46,10 +46,13 @@ curl -H "X-Environment: staging" \
 ## 求值优先级（固定，代码中不可调整）
 
 ```
-全关(kill_switch) > 结果冻结(freeze) > 开关依赖(depends_on) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout，含定档 variants) > 默认值(default)
+全关(kill_switch) > 对照组(control) > 结果冻结(freeze) > 开关依赖(depends_on) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout，含定档 variants) > 默认值(default)
 ```
 
-- **全关**：打开后所有身份一律为关，覆盖一切，**包括冻住的结果**。
+- **全关**：打开后所有身份一律为关，覆盖一切，**包括冻住的结果与对照组**。
+- **对照组**：见下节。被管理端点进对照组的人，每个开关只走它自己的默认开或关，
+  冻结 / 依赖 / 强制 / 属性 / 组 / 放量 / 定档一概不看（不落档、不写组落定），
+  唯一仍压过它的是全关。没进对照组的人不受这一层影响。
 - **结果冻结**：见下节。
 - **开关依赖**：见下节。
 - **单人强制**：对指定 identity 强制开/关，覆盖属性条件、互斥组、放量与默认值；
@@ -106,6 +109,52 @@ curl -X DELETE http://localhost:8000/api/flags/new-checkout/freezes \
   冻住那一刻按不带属性的口径求值。
 - 删除开关时它的冻结记录一并删除；`GET /api/flags/<name>/freezes` 可查看该开关
   冻住了哪些人。
+
+## 对照组（control group：点进来的人每个开关只走默认值）
+
+管理端可以**点名一拨人进对照组**。进了对照组的人来问时（单查、整包、带不带
+属性），**不再按人分开算**——结果冻结、开关依赖、单人强制、属性打开条件、
+互斥组、比例放量、定档这些「按人」的层一概不看，**每个开关只走它自己的默认
+开或关**（`reason=control`），不写组落定、不带档名（`variant`）；默认开且挂了
+配置的开关仍随结果带配置（与默认值层同口径）。**没进对照组的人完全照旧**，
+走各自开关原来的算法。
+
+```bash
+# 点名一拨人进对照组（整拨替换为新名单；至少一个，名字按主身份记名）
+curl -X PUT http://localhost:8000/api/control-group \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "X-Environment: prod" \
+  -H "Content-Type: application/json" \
+  -d '{"identities": ["u1", "u2", "u3"]}'
+# => {"ok":true,"changed":true,"identities":["u1","u2","u3"],
+#     "added":["u1","u2","u3"],"removed":[]}
+
+# 查看现在点着哪些人
+curl -H "X-Admin-Token: $TOKEN" -H "X-Environment: prod" \
+  http://localhost:8000/api/control-group
+# 只移出人（没点名的不动）；不带 body 或 identities 为空 = 清空整拨
+curl -X DELETE http://localhost:8000/api/control-group \
+  -H "X-Admin-Token: $TOKEN" -H "X-Environment: prod" \
+  -H "Content-Type: application/json" -d '{"identities": ["u2"]}'
+```
+
+- **少写了点不成**：`identities` 必须是非空字符串列表、至少一个、不能重复；
+  写成空列表 / `null` / 非字符串 / 空串 / 有重复，这次一个人都不写库，返回
+  `400` 并说清楚。身份若已被「收成同一个人」（见身份合并），按**主身份**记名，
+  同一拨里写两个别名归并后撞车也算重复（400）。
+- **全关仍压过对照**：某个开关全关期间，对照组里的人对它也一律关
+  （`reason=kill_switch`）；解除全关后自动回到「只走默认值」。
+- **同一人进没进，多次来问恒定**：对照归属是管理端明确点的名单，不做随机分桶，
+  问多少次、从哪台机器问、带什么属性，结果都一样；带不同属性来拿仍是各自独立
+  的包，但每个开关的结果与属性无关（属性条件不参与）。
+- **改了谁在对照里，再来问按新的算**：加入 / 移出 / 换名单立即生效。移出后此人
+  原来的冻结、单人强制等按人状态立刻恢复作用（它们一直留着，只是对照期间不
+  参与求值）。改动让**相关身份**（加入或移出的人）的已发整包换新版本，拿着旧包
+  来问得到 `valid=false`；与改动无关的人（没进没出的、对照组外的）包版本一字
+  不变。同一份名单再点一次是幂等的（`changed=false`，不换任何版本）。
+- **历史可重放**：进 / 出对照都进 append-only 历史流水——进对照前按原算法，
+  对照期每个开关只走当时的默认值，移出后又按原算法。
+- 对照组是**每个环境各自一份**的（与强制 / 冻结 / 互斥组一样），跨环境推送只推
+  开关规则、不推对照名单。`GET /api/control-group` 可查看当前名单。
 
 ## 开关依赖（depends_on）
 
@@ -502,8 +551,8 @@ curl -X POST http://localhost:8000/api/preview \
   （开/关、决定层或配置任一不同都算）。
 - **真的什么都不动**：预演在「现在」的内存快照上套用假想改动求值——不落库、
   不换整包版本、不写组落定、不进审计与历史流水，稿还是 open。
-- **全按现在的规矩算**：全关、冻结、依赖、单人强制、属性条件、互斥组、放量、
-  默认全部照现网；**还没到点的定时变更与别的没发布的稿不算进去**。
+- **全按现在的规矩算**：全关、对照组、冻结、依赖、单人强制、属性条件、互斥组、
+  放量、默认全部照现网；**还没到点的定时变更与别的没发布的稿不算进去**。
   可带 `attrs`（JSON 对象）预演「带这身属性来问」的情形。
 - **稿发不出去照实说**：稿若现在发布会失败（目标开关被删、合并后成环），
   响应带 `publishable:false` 与原因，`preview` 与 `current` 相同
@@ -562,12 +611,13 @@ curl "http://localhost:8000/api/history?identity=u123&at=1789000000"
 curl "http://localhost:8000/api/history?identity=u123&at=1789000000&attrs=%7B%22plan%22%3A%22pro%22%7D"
 ```
 
-- **口径与整包一致**：只返回当时存在的开关，按固定优先级（全关 > 冻结 > 依赖 >
-  强制 > 属性 > 组 > 放量 > 默认）逐开关求值；组落定也按当时的记录还原——那一刻
-  真查过的人按当时落定算，没查过的按「名字序首个自然开」确定性模拟（与整包同序）。
-- **配置是当时那份**：判开才带 `config`，判关（含全关、依赖关、强制关、没争到组、
-  放量未命中、默认关）不带；**冻住的人按冻住的算**，带冻住那一刻的配置快照与档名
-  快照，全关期间同样不带。定了档且为开的开关带当时的 `variant`。
+- **口径与整包一致**：只返回当时存在的开关，按固定优先级（全关 > 对照组 > 冻结 >
+  依赖 > 强制 > 属性 > 组 > 放量 > 默认）逐开关求值；对照组按那一刻的名单还原，
+  组落定也按当时的记录还原——那一刻真查过的人按当时落定算，没查过的按「名字序
+  首个自然开」确定性模拟（与整包同序）。
+- **配置是当时那份**：判开才带 `config`，判关（含全关、对照默认关、依赖关、强制关、
+  没争到组、放量未命中、默认关）不带；**冻住的人按冻住的算**，带冻住那一刻的配置
+  快照与档名快照，全关期间同样不带。定了档且为开的开关带当时的 `variant`。
 - **约了时间没到点的不算**：到点前问历史拿到的是旧值；到了点（哪怕还没有任何
   请求触发惰性应用）问历史就是新值；已取消的预约到点也不算。
 - **没发布的稿不算**：只有 `published_at <= at` 的发布稿参与重放，且稿里的改动
@@ -601,7 +651,7 @@ docker run -d -p 8000:8000 -e ADMIN_TOKEN=你的强随机串 \
 ```bash
 GET '/api/flags/<name>/check?identity=<用户身份>[&attrs=<URL编码的JSON属性>]'
 # => {"flag":"new-checkout","identity":"u123","enabled":true,"reason":"rollout"}
-#    reason ∈ kill_switch | freeze | depends_on | override | targeting | group | rollout | variants | default，表示结果由哪一层决定
+#    reason ∈ kill_switch | control | freeze | depends_on | override | targeting | group | rollout | variants | default，表示结果由哪一层决定
 #    定了档且最终为开时还带 "variant":"<档名>"；没定档的开关永远没有 variant 键
 #    identity / attrs 需 URL 编码；identity 允许包含斜杠、空格、引号等任意字符
 #    attrs 必须是扁平 JSON 对象，值为标量（字符串/数字/布尔/null）；非法返回 400
@@ -642,6 +692,9 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 | GET | `/api/identities/merges` | 列出每拨「收成同一个人」的身份（主身份排首位） |
 | POST | `/api/identities/merges` | 把几个身份收成同一个人，body `{identities:[…]}`；至少两个，某个身份已在另一拨则 409 并说明，整拨原样重收为幂等 no-op |
 | DELETE | `/api/identities/merges/<id>` | 拆开这拨人；拆开后这几个身份各算各的 |
+| GET | `/api/control-group` | 查看对照组现在点着哪些人（主身份，名字序） |
+| PUT | `/api/control-group` | 点名一拨人进对照组（整拨替换为新名单），body `{identities:[…]}`；至少一个，少写/空串/重复 400 并说明，一个人都不写库；进了的人来问每个开关只走它自己的默认开或关（`reason=control`，全关仍压过）；同名重复点为幂等 no-op |
+| DELETE | `/api/control-group` | 移出，body `{identities:[…]}`（只移点名的，没在名单里的不报错）；不带 body 或 `identities` 为空 = 清空整拨；移出后立即按各开关原来的算法算 |
 
 > identity 一律放在 JSON body / 查询参数里，不进 URL 路径，
 > 因此含 `/`、空格、`"`、`'` 等字符的身份都能正常设置、查询、移除。

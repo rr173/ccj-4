@@ -38,6 +38,11 @@ class _EnvClient(flag_app.FlaskClient):
         kwargs["headers"] = headers
         return super().open(*args, **kwargs)
 
+    def request(self, method, url, *args, **kwargs):
+        # 兼容旧 Werkzeug：client.request("DELETE", url, ...) -> open(url, method=...)
+        kwargs["method"] = method
+        return self.open(url, *args, **kwargs)
+
 
 flag_app.app.test_client_class = _EnvClient
 c = flag_app.app.test_client()
