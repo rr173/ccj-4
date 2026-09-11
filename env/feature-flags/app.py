@@ -130,6 +130,16 @@ scheduled_changes 表里，不参与求值）；到点之后，第一个进来�
 整包版本、组落定、审计与历史流水一概不动；全关、冻结、依赖按现在的规矩算，
 还没到点的定时变更与别的没发布的稿不算进去。稿若现在发不出去（目标开关
 没了 / 合并成环），预演照实回答 publishable=false 与原因，结果与现在相同。
+
+跨环境推送（push）：管理端可以把一批开关从源环境此刻的规则一次性推到另一个
+环境（POST /api/push，body 写明 source / target / flags）。少写了字段、
+环境不存在、点名的开关在源里没有，这次都推不成并说明；推成后目标环境里这些
+开关按源此刻的规则算（目标没有的就地新建），没点名的还是目标自己的；源环境
+全程只读，一份规则都不被这次改掉。若这么推会让目标里的开关互相绕着依赖
+（或被依赖的开关在目标里不存在），这一次一个开关都不改，目标保持推之前的
+规则并说明。推送是目标环境上的一次原子变更：记审计与历史流水、目标已发整包
+统一换新版本；目标本地的单人强制、冻结、互斥组、定时变更与发布稿都是目标
+自己的状态，推送不抄也不清。
 """
 
 import hashlib
@@ -804,12 +814,17 @@ def _init_environment_schema(path):
     conn.close()
 
 
-def audit(actor, flag_name, layer, action, detail=""):
-    get_db().execute(
+def audit_to(db, actor_name, flag_name, layer, action, detail=""):
+    """往指定环境的库落一条审计（跨环境推送要写给目标环境，不走请求环境）。"""
+    db.execute(
         "INSERT INTO audit_log (actor, flag_name, layer, action, detail, created_at)"
         " VALUES (?,?,?,?,?,?)",
-        (actor, flag_name, layer, action, detail, time.time()),
+        (actor_name, flag_name, layer, action, detail, time.time()),
     )
+
+
+def audit(actor, flag_name, layer, action, detail=""):
+    audit_to(get_db(), actor, flag_name, layer, action, detail)
 
 
 def flag_snapshot_payload(flag_row, dep_name=None):
@@ -1596,6 +1611,201 @@ def create_environment():
     return jsonify({"ok": True, "environment": name}), 201
 
 
+# ---------------------------------------------------------------- 跨环境推送
+
+def push_env_field(body, canonical, alias):
+    """读取推送的方向字段（source/from、target/to）：缺了报错；两种写法都给
+    且不一致时报错。返回 (环境名, 错误串)。"""
+    values = []
+    for k in (canonical, alias):
+        v = body.get(k)
+        if v is None or v == "":
+            continue
+        if not isinstance(v, str):
+            return None, f"{canonical} must be a string (environment name)"
+        values.append(v)
+    if not values:
+        what = ("the environment to push from" if canonical == "source"
+                else "the environment to push to")
+        return None, f"{canonical} is required ({what})"
+    if len(set(values)) > 1:
+        return None, f"{canonical} and {alias} must match when both are given"
+    try:
+        return validate_environment_name(values[0]), None
+    except ValueError as e:
+        return None, str(e)
+
+
+@app.post("/api/push")
+@require_admin
+def push_flags():
+    """管理端：把源环境此刻的开关规则一次性推到目标环境。
+
+    POST /api/push  {"source": "staging", "target": "prod", "flags": ["a", "b"]}
+    （source/target 也可写成 from/to）
+
+    - 少写了（source/target/flags 缺一）、环境名非法、flags 不是非空的开关
+      名单：400，这次推不成；
+    - 源或目标环境不存在：404 并指明是哪一边，这次推不成；
+    - 点名的开关在源里不存在：404 列出缺的，一个都不推；
+    - 推成后，目标环境里这些开关按源此刻的规则算（默认值 / 全关 / 放量比例 /
+      放量条件 / 放量规矩 / 属性打开条件 / 挂的配置 / 依赖，连同描述）；目标里
+      没有的开关就地新建；没点名的开关一律还是目标自己的。目标本地的单人强制、
+      结果冻结、互斥组与落定、定时变更、发布稿与整包账本都是目标自己的状态，
+      推送不抄也不清（与「在目标上直接改这些开关」同一口径）；
+    - 依赖按名字落到目标：被依赖的开关必须在推送后的目标里存在（目标已有或
+      这次一起推），否则这次一个都不推，返回 400 并说明；
+    - 若这么推会让目标里的开关互相绕着依赖（成环 / 自依赖），这一次一个开关
+      都不改，目标保持推之前的规则，返回 400 并说明；
+    - 源环境全程只读（连接上开了 query_only）：这次推送不改源的任何规则、
+      审计、历史与整包账本。
+    推送是目标环境上的一次原子变更：全部校验通过后一个事务写入，记审计与
+    历史流水，目标已发整包统一重算、换新版本。
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be a JSON object"
+                                 " ({source, target, flags})"}), 400
+    source, err = push_env_field(body, "source", "from")
+    if err:
+        return jsonify({"error": err}), 400
+    target, err = push_env_field(body, "target", "to")
+    if err:
+        return jsonify({"error": err}), 400
+    raw_flags = body.get("flags")
+    if raw_flags is None:
+        return jsonify({"error": "flags is required"
+                                 " (a non-empty list of flag names to push)"}), 400
+    if not isinstance(raw_flags, list) or not raw_flags:
+        return jsonify({"error": "flags must be a non-empty list of flag names"}), 400
+    names = []
+    for f in raw_flags:
+        if not isinstance(f, str) or f == "":
+            return jsonify({"error": "flags must be non-empty strings"
+                                     " (flag names)"}), 400
+        if f not in names:
+            names.append(f)
+    if source == target:
+        return jsonify({"error": "source and target must be different"
+                                 " environments"}), 400
+    src_rec = get_environment_record(source)
+    if src_rec is None:
+        return jsonify({"error": f"source environment not found: {source}"}), 404
+    tgt_rec = get_environment_record(target)
+    if tgt_rec is None:
+        return jsonify({"error": f"target environment not found: {target}"}), 404
+
+    # 源环境全程只读（query_only：任何误写都直接报错而不是落库）。读出点名
+    # 开关此刻的规则后即关闭——这次推送不改源的一分一毫。
+    src = connect_sqlite(src_rec["db_file"])
+    try:
+        src.execute("PRAGMA query_only=ON")
+        src_name_of_id = {r["id"]: r["name"]
+                          for r in src.execute("SELECT id, name FROM flags")}
+        src_flags = {}
+        for n in names:
+            row = src.execute("SELECT * FROM flags WHERE name=?", (n,)).fetchone()
+            if row is not None:
+                src_flags[n] = row
+    finally:
+        src.close()
+    missing = [n for n in names if n not in src_flags]
+    if missing:
+        return jsonify({"error": "flags not found in source environment"
+                                 f" '{source}': {', '.join(missing)}"}), 404
+
+    # 每个点名开关要落到目标的规则；依赖按名字带过去，稍后解析成目标的 id
+    staged = {}
+    for n in names:
+        s = src_flags[n]
+        dep = ""
+        if s["depends_on_flag_id"] is not None:
+            dep = src_name_of_id.get(s["depends_on_flag_id"], "")
+        staged[n] = {"depends_on": dep}
+
+    # 以下是目标环境上的一次变更：与任何访问目标环境的请求一样，先惰性应用
+    # 到点的定时变更，再在「此刻」的目标上做校验与写入
+    g.environment = target
+    apply_due_scheduled_changes()
+    db = get_db()
+
+    # 被依赖的开关必须在推送后的目标里存在（目标已有，或这次一起推）
+    tgt_names = {r["name"] for r in db.execute("SELECT name FROM flags")}
+    for n in sorted(staged):
+        dep = staged[n]["depends_on"]
+        if dep and dep not in tgt_names and dep not in staged:
+            msg = (f"flag '{n}' depends on '{dep}' in source environment"
+                   f" '{source}', but '{dep}' does not exist in target"
+                   f" environment '{target}'"
+                   " (push it too or create it there first)")
+            audit_to(db, actor(), f"push:{source}->{target}", "push",
+                     "push_rejected", msg)
+            db.commit()
+            return jsonify({"error": msg}), 400
+    # 合并后的目标依赖图不能成环：成环则这一次一个开关都不改
+    cycle_err = merged_dependency_cycle(
+        db, staged, what=f"pushing into environment '{target}'")
+    if cycle_err is not None:
+        audit_to(db, actor(), f"push:{source}->{target}", "push",
+                 "push_rejected", cycle_err)
+        db.commit()
+        return jsonify({"error": cycle_err}), 400
+
+    now = time.time()
+    created, updated = [], []
+    try:
+        # 先写各开关自身的规则（目标没有的就地新建），再统一落依赖边
+        for n in sorted(staged):
+            s = src_flags[n]
+            cur = db.execute(
+                "UPDATE flags SET description=?, default_enabled=?,"
+                " rollout_percent=?, rollout_condition=?, rollout_rules=?,"
+                " kill_switch=?, targeting_rule=?, flag_config=?, updated_at=?"
+                " WHERE name=?",
+                (s["description"], s["default_enabled"], s["rollout_percent"],
+                 s["rollout_condition"], s["rollout_rules"], s["kill_switch"],
+                 s["targeting_rule"], s["flag_config"], now, n))
+            if cur.rowcount == 0:
+                db.execute(
+                    "INSERT INTO flags (name, description, default_enabled,"
+                    " rollout_percent, rollout_condition, rollout_rules,"
+                    " kill_switch, targeting_rule, flag_config, created_at,"
+                    " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (n, s["description"], s["default_enabled"],
+                     s["rollout_percent"], s["rollout_condition"],
+                     s["rollout_rules"], s["kill_switch"], s["targeting_rule"],
+                     s["flag_config"], now, now))
+                created.append(n)
+            else:
+                updated.append(n)
+        for n in sorted(staged):
+            dep = staged[n]["depends_on"]
+            dep_id = None
+            if dep:
+                dep_id = db.execute("SELECT id FROM flags WHERE name=?",
+                                    (dep,)).fetchone()["id"]
+            db.execute("UPDATE flags SET depends_on_flag_id=? WHERE name=?",
+                       (dep_id, n))
+        for n in sorted(staged):
+            fresh = db.execute("SELECT * FROM flags WHERE name=?", (n,)).fetchone()
+            record_history(db, now, "flag_upsert", subject=n,
+                           payload=flag_snapshot_payload(fresh),
+                           actor_name=actor())
+            audit_to(db, actor(), n, "push", "push_flag",
+                     f"from {source}" + (" (created)" if n in created else ""))
+        audit_to(db, actor(), f"push:{source}->{target}", "push", "push_flags",
+                 "flags=" + ",".join(sorted(staged)))
+    except Exception:
+        db.rollback()
+        raise
+    db.commit()
+    record_invalidations(
+        db, actor(), f"push {source} -> {target}: {','.join(sorted(staged))}")
+    return jsonify({"ok": True, "source": source, "target": target,
+                    "pushed": sorted(staged), "created": created,
+                    "updated": updated})
+
+
 # ---------------------------------------------------------------- public API
 
 @app.get("/api/flags/<name>/check")
@@ -2074,7 +2284,8 @@ def apply_due_scheduled_changes():
 @app.before_request
 def _select_environment_and_apply_due_changes():
     if request.method == "OPTIONS" or request.url_rule is None or request.endpoint in {
-        "healthz", "list_environments", "create_environment", "admin_page"}:
+        "healthz", "list_environments", "create_environment", "admin_page",
+        "push_flags"}:
         return
     name, err = require_request_environment()
     if err is not None:
@@ -2475,12 +2686,13 @@ def draft_to_dict(db, r):
     }
 
 
-def merged_dependency_cycle(db, staged):
-    """发布前整稿校验：现网依赖图叠加整稿改动后是否成环。
+def merged_dependency_cycle(db, staged, what="the draft as a whole"):
+    """合并校验：现网依赖图叠加一批改动后是否成环。
 
-    staged 为 {flag_name: 合并后的改动 dict}。稿里改了 depends_on 的边以稿
+    staged 为 {flag_name: 合并后的改动 dict}。改动里改了 depends_on 的边以改动
     为准（"" = 解除），其余边沿用现网。返回错误串；None 表示图无环、所有
-    被依赖目标都存在。成环 / 自依赖 / 指向不存在的开关都会让整稿不能发布。
+    被依赖目标都存在。成环 / 自依赖 / 指向不存在的开关都会让这批改动不能生效。
+    发布稿与跨环境推送共用这段；what 是这批改动的说法，只用于成环报错文案。
     """
     name_of_dep_id = {r["id"]: r["name"]
                       for r in db.execute("SELECT id, name FROM flags")}
@@ -2510,7 +2722,7 @@ def merged_dependency_cycle(db, staged):
 
     for n in graph:
         if color.get(n, 0) == 0 and visit(n):
-            return "circular dependency rejected: the draft as a whole would form a cycle"
+            return f"circular dependency rejected: {what} would form a cycle"
     return None
 
 

@@ -94,6 +94,13 @@
       <div class="row"><button class="primary" onclick="createDraft()">开新稿</button></div>
       <div id="draftList"></div>
     </div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>跨环境推送 <span class="muted" style="font-weight:normal">把源环境此刻的开关规则推到另一个环境：源一份不动，没点名的还是目标自己的；会成环就一个都不推</span></h2>
+      <div class="row"><input id="pushSource" type="text" placeholder="从哪来（源环境），如 staging"></div>
+      <div class="row"><input id="pushTarget" type="text" placeholder="到哪去（目标环境），如 prod"></div>
+      <div class="row"><input id="pushFlags" type="text" placeholder="推哪几个开关，逗号分隔，如 alpha, beta"></div>
+      <div class="row"><button class="primary" onclick="runPush()">推送</button></div>
+    </div>
     <div class="card">
       <h2>开关列表 <button style="float:right" onclick="loadAll()">刷新</button></h2>
       <div id="flagList"><span class="muted">加载中…</span></div>
@@ -929,6 +936,26 @@ async function createDraft() {
     toast('已开稿，在开关详情里把改动收进来');
     await loadDrafts();
   } catch (e) { toast('开稿失败：' + e.message, true); }
+}
+
+async function runPush() {
+  const source = $('pushSource').value.trim();
+  const target = $('pushTarget').value.trim();
+  const flags = $('pushFlags').value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!source || !target || !flags.length)
+    return toast('从哪来、到哪去、推哪几个开关，都要写明', true);
+  if (!confirm(`确定把 ${source} 的 ${flags.length} 个开关（${flags.join(', ')}）推到 ${target}？\n`
+      + `目标里这些开关将按源此刻的规则算；源一份不动；若会让目标成环，一个都不推。`)) return;
+  try {
+    // 推送是目录级操作（环境写在 body 里），不走当前环境的 api() 助手
+    const res = await fetch('/api/push', { method: 'POST', headers: headers(),
+      body: JSON.stringify({ source, target, flags }) });
+    const data = await res.json();
+    if (!res.ok) return toast('推不成：' + (data.error || res.status), true);
+    toast(`已推送 ${data.pushed.length} 个开关：${source} → ${target}`
+          + (data.created.length ? `（新建 ${data.created.length} 个）` : ''));
+  } catch (e) { return toast('推不成：' + e.message, true); }
+  if (currentEnv === source || currentEnv === target) await loadAll();
 }
 
 async function publishDraft(id) {

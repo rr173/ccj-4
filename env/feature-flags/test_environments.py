@@ -34,7 +34,9 @@ def create_env(name):
 
 
 def get(path, env=None):
-    headers = {} if env is None else {"X-Environment": env}
+    headers = dict(H)  # 管理端接口需要令牌；公开接口多带也无妨
+    if env is not None:
+        headers["X-Environment"] = env
     return c.get(path, headers=headers)
 
 
@@ -56,9 +58,9 @@ r = get("/api/flags", "nope")
 check("未知环境返回 404", r.status_code == 404 and "environment not found" in j(r)["error"], j(r))
 r = get("/api/flags", "prod")
 check("存在环境可访问", r.status_code == 200, j(r))
-r = c.get("/api/flags?environment=prod")
+r = c.get("/api/flags?environment=prod", headers=H)
 check("查询参数也可指定环境", r.status_code == 200, j(r))
-r = c.get("/api/flags?env=prod", headers={"X-Env": "prod"})
+r = c.get("/api/flags?env=prod", headers={**H, "X-Env": "prod"})
 check("短参数与短头兼容", r.status_code == 200, j(r))
 r = c.get("/api/flags?env=prod", headers={"X-Env": "staging"})
 check("短参数与短头冲突明确报错", r.status_code == 400, j(r))

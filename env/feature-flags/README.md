@@ -6,7 +6,8 @@
 
 管理端可以创建多个环境。每个环境都有独立的开关配置、冻结 / 强制 / 互斥组 /
 发布稿 / 定时变更 / 历史，以及独立的整包账本和版本序号；一个环境里的改动不会
-影响另一个环境。
+影响另一个环境。唯一跨环境的动作是管理端显式发起的**推送**（见「跨环境推送」
+一节）：把源环境此刻的开关规则复制到目标环境，源全程只读。
 
 ```bash
 # 创建环境（管理接口）
@@ -412,6 +413,42 @@ curl -X POST http://localhost:8000/api/preview \
   稿预演按发布时的整稿合并校验判定 `publishable`。
 - 一次最多点 100 个人；身份放在 JSON body 里，特殊字符无需转义。
 
+## 跨环境推送（push）
+
+管理端可以把**一批开关从一个环境此刻的规则一次性推到另一个环境**——写明
+从哪来、到哪去、推哪几个开关：
+
+```bash
+curl -X POST http://localhost:8000/api/push \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "Content-Type: application/json" \
+  -d '{"source": "staging", "target": "prod", "flags": ["new-checkout", "promo-pay"]}'
+# => {"ok":true,"source":"staging","target":"prod",
+#     "pushed":["new-checkout","promo-pay"],"created":["promo-pay"],"updated":["new-checkout"]}
+```
+
+（`source`/`target` 也可写成 `from`/`to`；该接口是目录级操作，环境写在 body 里，
+不需要 `?environment=`。）
+
+- **少写了推不成**：`source` / `target` / `flags` 缺一、`flags` 不是非空的开关
+  名单、源与目标是同一个环境，都返回 400 并说明。
+- **写了个没有的环境推不成**：源或目标环境不存在返回 404，并指明是哪一边；
+  点名的开关在源里不存在同样 404 列出缺的，一个都不推。
+- **推成后**：目标环境里这些开关按源**此刻**的规则算（默认值 / 全关 / 放量比例 /
+  放量条件 / 放量规矩 / 属性打开条件 / 挂的配置 / 依赖，连同描述）；目标里没有的
+  开关就地新建。**没点名的还是目标自己的**，一个字段都不动。
+- **源一份都不被改掉**：源环境全程只读——规则、审计、历史、整包账本与版本，
+  这次推送一律不碰。
+- **依赖按名字落到目标**：被依赖的开关必须在推送后的目标里存在（目标已有或这次
+  一起推），否则这次一个都不推，返回 400 说明缺谁。
+- **会成环就一个都不推**：若这么推会让目标里的开关互相绕着依赖（成环 / 自依赖），
+  这一次一个开关都不改，目标保持推之前的规则，返回 400 说明；审计里记
+  `push_rejected` 与原因。
+- **目标环境上的一次原子变更**：全部校验通过后一个事务写入，记审计与历史流水，
+  目标已发整包统一重算、换新版本（失效记录里能查到这次推送）。
+- **目标自己的状态不抄也不清**：目标本地的单人强制、结果冻结、互斥组与落定、
+  定时变更、发布稿都是目标自己的状态——推送只覆盖开关本身的规则，与「在目标上
+  直接改这些开关」同一口径（冻住的人仍按冻住的算，等等）。
+
 ## 问某个过去的时刻（历史重放）
 
 调用方可以指定一个**过去的时刻**，问某个人当时**每个开关**开还是关；开着的开关
@@ -482,6 +519,9 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| GET | `/api/environments` | 列出所有环境 |
+| POST | `/api/environments` | 创建环境 `{name}` |
+| POST | `/api/push` | 跨环境推送 `{source, target, flags}`（也接受 `from`/`to`）：把源环境此刻的规则推到目标；少写/环境没有/会成环都推不成并说明，源全程只读 |
 | GET | `/api/flags` | 列出所有开关 |
 | POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting, rollout_condition, rollout_rules}` |
 | PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, rollout_condition, rollout_rules, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`rollout_condition` 为放量条件 JSON（`{}`/`null` 清除）；`rollout_rules` 为有序放量规矩列表（`[]`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |
