@@ -46,7 +46,7 @@ curl -H "X-Environment: staging" \
 ## 求值优先级（固定，代码中不可调整）
 
 ```
-全关(kill_switch) > 结果冻结(freeze) > 开关依赖(depends_on) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout) > 默认值(default)
+全关(kill_switch) > 结果冻结(freeze) > 开关依赖(depends_on) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout，含定档 variants) > 默认值(default)
 ```
 
 - **全关**：打开后所有身份一律为关，覆盖一切，**包括冻住的结果**。
@@ -60,10 +60,13 @@ curl -H "X-Environment: staging" \
   只要比例 > 0，这一层就给出定论，不再落到默认值；比例为 0 表示未启用放量。
   同一身份对同一开关永远落在同一侧，与进程、机器、重启无关；
   调高比例只会**新增**命中者，已命中者不会掉出。
+  若**定了档（variants）**，这一层把所有人按档分完：落进哪一档就开并带回那一档的
+  名字（`variant`），见「定档」一节；没定档的开关永远只回答开/关。
   若定了**放量条件**（`rollout_condition`），比例只对来问属性对上条件的人生效，
   没对上的直接落到默认值（见「条件按比例放量」一节）。
   若定了**有序放量规矩**（`rollout_rules`），放量层只看规矩：从上往下第一条
   对上的按它的比例定论，一条都对不上落到默认值（见「有序放量规矩」一节）。
+  定了档时比例 / 放量条件 / 规矩都不参与求值，清空档后恢复。
 - **默认值**：放量比例为 0（未启用放量），或定了放量条件但没对上时兜底。
 
 ## 结果冻结（freeze）
@@ -244,6 +247,58 @@ curl "http://localhost:8000/api/flags/new-checkout/check?identity=u456&attrs=%7B
 - `rollout_rules` 同样支持 `effective_at` 预约定时生效、可收进发布稿、可在预演
   里试；建开关时也可以直接带上。
 
+## 定档（variants：多档实验，回答「落在哪一档」）
+
+管理端可以给一个开关**定几档**：每档一个名字、一个比例（0-100 的整数），
+**几档的比例加起来必须刚好满 100**。定了档之后，放量层不再只回答开/关，而是把
+来问的人按稳定分桶落进**恰好一档**：结果为开，并把这一档的名字随结果带回去；
+**没定档的开关还是只回答开或关**，响应里没有 `variant` 这个键。
+
+```bash
+# 三档：对照 50% / 实验A 30% / 实验B 20%（比例和必须恰好 100）
+curl -X PATCH http://localhost:8000/api/flags/new-checkout \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"variants": [{"name":"control","percent":50},
+                    {"name":"treat-a","percent":30},
+                    {"name":"treat-b","percent":20}]}'
+
+curl "http://localhost:8000/api/flags/new-checkout/check?identity=u123"
+# => {"flag":"new-checkout","identity":"u123","enabled":true,
+#     "reason":"variants","variant":"treat-a"}
+# 清空档（回到只回答开/关）：
+#   -d '{"variants": []}'
+```
+
+- **落档规则**：沿用放量分桶 `sha256("{flag}:{identity}") % 100`，按档的书写顺序
+  累加比例划区间（上例：0-49 落 control、50-79 落 treat-a、80-99 落 treat-b）。
+  分桶只认开关与身份，**同一人、同一身属性（与带不带属性无关）问多少次、从哪台
+  机器问，都落同一档**；档名在响应（check 与整包）里用 `variant` 字段带回。
+- **校验**：至少一档；档名非空且不能重复；比例是 0-100 的整数（0% 合法，等于先
+  占位、谁也落不进去，之后可调大）；**各档比例加起来不等于 100 一律 400 拒绝**
+  （差一点都不收）。
+- **改了就按新的算**：改某一档的名字或比例（含增删、调序、清空）立即生效——
+  分桶值不变、落的区间按新比例重划；**只改名字，桶不换、带回去的名字换成新的**；
+  改比例会让一些人移到相邻的档（不是重新随机）。档是**所有人（含不带属性的包）**
+  的求值输入，任何一档改动都让已发整包序号 +1 换新版本，拿着改前那包来问得到
+  `valid=false`。
+- **与其他层的关系**：
+  - 定档排在属性打开条件之后、原放量/默认值的位置（优先级⑦）。**属性命中（⑤）
+    仍先定论为开**（`reason=targeting`），但只要开着且开关定了档，`variant` 同样
+    按同一分桶补上——档名只看最终开不开，与由哪一层决定无关。
+  - 定了档时这一层对所有人定论为开、不再落默认值；单条放量比例、放量条件与有序
+    放量规矩都**不参与求值**（配置保留回显，清空档后老路恢复）。
+  - **全关、结果冻结、开关依赖关、单人强制关**照样压过它：这些路径判关，响应里
+    没有 `variant`。**单人强制开、互斥组争胜**这些开的路径也带此人此刻的档名。
+  - 被别的开关**依赖**时，依赖者只看本开关的开/关，不看档名。
+- **冻结**：冻在开且当时定了档的人，拿**冻住那一刻的档名快照**（与冻住那一刻挂的
+  配置同口径），此后改档名/比例都不动他；重新冻但开/关没变也不刷新，想拿新档名需
+  先解冻。若冻住后把整开关的档清空，则与「没定档只回答开/关」一致，不再带
+  `variant`（历史重放冻结那一刻仍能还原当时档名）。
+- 定档同样支持建开关时直接带上、`effective_at` 预约定时生效、收进发布稿、预演、
+  跨环境推送（连同档名与比例一起推）与历史重放。整包、历史、预演的每个开关结果里，
+  定档且为开的那项带 `variant` 字段，其余没有这个键。
+
 ## 互斥组
 
 管理端可把多个开关编入同一互斥组（一个开关最多进一个组）。对同一身份，
@@ -306,7 +361,8 @@ GET '/api/bundle?identity=<用户身份>&attrs=<URL编码的JSON属性>&version=
 
 ## 定时生效（约个时间再生效）
 
-管理端改开关配置（全关 / 开关依赖 / 默认值 / 放量比例 / 放量条件 / 属性打开条件 / 描述）时，可以带一个
+管理端改开关配置（全关 / 开关依赖 / 默认值 / 放量比例 / 放量条件 / 放量规矩 /
+定档 / 属性打开条件 / 描述）时，可以带一个
 `effective_at`（unix 秒）把改动约到未来某个时刻生效：
 
 ```bash
@@ -367,7 +423,7 @@ curl -s -X POST http://localhost:8000/api/drafts/$DID/publish \
   保留记录（`GET /api/drafts?all=1`），但不能再改、再发布。
 - 稿里可收的字段与立即生效 PATCH 一致：`kill_switch`、`default_enabled`、
   `rollout_percent`、`rollout_condition`（`{}` 清放量条件）、`rollout_rules`
-  （`[]` 清放量规矩）、`targeting`
+  （`[]` 清放量规矩）、`variants`（`[]` 清档）、`targeting`
   （`{}` 清条件）、`depends_on`（`""`/`null` 解除）、
   `description`。**稿不支持 `effective_at`**：发布的一刻就是整稿的生效时刻。
 - 若稿里某个开关在发布前被删除，发布会被整稿拒绝（先把该开关的改动从稿里摘掉即可）。
@@ -434,8 +490,8 @@ curl -X POST http://localhost:8000/api/push \
 - **写了个没有的环境推不成**：源或目标环境不存在返回 404，并指明是哪一边；
   点名的开关在源里不存在同样 404 列出缺的，一个都不推。
 - **推成后**：目标环境里这些开关按源**此刻**的规则算（默认值 / 全关 / 放量比例 /
-  放量条件 / 放量规矩 / 属性打开条件 / 挂的配置 / 依赖，连同描述）；目标里没有的
-  开关就地新建。**没点名的还是目标自己的**，一个字段都不动。
+  放量条件 / 放量规矩 / 定档 / 属性打开条件 / 挂的配置 / 依赖，连同描述）；目标里
+  没有的开关就地新建。**没点名的还是目标自己的**，一个字段都不动。
 - **源一份都不被改掉**：源环境全程只读——规则、审计、历史、整包账本与版本，
   这次推送一律不碰。
 - **依赖按名字落到目标**：被依赖的开关必须在推送后的目标里存在（目标已有或这次
@@ -466,8 +522,8 @@ curl "http://localhost:8000/api/history?identity=u123&at=1789000000&attrs=%7B%22
   强制 > 属性 > 组 > 放量 > 默认）逐开关求值；组落定也按当时的记录还原——那一刻
   真查过的人按当时落定算，没查过的按「名字序首个自然开」确定性模拟（与整包同序）。
 - **配置是当时那份**：判开才带 `config`，判关（含全关、依赖关、强制关、没争到组、
-  放量未命中、默认关）不带；**冻住的人按冻住的算**，带冻住那一刻的配置快照，
-  全关期间同样不带。
+  放量未命中、默认关）不带；**冻住的人按冻住的算**，带冻住那一刻的配置快照与档名
+  快照，全关期间同样不带。定了档且为开的开关带当时的 `variant`。
 - **约了时间没到点的不算**：到点前问历史拿到的是旧值；到了点（哪怕还没有任何
   请求触发惰性应用）问历史就是新值；已取消的预约到点也不算。
 - **没发布的稿不算**：只有 `published_at <= at` 的发布稿参与重放，且稿里的改动
@@ -501,12 +557,14 @@ docker run -d -p 8000:8000 -e ADMIN_TOKEN=你的强随机串 \
 ```bash
 GET '/api/flags/<name>/check?identity=<用户身份>[&attrs=<URL编码的JSON属性>]'
 # => {"flag":"new-checkout","identity":"u123","enabled":true,"reason":"rollout"}
-#    reason ∈ kill_switch | freeze | depends_on | override | targeting | group | rollout | default，表示结果由哪一层决定
+#    reason ∈ kill_switch | freeze | depends_on | override | targeting | group | rollout | variants | default，表示结果由哪一层决定
+#    定了档且最终为开时还带 "variant":"<档名>"；没定档的开关永远没有 variant 键
 #    identity / attrs 需 URL 编码；identity 允许包含斜杠、空格、引号等任意字符
 #    attrs 必须是扁平 JSON 对象，值为标量（字符串/数字/布尔/null）；非法返回 400
 
 GET '/api/bundle?identity=<用户身份>[&attrs=<URL编码的JSON属性>][&version=<手中的整包版本>]'
 # => {"identity":"u123","version":"9f2c…","flags":{"new-checkout":{"enabled":true,"reason":"rollout"}, …}}
+#    定了档且为开的开关还带 "variant":"<档名>"；没定档的开关没有 variant 键
 #    带了 attrs 时响应多一个 attrs 字段；整包按 (身份, 属性) 分别记账
 #    带 version 时响应多一个 valid 字段：false 即该版本对此身属性已过期，响应里是新版本与新结果
 
@@ -523,13 +581,13 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 | POST | `/api/environments` | 创建环境 `{name}` |
 | POST | `/api/push` | 跨环境推送 `{source, target, flags}`（也接受 `from`/`to`）：把源环境此刻的规则推到目标；少写/环境没有/会成环都推不成并说明，源全程只读 |
 | GET | `/api/flags` | 列出所有开关 |
-| POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting, rollout_condition, rollout_rules}` |
-| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, rollout_condition, rollout_rules, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`rollout_condition` 为放量条件 JSON（`{}`/`null` 清除）；`rollout_rules` 为有序放量规矩列表（`[]`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |
+| POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting, rollout_condition, rollout_rules, variants}` |
+| PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, rollout_condition, rollout_rules, variants, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`rollout_condition` 为放量条件 JSON（`{}`/`null` 清除）；`rollout_rules` 为有序放量规矩列表（`[]`/`null` 清除）；`variants` 为定档列表 `[{"name","percent"}]`（档名非空不重复、比例 0-100、和必须恰好 100；`[]`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |
 | DELETE | `/api/flags/<name>` | 删除开关（其未生效的定时变更一并取消） |
 | GET | `/api/flags/<name>/overrides` | 列出单人强制 |
 | PUT | `/api/flags/<name>/overrides` | 设置 `{identity, enabled}` |
 | DELETE | `/api/flags/<name>/overrides` | 移除，body `{identity}` |
-| GET | `/api/flags/<name>/freezes` | 列出被冻住结果的人（冻住的值、冻住时的理由、操作人） |
+| GET | `/api/flags/<name>/freezes` | 列出被冻住结果的人（冻住的值、冻住时的理由、档名快照、操作人） |
 | PUT | `/api/flags/<name>/freezes` | 冻住某人此刻的结果，body `{identity}`；返回 `{changed, enabled, reason}`（重复冻且值未变则 `changed=false`） |
 | DELETE | `/api/flags/<name>/freezes` | 解冻，body `{identity}`；解冻后立即按当时规则求值 |
 | GET | `/api/groups` | 列出互斥组（含成员开关、`updated_by` 最近修改人） |

@@ -285,6 +285,8 @@ async function loadFlags() {
       badges.push('<span class="badge roll">条件放量</span>');
     if (f.rollout_rules && f.rollout_rules.length)
       badges.push(`<span class="badge roll">规矩×${f.rollout_rules.length}</span>`);
+    if (f.variants && f.variants.length)
+      badges.push(`<span class="badge on">定档×${f.variants.length}</span>`);
     if (f.targeting && Object.keys(f.targeting).length)
       badges.push('<span class="badge on">属性条件</span>');
     if (f.config != null) badges.push('<span class="badge on">挂配置</span>');
@@ -414,8 +416,23 @@ async function renderDetail() {
         不参与求值，清除后恢复。改任何一条的条件或比例都会让已发出的整包（含不带属性的包）换新版本。</div>
     </div>
 
+    <div class="layer on">
+      <h3>⑥˝ 定档（多档实验） <span class="prio">每档一个名字、一个比例，加起来必须刚好 100：来问的人按稳定分桶落进恰好一档，结果为开并带回这一档的名字；没定档的开关只回答开/关</span></h3>
+      <div class="row">
+        <input id="variantsCfg" type="text" style="flex:1"
+          placeholder='定档 JSON，如 [{"name":"对照","percent":50},{"name":"实验A","percent":30},{"name":"实验B","percent":20}]；[] 或留空后点「清除」=不定档'
+          value="${f.variants && f.variants.length ? esc(JSON.stringify(f.variants)) : ''}">
+        <button class="primary" onclick="setVariants()">保存档</button>
+        <button onclick="clearVariants()">清除</button>
+      </div>
+      <div class="muted">同一人对同一开关永远落同一档（只认开关与身份，与带不带属性无关）。<b>定了档后这一层对所有人定论为开、
+        带档名（variant 字段）</b>，上面的比例 / 放量条件 / 放量规矩与下面的默认值都不参与求值，清除后恢复。
+        改某一档的名字或比例（含增删、调序）立即按新的算：分桶不变、区间按新比例重划，改名只换带回去的名字；
+        任何一档改动都会让已发出的整包（含不带属性的包）换新版本。冻住的人一直拿冻住那一刻那档。</div>
+    </div>
+
     <div class="layer">
-      <h3>⑦ 默认值 <span class="prio">属性对不上且放量比例为 0 时兜底</span></h3>
+      <h3>⑦ 默认值 <span class="prio">没定档、属性对不上且放量比例为 0 时兜底</span></h3>
       <label><input type="checkbox" ${f.default_enabled ? 'checked' : ''}
         onchange="setDefault(this.checked)"> 默认开</label>
     </div>
@@ -430,7 +447,7 @@ async function renderDetail() {
         <button onclick="unstageFromDraft()">从稿里摘掉本开关</button>
         <span id="draftStaged" class="muted"></span>
       </div>
-      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 放量条件 / 放量规矩 / 属性条件 / 开关配置（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
+      <div class="muted">收进稿的字段：全关 / 默认开 / 放量比例 / 放量条件 / 放量规矩 / 定档 / 属性条件 / 开关配置（当前输入框的值）；稿不支持定时，发布时刻就是生效时刻。</div>
     </div>
 
     <div class="layer">
@@ -481,7 +498,7 @@ function populateDraftSelect() {
 
 const FIELD_NAMES = { kill_switch: '全关', default_enabled: '默认开',
                       rollout_percent: '放量比例', rollout_condition: '放量条件',
-                      rollout_rules: '放量规矩',
+                      rollout_rules: '放量规矩', variants: '定档',
                       description: '描述', targeting: '属性打开条件',
                       depends_on: '开关依赖', config: '开关配置' };
 
@@ -606,6 +623,16 @@ const setRolloutRules = async function() {
 };
 const clearRolloutRules = () => patch({ rollout_rules: [] });
 
+const setVariants = async function() {
+  let tiers;
+  const raw = $('variantsCfg').value.trim();
+  if (!raw) return toast('档为空：要清除请点「清除」', true);
+  try { tiers = JSON.parse(raw); } catch (e) { return toast('定档不是合法 JSON', true); }
+  if (!Array.isArray(tiers)) return toast('定档必须是 JSON 数组', true);
+  await patch({ variants: tiers });  // 服务端校验：名字非空不重复、比例 0-100、加起来恰好 100
+};
+const clearVariants = () => patch({ variants: [] });
+
 async function setFlagConfig() {
   const raw = $('flagConfig').value.trim();
   if (!raw) return toast('配置为空：不挂配置请点「清除」', true);
@@ -634,7 +661,8 @@ async function removeOverride(identity) {
 
 const REASON_NAMES = { kill_switch: '全关', freeze: '结果冻结', depends_on: '开关依赖',
                        override: '单人强制', targeting: '属性条件',
-                       group: '互斥组', rollout: '比例放量', default: '默认值' };
+                       group: '互斥组', rollout: '比例放量', variants: '定档',
+                       default: '默认值' };
 
 async function loadFreezes() {
   const body = $('fzBody');
@@ -652,8 +680,9 @@ async function loadFreezes() {
     tdReason.className = 'muted';
     const cfgTxt = z.config !== undefined && z.config !== null
       ? `，配置快照 ${JSON.stringify(z.config)}` : '';
+    const varTxt = z.variant ? `，档名快照 ${z.variant}` : '';
     tdReason.textContent = (REASON_NAMES[z.frozen_reason] || z.frozen_reason)
-      + (z.created_by ? `（${z.created_by} 冻的）` : '') + cfgTxt;
+      + (z.created_by ? `（${z.created_by} 冻的）` : '') + cfgTxt + varTxt;
     const tdBtn = document.createElement('td');
     const btn = document.createElement('button');
     btn.textContent = '解冻';
@@ -673,6 +702,7 @@ async function freezeResult() {
     $('fzIdentity').value = '';
     toast(r.changed
       ? `已冻住此刻结果：${r.enabled ? '开' : '关'}（${REASON_NAMES[r.reason] || r.reason}）`
+        + (r.variant ? `，档「${r.variant}」` : '')
       : '已经冻着同一个结果，未改动');
   } catch (e) { return toast('冻结失败：' + e.message, true); }
   loadAll();
@@ -705,6 +735,8 @@ async function checkIdentity() {
   $('checkResult').innerHTML = r.error ? esc(r.error)
     : `结果：<b style="color:${r.enabled ? 'var(--ok)' : 'var(--danger)'}">${r.enabled ? '开' : '关'}</b>
        <span class="muted">（由「${REASON_NAMES[r.reason] || r.reason}」层决定）</span>`
+       + (r.variant !== undefined
+          ? ` <span class="badge on">档：${esc(r.variant)}</span>` : '')
        + (r.config !== undefined
           ? `<div class="muted" style="margin-top:4px">配置：<code>${esc(JSON.stringify(r.config))}</code></div>` : '');
 }
@@ -725,6 +757,7 @@ function renderBundle(r) {
   const rows = Object.entries(r.flags).map(([name, v]) =>
     `<div>${esc(name)}：<b style="color:${v.enabled ? 'var(--ok)' : 'var(--danger)'}">` +
     `${v.enabled ? '开' : '关'}</b> <span class="muted">(${esc(v.reason)})</span>` +
+    (v.variant !== undefined ? ` <span class="badge on">档：${esc(v.variant)}</span>` : '') +
     (v.config !== undefined
       ? ` <span class="muted">配置：<code>${esc(JSON.stringify(v.config))}</code></span>` : '') +
     `</div>`).join('');
@@ -821,6 +854,7 @@ async function runPreviewDraft() {
 function fmtFlag(name, v) {
   return `${esc(name)}：<b style="color:${v.enabled ? 'var(--ok)' : 'var(--danger)'}">${v.enabled ? '开' : '关'}</b>`
     + ` <span class="muted">(${esc(v.reason)})</span>`
+    + (v.variant !== undefined ? ` <span class="badge on">档：${esc(v.variant)}</span>` : '')
     + (v.config !== undefined
        ? ` <span class="muted">配置：<code>${esc(JSON.stringify(v.config))}</code></span>` : '');
 }
@@ -1001,6 +1035,11 @@ async function stageToDraft() {
   if (rrRaw) {
     try { patch.rollout_rules = JSON.parse(rrRaw); }
     catch (e) { return toast('放量规矩不是合法 JSON，无法收入稿', true); }
+  }
+  const vrRaw = $('variantsCfg').value.trim();
+  if (vrRaw) {
+    try { patch.variants = JSON.parse(vrRaw); }
+    catch (e) { return toast('定档不是合法 JSON，无法收入稿', true); }
   }
   const cfgRaw = $('flagConfig').value.trim();
   if (cfgRaw) {

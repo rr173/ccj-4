@@ -17,13 +17,16 @@ SQLite 库，开关、配置、冻结、强制、互斥组、发布稿、定时�
     4. 单人强制（override）        -> 强制开 / 强制关
     5. 属性打开条件（targeting）   -> 来问带的属性全对上则开；对不上落到下面
     6. 互斥组（group）            -> 组内同一身份最多一个开
-    7. 比例放量（rollout）         -> 定了有序放量规矩（rollout_rules）时只看规矩：
+    7. 比例放量（rollout）         -> 定了档（variants）时这一层把人按档分完：
+       每档一个名字、一个比例，各档加起来恰好 100，谁来问都落进恰好一档，本层
+       定论为开并把这一档的名字带回去（reason=variants），没有「关」的余口；
+       没定档时，定了有序放量规矩（rollout_rules）只看规矩：
        从上往下第一条对上的按它的比例定论（命中开、未命中关），一条都对不上落到
        默认值；没定规矩时走单条比例（rollout_percent，可再定放量条件
        rollout_condition）：比例 > 0 时此层定论，命中开、未命中关；定了放量
        条件时只有来问属性对上条件的人走这一层，没对上的（含没带属性）直接落到
        默认值
-    8. 默认值（default_enabled）   -> 没启用放量（比例为 0 且没定规矩），或定了
+    8. 默认值（default_enabled）   -> 没定档、没启用放量（比例为 0 且没定规矩），或定了
        放量条件 / 规矩但来问属性一条都没对上时兜底
 
 结果冻结（freeze）：管理端可以把某个人对某个开关「此刻」的结果冻住。冻住时
@@ -89,6 +92,24 @@ SQLite 库，开关、配置、冻结、强制、互斥组、发布稿、定时�
 改任何一条的条件或比例（含增删、调序、清空）都让已发出的整包（含不带属性
 的包——走哪一层由规矩决定）换新版本，拿着改前那包来问算过期；没定规矩时
 它不参与求值，摘要保持没这功能时的原样。
+
+定档（variants）：管理端可以给一个开关定好几档，每档一个名字、一个比例
+（0-100 的整数），各档比例加起来必须恰好 100。定了档之后来问，放量层不再
+给「开/关」，而是按 sha256("{flag_name}:{identity}") % 100 的分桶把人落进
+恰好一档（按档的书写顺序累加比例划区间），最终结果为开，并把这一档的名字
+随 check / 整包带回去（variant 字段；reason=variants）——分桶只认开关与
+身份，同一人、同一身属性，问多少次、从哪台机器问都落同一档，与带不带属性
+无关。没定档（[] / null 清空）的开关仍然只回答开或关，响应里没有 variant
+这个键。定了档时这一层对所有人定论为开、不再落默认值；单条放量比例、放量
+条件与有序放量规矩都不参与求值（清空档后它们恢复）。全关、结果冻结、开关
+依赖、单人强制仍排在它前面：这些层判关时没有档名；单人强制开、属性打开
+条件、互斥组争胜这些「开」的路径也把此人此刻的档名一并带上（与由哪一层
+决定无关）。被别的开关依赖时，依赖者只看开/关，不看档名。改某一档的名字
+或比例（含增删、调序、清空）立即按新的算——分桶值不变、落的区间按新比例
+重划，改名不换桶、只换带回去的名字；档是所有人（含不带属性的包）的求值
+输入，任何一档改动都让已发整包换新版本，拿着改前那包来问算过期。冻住的人
+拿冻住那一刻的档名快照（与冻住那一刻挂的配置同口径），此后改档不动他；
+重新冻且开/关翻转才刷新，想拿新档名需先解冻。
 
 整包（bundle）：调用方带身份（可再带一身属性），一次拿走所有开关的开/关
 结果与整包版本。整包按 (身份, 属性) 分别记账：同一人带不同属性来拿是不同
@@ -185,6 +206,10 @@ CREATE TABLE IF NOT EXISTS flags (
     -- 有序放量规矩（canonical JSON 列表）：''=没定。定了之后放量层只看规矩：
     -- 来问时从上往下对，第一条对上的按它的比例分桶定论；一条都对不上落到默认值
     rollout_rules TEXT NOT NULL DEFAULT '',
+    -- 定档（canonical JSON 列表 [{name, percent}, …]）：''=没定档。定了之后
+    -- 放量层把所有人按分桶落进恰好一档（各档比例加起来必须 100），结果为开
+    -- 并带回档名；没定档时只回答开/关。改档立即按新比例/新名字算。
+    variants TEXT NOT NULL DEFAULT '',
     kill_switch     INTEGER NOT NULL DEFAULT 0,
     targeting_rule  TEXT NOT NULL DEFAULT '',  -- 属性打开条件（canonical JSON）；''=未定条件
     -- 开关挂的配置（canonical JSON）：''=没挂。开关对此人判开时，这份配置随
@@ -219,6 +244,9 @@ CREATE TABLE IF NOT EXISTS freezes (
     -- 冻住那一刻开关挂的配置快照（canonical JSON）：冻住在开的人此后
     -- 单查/整包都带这份；冻住在关则恒为 ''（不带）。全关期间也不带。
     frozen_config TEXT NOT NULL DEFAULT '',
+    -- 冻住那一刻此人落的档名快照（''=冻在关或当时开关没定档）：冻住在开且
+    -- 当时定了档的人此后带这份档名；改档名/比例不动他，想拿新档需先解冻。
+    frozen_variant TEXT NOT NULL DEFAULT '',
     created_by    TEXT NOT NULL DEFAULT '',
     created_at    REAL NOT NULL,
     UNIQUE(flag_id, identity)
@@ -470,6 +498,52 @@ def validate_rollout_rules(rules):
     return canonical_json(norm)
 
 
+def validate_variants(variants):
+    """校验「定档」，返回规范化 JSON 串（'' = 没定档）。
+
+    形式：[{"name": "对照", "percent": 50}, {"name": "实验", "percent": 50}]；
+    列表顺序即分桶区间的顺序（从上往下累加比例划区间）。每档要有一个非空
+    名字（允许任意字符，含空白，不做 strip）和一个 0-100 的整数比例；档名不
+    能重复；至少一档；各档比例加起来必须**恰好 100**（差一点都不收）。
+    比例为 0 的档合法（写出来先占位，谁也落不进去，之后可调大）。
+    None / [] 表示清除档（返回 ''）。非法抛 ValueError。
+    """
+    if variants is None:
+        return ""
+    if not isinstance(variants, list):
+        raise ValueError("variants must be a list of tiers"
+                         ' ({"name": "...", "percent": 0-100});'
+                         " use [] or null to clear")
+    if not variants:
+        return ""
+    if len(variants) > 100:
+        raise ValueError("variants: at most 100 tiers")
+    norm = []
+    names = set()
+    total = 0
+    for i, v in enumerate(variants):
+        where = f"variants[{i}]"
+        if not isinstance(v, dict) or set(v) != {"name", "percent"}:
+            raise ValueError(f"{where} must be an object with exactly"
+                             ' "name" and "percent"')
+        name = v["name"]
+        if not isinstance(name, str) or name == "":
+            raise ValueError(f"{where}.name must be a non-empty string")
+        if name in names:
+            raise ValueError(f"variants tier names must be unique"
+                             f" (duplicate name: {name!r})")
+        pct = v["percent"]
+        if isinstance(pct, bool) or not isinstance(pct, int) or not 0 <= pct <= 100:
+            raise ValueError(f"{where}.percent must be an int in [0,100]")
+        names.add(name)
+        total += pct
+        norm.append({"name": name, "percent": pct})
+    if total != 100:
+        raise ValueError(f"variants percents must sum to exactly 100"
+                         f" (got {total})")
+    return canonical_json(norm)
+
+
 def condition_dict_matches(cond, attrs):
     """条件（dict 形态）对不对得上来问属性：条件每个键都在属性里且值相等
     （列表值任一即可）。空条件 / 没带属性一律算对不上。"""
@@ -691,6 +765,10 @@ def _init_environment_schema(path):
     # 求值与整包摘要与升级前一字不差）
     if "rollout_rules" not in flag_cols:
         conn.execute("ALTER TABLE flags ADD COLUMN rollout_rules TEXT NOT NULL DEFAULT ''")
+    # 定档：flags 增加 variants（老库一律从没定档起步，求值与整包摘要与
+    # 升级前一字不差）
+    if "variants" not in flag_cols:
+        conn.execute("ALTER TABLE flags ADD COLUMN variants TEXT NOT NULL DEFAULT ''")
     # 开关依赖：flags 增加 depends_on_flag_id（老库一律从无依赖起步；
     # 不能在 ALTER 上加外键，但删除路径里同样会把指向已删开关的依赖置空）
     if "depends_on_flag_id" not in flag_cols:
@@ -703,6 +781,10 @@ def _init_environment_schema(path):
     freeze_cols = {r[1] for r in conn.execute("PRAGMA table_info(freezes)")}
     if "frozen_config" not in freeze_cols:
         conn.execute("ALTER TABLE freezes ADD COLUMN frozen_config TEXT NOT NULL DEFAULT ''")
+    # 定档：freezes 增加 frozen_variant（老的冻结行从空档名起步，与「冻住期间
+    # 改档不动冻住的人」一致；想拿档名需重新冻一次）
+    if "frozen_variant" not in freeze_cols:
+        conn.execute("ALTER TABLE freezes ADD COLUMN frozen_variant TEXT NOT NULL DEFAULT ''")
     # 整包按 (身份, 属性) 分别记账：把旧的「身份主键」整包表重建为复合主键，
     # 已发的老包原样保留（它们是不带属性的包，attrs_hash=''）
     pk = conn.execute("PRAGMA table_info(bundles)").fetchall()
@@ -743,6 +825,7 @@ def _init_environment_schema(path):
                         "rollout_percent": r["rollout_percent"],
                         "rollout_condition": r["rollout_condition"],
                         "rollout_rules": r["rollout_rules"],
+                        "variants": r["variants"],
                         "kill_switch": bool(r["kill_switch"]),
                         "targeting": r["targeting_rule"],
                         "config": r["flag_config"],
@@ -783,7 +866,8 @@ def _init_environment_schema(path):
                     (r["created_at"], r["fname"], r["identity"],
                      canonical_json({"enabled": bool(r["frozen_enabled"]),
                                      "reason": r["frozen_reason"],
-                                     "config": r["frozen_config"]}),
+                                     "config": r["frozen_config"],
+                                     "variant": r["frozen_variant"]}),
                      r["created_by"] or "system-migration"))
             for r in conn.execute("SELECT * FROM mutex_groups"):
                 conn.execute(
@@ -847,6 +931,7 @@ def flag_snapshot_payload(flag_row, dep_name=None):
         "rollout_percent": flag_row["rollout_percent"],
         "rollout_condition": flag_row["rollout_condition"],
         "rollout_rules": flag_row["rollout_rules"],
+        "variants": flag_row["variants"],
         "kill_switch": bool(flag_row["kill_switch"]),
         "targeting": flag_row["targeting_rule"],
         "config": flag_row["flag_config"],
@@ -877,6 +962,7 @@ def flag_to_dict(row, dep_name=None):
                               if row["rollout_condition"] else {}),
         "rollout_rules": (json.loads(row["rollout_rules"])
                           if row["rollout_rules"] else []),
+        "variants": (json.loads(row["variants"]) if row["variants"] else []),
         "kill_switch": bool(row["kill_switch"]),
         "targeting": json.loads(row["targeting_rule"]) if row["targeting_rule"] else {},
         "config": parse_flag_config(row["flag_config"]),
@@ -892,6 +978,23 @@ def bucket_of(flag_name, identity):
     """确定性分桶：同一 (flag, identity) 永远得到 0-99 中同一个数。"""
     digest = hashlib.sha256(f"{flag_name}:{identity}".encode("utf-8")).hexdigest()
     return int(digest, 16) % 100
+
+
+def variant_of(variants_json, flag_name, identity):
+    """定档分桶：按档的书写顺序累加比例划区间，返回此人此刻落的档名。
+
+    分桶值只认开关与身份（bucket_of）；档名/比例怎么改，桶值不变，落的区间
+    按新比例重划、带回去的名字按新档名给。没定档（''）返回 None。
+    """
+    if not variants_json:
+        return None
+    b = bucket_of(flag_name, identity)
+    upto = 0
+    for v in json.loads(variants_json):
+        upto += v["percent"]
+        if b < upto:
+            return v["name"]
+    return None  # 理论不可达：写入时各档比例和已校验为恰好 100
 
 
 def rollout_layer_verdict(name, identity, rollout_percent, rollout_condition_json,
@@ -926,45 +1029,58 @@ def group_of(db, flag_id):
 
 def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
              _skip_freeze_id=None):
-    """按固定优先级求值，返回 (enabled, reason, config)。
+    """按固定优先级求值，返回 (enabled, reason, config, variant)。
 
     config 是「此人此刻拿得到的开关配置」：只看最终开/关，与由哪一层决定
     无关——最终为开且开关挂了配置，就带上该配置（对象/数组/标量原样）；
     最终为关（全关、依赖关、强制关、组内没争到、放量未命中、默认关）或开关
     没挂配置，config 一律为 None（接口里不带这个键）。
 
+    variant 是「此人此刻落的档名」：只看最终开/关，与由哪一层决定无关——
+    最终为开且开关定了档，就带上档名（放量定档层按分桶落档；强制开 / 属性
+    命中 / 组内争胜这些开的路径也按同一分桶补算此人的档）；最终为关或开关
+    没定档，variant 一律为 None（接口里不带这个键）。冻在开且当时定了档的人
+    拿冻住那一刻的档名快照。
+
     attrs 为来问时带的属性（dict）。属性条件命中时这一层直接定论为开；
     对不上 / 没带属性 / 开关没定条件，都按原来的放量 / 默认值算。
-    放量层定了有序放量规矩（rollout_rules）时只看规矩：从上往下第一条
-    对上的按它的比例分桶定论；一条都对不上（含没带属性）不看任何比例，
-    直接落到默认值。没定规矩时走老路：放量层带放量条件（rollout_condition）
-    时，只有来问属性对上条件的人才按比例分桶；没对上的（含没带属性）不看
-    比例，直接落到默认值。
+    定了档（variants 非空）时，放量层把所有人按分桶落进恰好一档：本层定论
+    为开、带档名（reason=variants），不再看单条比例、放量条件、有序规矩与
+    默认值；没定档时放量层维持原来的开/关口径。
 
     结果冻结在全关之后、开关依赖之前：冻住后直接返回冻住那一刻的结果
     （reason=freeze），不再看依赖、强制、属性、组、放量与默认值；因此
     改依赖也救不回/压不掉冻住的值。冻在开的人同时拿到冻住那一刻挂着的
-    配置快照（frozen_config），此后改挂的配置不动他；冻在关则不带。
+    配置快照（frozen_config）与档名快照（frozen_variant），此后改挂的配置
+    或改档都不动他；冻在关则两者都不带。
     被别的开关依赖时，依赖者沿备忘拿到的就是这个冻住的结果。全关仍在更
-    前面，冻住也压不过全关（全关一律关、不带配置）。
+    前面，冻住也压不过全关（全关一律关、不带配置与档名）。
     _skip_freeze_id 仅供「重新冻住」时顶层使用：按假设此开关没冻的口径
     求它此刻的结果（沿依赖递归时被依赖开关的冻结照常生效）。
     依赖链上的结果在单次求值内备忘，保证链上每个开关只算一次、结果一致；
     成环在管理端写入时已拒绝，运行时再兜一层防环。
     """
-    def ret(enabled, reason, config_json=None):
-        """统一出口：开且挂了配置才随结果带配置；关一律不带。"""
+    _COMPUTE = object()  # 档名出口哨兵：没显式给档名时按当前分桶补算
+
+    def ret(enabled, reason, config_json=None, variant=_COMPUTE):
+        """统一出口：开且挂了配置才随结果带配置；关一律不带。
+        开且定了档才带档名；variant 没显式给（哨兵）时按当前分桶补算此人
+        的档，显式给 None（如档已清空的冻住结果）则不带。"""
         cfg = parse_flag_config(config_json) if enabled and config_json else None
-        return enabled, reason, cfg
+        if not enabled:
+            variant = None
+        elif variant is _COMPUTE:
+            variant = variant_of(flag["variants"], flag["name"], identity)
+        return enabled, reason, cfg, variant
 
     if flag["kill_switch"]:
         return ret(False, "kill_switch")
 
-    # 结果冻结：只认冻住那一刻存下的开/关（连同配置快照），此后其他层
+    # 结果冻结：只认冻住那一刻存下的开/关（连同配置与档名快照），此后其他层
     # 怎么改都不影响它。
     if _skip_freeze_id != flag["id"]:
         freeze = db.execute(
-            "SELECT frozen_enabled, frozen_config FROM freezes"
+            "SELECT frozen_enabled, frozen_config, frozen_variant FROM freezes"
             " WHERE flag_id=? AND identity=?",
             (flag["id"], identity),
         ).fetchone()
@@ -972,7 +1088,10 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
             enabled = bool(freeze["frozen_enabled"])
             if _memo is not None:
                 _memo[flag["id"]] = enabled
-            return ret(enabled, "freeze", freeze["frozen_config"])
+            # 档名快照只在此开关此刻仍定着档时才带回；档已清空则与「没定档
+            # 的开关只回答开/关」一致（快照仍留在库里，历史重放仍可还原）
+            frozen_variant = (freeze["frozen_variant"] or None) if flag["variants"] else None
+            return ret(enabled, "freeze", freeze["frozen_config"], frozen_variant)
 
     # 开关依赖：被依赖的开关对此人此身属性不是开，则必须关。
     # 对本开关的强制开排在依赖之后，救不回依赖关着的情形。
@@ -992,8 +1111,8 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
                 dep_enabled = _memo[dep_id]
             else:
                 next_chain = {flag["id"]} if _chain is None else _chain | {flag["id"]}
-                dep_enabled, _, _ = evaluate(db, dep_flag, identity, attrs,
-                                             _memo, next_chain)
+                dep_enabled, _, _, _ = evaluate(db, dep_flag, identity, attrs,
+                                                _memo, next_chain)
             if not dep_enabled:
                 if _memo is not None:
                     _memo[flag["id"]] = False
@@ -1009,10 +1128,15 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
             _memo[flag["id"]] = enabled
         return ret(enabled, "override", flag["flag_config"])
 
-    # 属性打开条件：来问属性全对上则开，且不落到放量 / 默认值
+    # 属性打开条件：来问属性全对上则开，且不落到定档 / 放量 / 默认值
     if targeting_matches(flag["targeting_rule"], attrs):
         natural = True
         reason = "targeting"
+    # 定档：定了档时这一层把所有人按分桶落进恰好一档，定论为开并带档名
+    # （reason=variants），不再往下落放量 / 默认值。
+    elif flag["variants"]:
+        natural = True
+        reason = "variants"
     else:
         # 放量层：定了有序规矩只看规矩（从上往下第一条对上的定论，都对不上
         # 落默认）；没定规矩走老路（比例 > 0 且过了放量条件的门才定论，
@@ -1095,16 +1219,21 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
     走都由规矩决定，因此是所有人（含不带属性的包）的求值输入：改任何一条的
     条件或比例（含增删、调序、清空），所有已发整包都换新版本；没定规矩
     （''）时不进摘要（摘要保持没这功能时的原样）。
-    冻住的开关对此人只认 freezes 行：它的默认值/放量/属性条件/依赖边/单人强制
-    在冻住期间都不参与求值，因此这些改动不进此人的摘要（不换版本），它挂的
-    配置也只认冻住那一刻的快照 frozen_config；它的全关仍压过冻结，所以全关
-    字段保留，冻住期间开全关仍让包换版本。
+    定档（variants）：定了档时放量层只看档（对所有人定论为开并带档名），
+    单条比例/放量条件/放量规矩与默认值都不参与求值——因此定档开关的默认值、
+    放量比例在摘要里恒为中性值，档本身（名字+比例，顺序敏感）是所有人
+    （含不带属性的包）的求值输入：改任何一档的名字或比例（含增删、调序、
+    清空），所有已发整包都换新版本；没定档（''）时不进摘要。
+    冻住的开关对此人只认 freezes 行：它的默认值/放量/档/属性条件/依赖边/
+    单人强制在冻住期间都不参与求值，因此这些改动不进此人的摘要（不换版本），
+    它挂的配置与档名也只认冻住那一刻的快照 frozen_config / frozen_variant；
+    它的全关仍压过冻结，所以全关字段保留，冻住期间开全关仍让包换版本。
     与求值无关的字段（如描述、时间戳）不影响摘要；只与别人相关的改动
     （如给他人的单人强制）也不影响此身份的摘要。
     """
     flags = db.execute(
         "SELECT name, default_enabled, rollout_percent, rollout_condition,"
-        " rollout_rules, kill_switch, targeting_rule, flag_config"
+        " rollout_rules, variants, kill_switch, targeting_rule, flag_config"
         " FROM flags ORDER BY name"
     ).fetchall()
     overrides = db.execute(
@@ -1113,7 +1242,8 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
         (identity,),
     ).fetchall()
     freezes = db.execute(
-        "SELECT f.name, z.frozen_enabled, z.frozen_config FROM freezes z"
+        "SELECT f.name, z.frozen_enabled, z.frozen_config, z.frozen_variant"
+        " FROM freezes z"
         " JOIN flags f ON f.id = z.flag_id WHERE z.identity=? ORDER BY f.name",
         (identity,),
     ).fetchall()
@@ -1134,15 +1264,21 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
         "identity": identity,
         # 冻住的开关：默认值/放量在冻住期间不参与求值，摘要里恒为中性值，
         # 全关仍压过冻结、照常参与，故保留真实值。
+        # 定档开关：默认值/放量比例被档层取代（恒为中性值），档本身在下面
+        # 以标记元素追加。
         "flags": [[r["name"],
-                   False if r["name"] in frozen_names else bool(r["default_enabled"]),
-                   0 if r["name"] in frozen_names else r["rollout_percent"],
+                   False if (r["name"] in frozen_names or r["variants"])
+                   else bool(r["default_enabled"]),
+                   0 if (r["name"] in frozen_names or r["variants"])
+                   else r["rollout_percent"],
                    bool(r["kill_switch"])] for r in flags],
         # 冻住的开关不看单人强制，给它的强制不进摘要
         "overrides": [[r["name"], bool(r["enabled"])] for r in overrides
                       if r["name"] not in frozen_names],
-        # 冻住的开关：第三个元素是冻住那一刻挂着的配置快照（冻在关时为 ''）
-        "freezes": [[r["name"], bool(r["frozen_enabled"]), r["frozen_config"]]
+        # 冻住的开关：第三个元素是冻住那一刻挂着的配置快照（冻在关时为 ''），
+        # 第四个元素是冻住那一刻的档名快照（没有档/冻在关时为 ''）
+        "freezes": [[r["name"], bool(r["frozen_enabled"]), r["frozen_config"],
+                     r["frozen_variant"]]
                     for r in freezes],
         "groups": [[r["g"], r["f"]] for r in members],
         "assignments": [[r["g"], r["f"]] for r in assignments],
@@ -1185,19 +1321,28 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
     # 放量条件：比例 > 0 且定了条件时进所有人的摘要（含不带属性的包——没对上
     # 的人被它挡去默认值层，走哪一层由它决定，所以它也是这些人的求值输入）。
     # 以标记元素追加在属性条件位之后，与属性打开条件区分开；没定条件、比例为
-    # 0 或开关被冻住时不进摘要（摘要保持没这功能时的原样）。
+    # 0、开关被冻住或定了档时不进摘要（定了档时这些字段不参与求值）。
     for i, r in enumerate(flags):
-        if (r["name"] not in frozen_names and r["rollout_percent"] > 0
-                and r["rollout_condition"]):
+        if (r["name"] not in frozen_names and not r["variants"]
+                and r["rollout_percent"] > 0 and r["rollout_condition"]):
             payload["flags"][i] = payload["flags"][i] + [
                 ["rollout_condition", json.loads(r["rollout_condition"])]]
     # 有序放量规矩：定了规矩时进所有人的摘要（含不带属性的包——走哪一层、按
-    # 哪条的比例走都由规矩决定）。以标记元素追加在放量条件位之后；没定规矩或
-    # 开关被冻住时不进摘要（摘要保持没这功能时的原样）。
+    # 哪条的比例走都由规矩决定）。以标记元素追加在放量条件位之后；没定规矩、
+    # 开关被冻住或定了档时不进摘要（定了档时规矩不参与求值）。
     for i, r in enumerate(flags):
-        if r["name"] not in frozen_names and r["rollout_rules"]:
+        if (r["name"] not in frozen_names and not r["variants"]
+                and r["rollout_rules"]):
             payload["flags"][i] = payload["flags"][i] + [
                 ["rollout_rules", json.loads(r["rollout_rules"])]]
+    # 定档：定了档时档是所有人（含不带属性的包）的求值输入——改任何一档的
+    # 名字或比例（含增删、调序、清空）都让整包换新版本。以标记元素追加在
+    # 放量规矩位之后；没定档或开关被冻住时不进摘要（冻住的人只认 freezes 里
+    # 的档名快照）。
+    for i, r in enumerate(flags):
+        if r["name"] not in frozen_names and r["variants"]:
+            payload["flags"][i] = payload["flags"][i] + [
+                ["variants", json.loads(r["variants"])]]
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
@@ -1224,10 +1369,12 @@ def compute_bundle(db, identity, attrs=None):
     results = {}
     memo = {}
     for flag in flags:
-        enabled, reason, config = evaluate(db, flag, identity, attrs, memo)
+        enabled, reason, config, variant = evaluate(db, flag, identity, attrs, memo)
         item = {"enabled": enabled, "reason": reason}
         if config is not None:
             item["config"] = config
+        if variant is not None:
+            item["variant"] = variant
         results[flag["name"]] = item
     return results, bundle_content_hash(db, identity, attrs, results)
 
@@ -1280,6 +1427,7 @@ def record_invalidations(db, actor_name, change):
 _HIST_RANK = {"imm": 0, "sched": 1, "draft": 2}
 _FLAG_DEFAULT = {"default_enabled": False, "rollout_percent": 0,
                  "rollout_condition": "", "rollout_rules": "",
+                 "variants": "",
                  "kill_switch": False, "targeting": "",
                  "config": "", "depends_on": ""}
 
@@ -1306,6 +1454,10 @@ def _normalize_replay_patch(changes):
         v = changes["rollout_rules"]
         patch["rollout_rules"] = (v if isinstance(v, str)
                                   else validate_rollout_rules(v))
+    if "variants" in changes:
+        v = changes["variants"]
+        patch["variants"] = (v if isinstance(v, str)
+                             else validate_variants(v))
     if "targeting" in changes:
         v = changes["targeting"]
         patch["targeting"] = v if isinstance(v, str) else validate_targeting(v)
@@ -1329,8 +1481,8 @@ def replay_state(db, identity, at, attrs=None):
 
     返回 dict：
       flags:  name -> {default_enabled, rollout_percent, rollout_condition(串),
-                       rollout_rules(串), kill_switch, targeting(串), config(串),
-                       depends_on(名字串)}
+                       rollout_rules(串), variants(串), kill_switch, targeting(串),
+                       config(串), depends_on(名字串)}
       overrides/frozen: (flag_name, identity) -> ...
       groups: name -> set(成员 flag)；assignments: 组名 -> 落定 flag
     """
@@ -1415,6 +1567,7 @@ def replay_state(db, identity, at, attrs=None):
             frozen[(subject, identity)] = {
                 "enabled": bool(payload["enabled"]),
                 "config": payload.get("config", ""),
+                "variant": payload.get("variant", ""),
             }
         elif ev_kind == "freeze_delete" and ev_identity == identity:
             frozen.pop((subject, identity), None)
@@ -1440,21 +1593,27 @@ def replay_state(db, identity, at, attrs=None):
 
 
 def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
-    """按固定优先级在重放状态上求一个开关的值，返回 (enabled, reason, config)。
+    """按固定优先级在重放状态上求一个开关的值，返回 (enabled, reason, config, variant)。
 
-    与线上 evaluate 同一套口径（全关 > 冻结 > 依赖 > 强制 > 属性 > 组 >
-    放量 > 默认），区别只是输入来自 replay_state 的内存状态、且组落定不写库：
-    那一刻已经落定过（assginments 里有）就按落定算；没落定过就按名字序模拟
-    ——与「那一刻整包来问」时 compute_bundle 按 name 序求值、首个自然开的
-    组内开关落定的行为一字不差。
+    与线上 evaluate 同一套口径（全关 > 冻结 > 依赖 > 强制 > 定档 > 属性 >
+    组 > 放量 > 默认），区别只是输入来自 replay_state 的内存状态、且组落定不
+    写库：那一刻已经落定过（assginments 里有）就按落定算；没落定过就按名字
+    序模拟——与「那一刻整包来问」时 compute_bundle 按 name 序求值、首个自然
+    开的组内开关落定的行为一字不差。
     """
-    def ret(enabled, reason, config_json=""):
+    _COMPUTE = object()  # 与线上 evaluate 同口径的档名出口哨兵
+
+    def ret(enabled, reason, config_json="", variant=_COMPUTE):
         cfg = parse_flag_config(config_json) if enabled and config_json else None
-        return enabled, reason, cfg
+        if not enabled:
+            variant = None
+        elif variant is _COMPUTE:
+            variant = variant_of(flag["variants"], name, identity)
+        return enabled, reason, cfg, variant
 
     flag = state["flags"].get(name)
     if flag is None:
-        return False, "default", None  # 理论不可达：整包只遍历当时存在的开关
+        return False, "default", None, None  # 理论不可达：整包只遍历当时存在的开关
 
     if flag["kill_switch"]:
         return ret(False, "kill_switch")
@@ -1463,7 +1622,9 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
     if fz is not None:
         if _memo is not None:
             _memo[name] = fz["enabled"]
-        return ret(fz["enabled"], "freeze", fz["config"])
+        # 与线上 evaluate 同一口径：档在那一刻已清空则不带档名
+        fz_variant = fz.get("variant") or None if flag.get("variants") else None
+        return ret(fz["enabled"], "freeze", fz["config"], fz_variant)
 
     dep = flag["depends_on"]
     if dep and dep in state["flags"]:
@@ -1473,8 +1634,8 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
             dep_enabled = _memo[dep]
         else:
             next_chain = {name} if _chain is None else _chain | {name}
-            dep_enabled, _, _ = evaluate_at(state, dep, identity, attrs,
-                                            _memo, next_chain)
+            dep_enabled, _, _, _ = evaluate_at(state, dep, identity, attrs,
+                                               _memo, next_chain)
         if not dep_enabled:
             if _memo is not None:
                 _memo[name] = False
@@ -1489,6 +1650,8 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
 
     if targeting_matches(flag["targeting"], attrs):
         natural, reason = True, "targeting"
+    elif flag.get("variants"):
+        natural, reason = True, "variants"
     else:
         verdict = rollout_layer_verdict(
             name, identity, flag["rollout_percent"], flag["rollout_condition"],
@@ -1524,10 +1687,13 @@ def compute_history_bundle(db, identity, at, attrs=None):
     results = {}
     memo = {}
     for name in sorted(state["flags"]):
-        enabled, reason, config = evaluate_at(state, name, identity, attrs, memo)
+        enabled, reason, config, variant = evaluate_at(
+            state, name, identity, attrs, memo)
         item = {"enabled": enabled, "reason": reason}
         if config is not None:
             item["config"] = config
+        if variant is not None:
+            item["variant"] = variant
         results[name] = item
     return results
 
@@ -1760,21 +1926,23 @@ def push_flags():
             cur = db.execute(
                 "UPDATE flags SET description=?, default_enabled=?,"
                 " rollout_percent=?, rollout_condition=?, rollout_rules=?,"
-                " kill_switch=?, targeting_rule=?, flag_config=?, updated_at=?"
+                " variants=?, kill_switch=?, targeting_rule=?, flag_config=?,"
+                " updated_at=?"
                 " WHERE name=?",
                 (s["description"], s["default_enabled"], s["rollout_percent"],
-                 s["rollout_condition"], s["rollout_rules"], s["kill_switch"],
+                 s["rollout_condition"], s["rollout_rules"], s["variants"],
+                 s["kill_switch"],
                  s["targeting_rule"], s["flag_config"], now, n))
             if cur.rowcount == 0:
                 db.execute(
                     "INSERT INTO flags (name, description, default_enabled,"
                     " rollout_percent, rollout_condition, rollout_rules,"
-                    " kill_switch, targeting_rule, flag_config, created_at,"
-                    " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " variants, kill_switch, targeting_rule, flag_config,"
+                    " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (n, s["description"], s["default_enabled"],
                      s["rollout_percent"], s["rollout_condition"],
-                     s["rollout_rules"], s["kill_switch"], s["targeting_rule"],
-                     s["flag_config"], now, now))
+                     s["rollout_rules"], s["variants"], s["kill_switch"],
+                     s["targeting_rule"], s["flag_config"], now, now))
                 created.append(n)
             else:
                 updated.append(n)
@@ -1830,7 +1998,7 @@ def check(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
-    enabled, reason, config = evaluate(db, flag, identity, attrs)
+    enabled, reason, config, variant = evaluate(db, flag, identity, attrs)
     body = {
         "flag": name,
         "identity": identity,
@@ -1840,6 +2008,9 @@ def check(name):
     # 开才带开关挂的配置（冻住的人拿冻住那一刻那份）；关不带这个键
     if config is not None:
         body["config"] = config
+    # 定了档且最终为开才带档名（没定档的开关只回答开/关，没有这个键）
+    if variant is not None:
+        body["variant"] = variant
     if attrs is not None:
         body["attrs"] = attrs
     return jsonify(body)
@@ -1977,6 +2148,10 @@ def create_flag():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     try:
+        variants_json = validate_variants(body.get("variants"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
         config_json = validate_config(body.get("config"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1984,10 +2159,12 @@ def create_flag():
     default_enabled = 1 if body.get("default_enabled") else 0
     cur = db.execute(
         "INSERT INTO flags (name, description, default_enabled, targeting_rule,"
-        " rollout_condition, rollout_rules, flag_config, created_at, updated_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?)",
+        " rollout_condition, rollout_rules, variants, flag_config,"
+        " created_at, updated_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
         (name, body.get("description", ""), default_enabled, targeting_json,
-         rollout_condition_json, rollout_rules_json, config_json, now, now),
+         rollout_condition_json, rollout_rules_json, variants_json, config_json,
+         now, now),
     )
     audit(actor(), name, "default", "create_flag",
           f"default_enabled={bool(default_enabled)}"
@@ -1995,6 +2172,7 @@ def create_flag():
           + (f" rollout_condition={rollout_condition_json}"
              if rollout_condition_json else "")
           + (f" rollout_rules={rollout_rules_json}" if rollout_rules_json else "")
+          + (f" variants={variants_json}" if variants_json else "")
           + (f" config={config_json}" if config_json else ""))
     # 历史流水：新建即一条全量快照（不依赖任何开关）
     record_history(
@@ -2002,6 +2180,7 @@ def create_flag():
         payload={"default_enabled": bool(default_enabled), "rollout_percent": 0,
                  "rollout_condition": rollout_condition_json,
                  "rollout_rules": rollout_rules_json,
+                 "variants": variants_json,
                  "kill_switch": False, "targeting": targeting_json,
                  "config": config_json, "depends_on": ""})
     db.commit()
@@ -2011,7 +2190,8 @@ def create_flag():
 
 # 可预约定时生效的开关字段（与 PATCH 立即生效支持的字段一致）
 SCHEDULABLE_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
-                      "rollout_condition", "rollout_rules", "description",
+                      "rollout_condition", "rollout_rules", "variants",
+                      "description",
                       "targeting", "depends_on", "config")
 
 
@@ -2050,7 +2230,8 @@ def validate_depends_on(db, flag, raw):
 
 def apply_flag_fields(db, flag, body):
     """把 kill_switch / default_enabled / rollout_percent / rollout_condition /
-    rollout_rules / description / targeting / depends_on / config 写到开关上。
+    rollout_rules / variants / description / targeting / depends_on / config
+    写到开关上。
 
     立即生效与定时生效到点应用共用这一段。返回 (changes, error)：
     changes 是 (layer, action, detail) 列表（值没变的字段不在列）；
@@ -2126,6 +2307,20 @@ def apply_flag_fields(db, flag, body):
                 changes.append(("rollout", "clear_rollout_rules",
                                 "rollout_rules removed"
                                 f" (was {flag['rollout_rules']})"))
+    if "variants" in body:
+        try:
+            new_variants = validate_variants(body["variants"])
+        except ValueError as e:
+            return None, str(e)
+        if new_variants != flag["variants"]:
+            db.execute("UPDATE flags SET variants=?, updated_at=? WHERE id=?",
+                       (new_variants, time.time(), flag["id"]))
+            if new_variants:
+                changes.append(("rollout", "set_variants",
+                                f"variants={new_variants}"))
+            else:
+                changes.append(("rollout", "clear_variants",
+                                f"variants removed (was {flag['variants']})"))
     if "config" in body:
         try:
             new_config = validate_config(body["config"])
@@ -2180,7 +2375,8 @@ def schedule_flag_change(db, flag, body, effective_at):
     if not payload:
         return jsonify({"error": "nothing to schedule"
                                  " (no kill_switch/default_enabled/rollout_percent"
-                                 "/rollout_condition/rollout_rules/description"
+                                 "/rollout_condition/rollout_rules/variants"
+                                 "/description"
                                  "/depends_on/config given)"}), 400
     # 与立即生效同一套校验，避免约了一个到点应用不了的值
     if "rollout_percent" in payload:
@@ -2200,6 +2396,11 @@ def schedule_flag_change(db, flag, body, effective_at):
     if "rollout_rules" in payload:
         try:
             validate_rollout_rules(payload["rollout_rules"])
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+    if "variants" in payload:
+        try:
+            validate_variants(payload["variants"])
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
     if "config" in payload:
@@ -2428,9 +2629,10 @@ def delete_override(name):
 
 def freeze_result(db, flag, identity):
     """冻住时按当前完整规则求一次「此刻」的结果（不带属性口径），
-    返回 (enabled, reason, config)。跳过本开关已有的冻结行——重新冻同一个人时，
-    冻住的是「假如现在解冻会算出的结果」；被依赖开关的冻结照常生效。
-    config 即此人此刻判开时开关挂的配置（冻住后按这份快照下发），判关为 None。"""
+    返回 (enabled, reason, config, variant)。跳过本开关已有的冻结行——重新冻
+    同一个人时，冻住的是「假如现在解冻会算出的结果」；被依赖开关的冻结照常
+    生效。config 即此人此刻判开时开关挂的配置（冻住后按这份快照下发），
+    判关为 None；variant 同理为此刻落的档名，判关或没定档为 None。"""
     return evaluate(db, flag, identity, None,
                     _skip_freeze_id=flag["id"])
 
@@ -2444,13 +2646,15 @@ def list_freezes(name):
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
     rows = db.execute(
-        "SELECT identity, frozen_enabled, frozen_reason, frozen_config, created_by, created_at"
+        "SELECT identity, frozen_enabled, frozen_reason, frozen_config,"
+        " frozen_variant, created_by, created_at"
         " FROM freezes WHERE flag_id=? ORDER BY identity", (flag["id"],),
     ).fetchall()
     return jsonify([
         {"identity": r["identity"], "enabled": bool(r["frozen_enabled"]),
          "frozen_reason": r["frozen_reason"],
          "config": json.loads(r["frozen_config"]) if r["frozen_config"] else None,
+         "variant": r["frozen_variant"] or None,
          "created_by": r["created_by"],
          "created_at": r["created_at"]}
         for r in rows
@@ -2475,38 +2679,45 @@ def put_freeze(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
-    enabled, reason, config = freeze_result(db, flag, identity)
+    enabled, reason, config, variant = freeze_result(db, flag, identity)
     now = time.time()
     existing = db.execute(
-        "SELECT frozen_enabled, frozen_config FROM freezes"
+        "SELECT frozen_enabled, frozen_config, frozen_variant FROM freezes"
         " WHERE flag_id=? AND identity=?",
         (flag["id"], identity),
     ).fetchone()
     if existing is not None and bool(existing["frozen_enabled"]) == enabled:
-        # 冻住的开/关没变就是 no-op：值、理由、配置快照都不刷新（与「冻住后
-        # 雷打不动」一致，想拿新配置需先解冻），不产生失效记录。
+        # 冻住的开/关没变就是 no-op：值、理由、配置与档名快照都不刷新（与
+        # 「冻住后雷打不动」一致，想拿新配置/新档名需先解冻），不产生失效
+        # 记录。
         return jsonify({"ok": True, "changed": False, "enabled": enabled,
                         "reason": reason})
-    # 第一次冻，或重新冻把结果从开冻成关 / 从关冻成开：此刻挂着的配置一并
-    # 快照——冻在开带这份（没挂为 ''），冻在关为 ''（关不带配置）。
+    # 第一次冻，或重新冻把结果从开冻成关 / 从关冻成开：此刻挂着的配置与
+    # 档名一并快照——冻在开带这两份（没挂 / 没定档为 ''），冻在关为 ''
+    # （关不带配置与档名）。
     config_json = flag["flag_config"] if enabled else ""
+    variant_name = variant if enabled and variant is not None else ""
     db.execute(
         "INSERT INTO freezes (flag_id, identity, frozen_enabled, frozen_reason,"
-        " frozen_config, created_by, created_at) VALUES (?,?,?,?,?,?,?)"
+        " frozen_config, frozen_variant, created_by, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?)"
         " ON CONFLICT(flag_id, identity) DO UPDATE SET"
         " frozen_enabled=excluded.frozen_enabled,"
         " frozen_reason=excluded.frozen_reason,"
         " frozen_config=excluded.frozen_config,"
+        " frozen_variant=excluded.frozen_variant,"
         " created_by=excluded.created_by,"
         " created_at=excluded.created_at",
         (flag["id"], identity, 1 if enabled else 0, reason, config_json,
-         actor(), now),
+         variant_name, actor(), now),
     )
     audit(actor(), name, "freeze", "freeze_result",
-          f"identity={identity} enabled={enabled} reason={reason}")
+          f"identity={identity} enabled={enabled} reason={reason}"
+          + (f" variant={variant_name}" if variant_name else ""))
     record_history(db, now, "freeze", subject=name, identity=identity,
                    payload={"enabled": bool(enabled), "reason": reason,
-                            "config": config_json},
+                            "config": config_json,
+                            "variant": variant_name},
                    actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
@@ -2514,6 +2725,8 @@ def put_freeze(name):
     body = {"ok": True, "changed": True, "enabled": enabled, "reason": reason}
     if config is not None:
         body["config"] = config
+    if variant is not None:
+        body["variant"] = variant
     return jsonify(body)
 
 
@@ -2595,7 +2808,7 @@ def cancel_scheduled_change(change_id):
 # 稿里允许收的开关字段（与立即生效 PATCH 支持的字段一致，但不含 effective_at：
 # 稿在发布的一刻统一生效，不能再约时间）
 DRAFT_FIELDS = ("kill_switch", "default_enabled", "rollout_percent",
-                "rollout_condition", "rollout_rules", "description",
+                "rollout_condition", "rollout_rules", "variants", "description",
                 "targeting", "depends_on", "config")
 
 
@@ -2627,6 +2840,8 @@ def normalize_patch(db, body):
     if "rollout_rules" in body:
         out["rollout_rules"] = validate_rollout_rules(
             body["rollout_rules"])  # "" = 清除放量规矩
+    if "variants" in body:
+        out["variants"] = validate_variants(body["variants"])  # "" = 清除档
     if "config" in body:
         out["config"] = validate_config(body["config"])  # "" = 清除配置
     if "kill_switch" in body:
@@ -2657,6 +2872,8 @@ def draft_change_to_dict(ch):
     if "rollout_rules" in out:
         out["rollout_rules"] = (json.loads(out["rollout_rules"])
                                 if out["rollout_rules"] else [])
+    if "variants" in out:
+        out["variants"] = json.loads(out["variants"]) if out["variants"] else []
     if "config" in out:
         out["config"] = json.loads(out["config"]) if out["config"] else None
     for k in ("kill_switch", "default_enabled"):
@@ -2792,6 +3009,17 @@ def apply_patch_to_flag(db, flag, ch, now):
                 changes.append(("rollout", "clear_rollout_rules",
                                 "rollout_rules removed"
                                 f" (was {flag['rollout_rules']})"))
+    if "variants" in ch:
+        new_variants = ch["variants"]
+        if new_variants != flag["variants"]:
+            db.execute("UPDATE flags SET variants=?, updated_at=? WHERE id=?",
+                       (new_variants, now, fid))
+            if new_variants:
+                changes.append(("rollout", "set_variants",
+                                f"variants={new_variants}"))
+            else:
+                changes.append(("rollout", "clear_variants",
+                                f"variants removed (was {flag['variants']})"))
     if "config" in ch:
         new_config = ch["config"]
         if new_config != flag["flag_config"]:
@@ -2905,7 +3133,8 @@ def stage_draft_change(draft_id, name):
     if not patch:
         return jsonify({"error": "nothing to stage"
                                  " (kill_switch/default_enabled/rollout_percent"
-                                 "/rollout_condition/rollout_rules/description"
+                                 "/rollout_condition/rollout_rules/variants"
+                                 "/description"
                                  "/targeting/depends_on/config)"}), 400
     row = db.execute(
         "SELECT changes FROM draft_changes WHERE draft_id=? AND flag_name=?",
@@ -3049,6 +3278,7 @@ def snapshot_current_state(db, identity):
             "rollout_percent": r["rollout_percent"],
             "rollout_condition": r["rollout_condition"],
             "rollout_rules": r["rollout_rules"],
+            "variants": r["variants"],
             "kill_switch": bool(r["kill_switch"]),
             "targeting": r["targeting_rule"],
             "config": r["flag_config"],
@@ -3061,10 +3291,14 @@ def snapshot_current_state(db, identity):
         overrides[(r["fname"], identity)] = bool(r["enabled"])
     frozen = {}
     for r in db.execute(
-            "SELECT f.name AS fname, z.frozen_enabled, z.frozen_config FROM freezes z"
+            "SELECT f.name AS fname, z.frozen_enabled, z.frozen_config,"
+            " z.frozen_variant FROM freezes z"
             " JOIN flags f ON f.id=z.flag_id WHERE z.identity=?", (identity,)):
-        frozen[(r["fname"], identity)] = {"enabled": bool(r["frozen_enabled"]),
-                                          "config": r["frozen_config"]}
+        frozen[(r["fname"], identity)] = {
+            "enabled": bool(r["frozen_enabled"]),
+            "config": r["frozen_config"],
+            "variant": r["frozen_variant"],
+        }
     groups = {}
     for r in db.execute(
             "SELECT g.name AS gname, f.name AS fname FROM group_members m"
@@ -3090,10 +3324,13 @@ def evaluate_state_bundle(state, identity, attrs=None):
     results = {}
     memo = {}
     for name in sorted(state["flags"]):
-        enabled, reason, config = evaluate_at(state, name, identity, attrs, memo)
+        enabled, reason, config, variant = evaluate_at(
+            state, name, identity, attrs, memo)
         item = {"enabled": enabled, "reason": reason}
         if config is not None:
             item["config"] = config
+        if variant is not None:
+            item["variant"] = variant
         results[name] = item
     return results
 
@@ -3117,6 +3354,8 @@ def apply_patch_to_state(state, flag_name, patch):
         flag["rollout_condition"] = patch["rollout_condition"]
     if "rollout_rules" in patch:
         flag["rollout_rules"] = patch["rollout_rules"]
+    if "variants" in patch:
+        flag["variants"] = patch["variants"]
     if "targeting" in patch:
         flag["targeting"] = patch["targeting"]
     if "config" in patch:
@@ -3193,7 +3432,8 @@ def preview():
         if not patch:
             return jsonify({"error": "nothing to preview (no kill_switch"
                                      "/default_enabled/rollout_percent"
-                                     "/rollout_condition/rollout_rules/description"
+                                     "/rollout_condition/rollout_rules/variants"
+                                     "/description"
                                      "/targeting/depends_on/config given)"}), 400
         # 与立即生效 PATCH 同一口径：依赖目标要存在、自依赖与成环直接拒
         if "depends_on" in patch:
@@ -3243,7 +3483,8 @@ def preview():
         changed = [n for n in current
                    if current[n]["enabled"] != after[n]["enabled"]
                    or current[n]["reason"] != after[n]["reason"]
-                   or current[n].get("config") != after[n].get("config")]
+                   or current[n].get("config") != after[n].get("config")
+                   or current[n].get("variant") != after[n].get("variant")]
         people[ident] = {"current": current, "preview": after, "changed": changed}
 
     out = dict(mode)
