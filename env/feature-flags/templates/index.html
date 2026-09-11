@@ -89,6 +89,12 @@
       <div id="groupList"></div>
     </div>
     <div class="card" style="margin-bottom:16px">
+      <h2>身份合并 <span class="muted" style="font-weight:normal">把几个身份收成同一个人：用其中任何一个来问，每个开关都按同一个人算；拆开后各算各的</span></h2>
+      <div class="row"><input id="newMergeIds" type="text" placeholder="收成同一人的身份，逗号分隔，至少两个，如 alice, alice-app, alice-web"></div>
+      <div class="row"><button class="primary" onclick="mergeIdentities()">收成同一个人</button></div>
+      <div id="mergeList"></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
       <h2>发布稿 <span class="muted" style="font-weight:normal">好几处改动收成一稿，发布时一起生效；稿在发布前不影响任何结果</span></h2>
       <div class="row"><input id="newDraftNote" type="text" placeholder="这稿要做什么（备注，可选）"></div>
       <div class="row"><button class="primary" onclick="createDraft()">开新稿</button></div>
@@ -260,7 +266,8 @@ async function loadAll() {
     $('flagList').innerHTML = '<span class="muted">请先在顶部填写并切换/新建环境</span>';
     return;
   }
-  await loadFlags(); await loadGroups(); await loadDrafts(); await loadAudit(); await loadInvalidations();
+  await loadFlags(); await loadGroups(); await loadMerges();
+  await loadDrafts(); await loadAudit(); await loadInvalidations();
 }
 
 async function loadFlags() {
@@ -1062,6 +1069,72 @@ async function unstageFromDraft() {
               { method: 'DELETE' });
     toast('已从稿里摘掉本开关'); await loadDrafts();
   } catch (e) { toast('操作失败：' + e.message, true); }
+}
+
+// ---------------------------------------------------------------- 身份合并
+
+async function loadMerges() {
+  let groups;
+  try {
+    groups = await api('/api/identities/merges');
+  } catch (e) {
+    $('mergeList').innerHTML = '<span class="muted">加载失败：' + esc(e.message) + '</span>';
+    return;
+  }
+  const el = $('mergeList');
+  if (!groups.length) { el.innerHTML = '<span class="muted">还没有把身份收在一起</span>'; return; }
+  el.innerHTML = '';
+  for (const g of groups) {
+    const div = document.createElement('div');
+    div.className = 'group-block';
+    const chips = g.identities.map((id, i) => {
+      const cls = i === 0 ? 'badge on' : 'badge';
+      const title = i === 0 ? '主身份：所有开关按这个人算' : '';
+      return `<span class="${cls}" title="${esc(title)}">${esc(id)}</span>`;
+    }).join('');
+    div.innerHTML = `<div class="members">${chips}</div>`;
+    const meta = document.createElement('div');
+    meta.className = 'muted';
+    meta.textContent = `#${g.id} · ${g.identities.length} 个身份算同一个人 · 由 ${g.created_by || '—'} 合并`;
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.marginTop = '4px';
+    const btn = document.createElement('button');
+    btn.className = 'danger';
+    btn.style.cssText = 'padding:2px 10px';
+    btn.textContent = '拆开（之后各算各的）';
+    btn.addEventListener('click', () => splitIdentities(g.id, g.identities));
+    row.appendChild(btn);
+    div.appendChild(meta);
+    div.appendChild(row);
+    el.appendChild(div);
+  }
+}
+
+async function mergeIdentities() {
+  const ids = $('newMergeIds').value.split(',').map(s => s.trim()).filter(Boolean);
+  if (ids.length < 2) return toast('至少要写两个身份才能收成同一个人', true);
+  if (new Set(ids).size !== ids.length) return toast('身份不能重复', true);
+  try {
+    const r = await api('/api/identities/merges',
+      { method: 'POST', body: JSON.stringify({ identities: ids }) });
+    if (r.changed === false) {
+      toast('这几个身份本来就收在同一拨里，未改动');
+    } else {
+      $('newMergeIds').value = '';
+      toast(`已收成同一个人（主身份：${r.primary}），之后用任一身份来问结果一致`);
+    }
+    await loadMerges();
+  } catch (e) { toast('收不成：' + e.message, true); }
+}
+
+async function splitIdentities(id, identities) {
+  if (!confirm(`确定把这拨人拆开？\n${identities.join('、')}\n拆开后这几个身份各算各的。`)) return;
+  try {
+    await api(`/api/identities/merges/${id}`, { method: 'DELETE' });
+    toast('已拆开，之后各算各的');
+    await loadMerges();
+  } catch (e) { toast('拆开失败：' + e.message, true); }
 }
 
 // ---------------------------------------------------------------- 互斥组

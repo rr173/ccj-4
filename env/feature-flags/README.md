@@ -299,6 +299,50 @@ curl "http://localhost:8000/api/flags/new-checkout/check?identity=u123"
   跨环境推送（连同档名与比例一起推）与历史重放。整包、历史、预演的每个开关结果里，
   定档且为开的那项带 `variant` 字段，其余没有这个键。
 
+## 身份合并（把几个身份收成同一个人）
+
+同一个人可能用好几个身份来问（网页登录账号、App 设备号、第三方 open id……）。
+管理端可以把**几个身份收成同一个人**：
+
+```bash
+# 把 alice / alice-app / alice-web 收成同一个人（至少两个）
+curl -X POST http://localhost:8000/api/identities/merges \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"identities": ["alice", "alice-app", "alice-web"]}'
+# => {"ok":true,"changed":true,"id":1,"primary":"alice",
+#     "identities":["alice","alice-app","alice-web"]}
+```
+
+- **至少要写两个**：少于两个、不是非空字符串列表、身份有重复，这次收不成（400）
+  并说清楚；一个身份都不写库。
+- **已在另一拨人里就收不成**：要收的身份里只要有一个已经属于**另一拨**，这一次
+  一个都不收（409），错误里点出是谁、已经在哪一拨。想改「谁跟谁是同一个人」，
+  先把那一拨拆开再重新收；整拨原封不动再收一次是幂等的（`changed=false`，
+  不换任何版本）。
+- **按同一个人算**：收完之后，用其中**任何一个身份**来问（单查、整包、历史、
+  预演），这个人对每个开关的开/关、理由、档名、整包版本都按同一个人算；换一个
+  收在一起的身份来问，结果**一字不差**。主身份取成员里名字序最小者（与请求书写
+  顺序无关），分桶、单人强制、结果冻结、互斥组落定都落在主身份名下。
+- **管理端状态也合并**：给别名下单人强制 / 冻结果子，落在同一个人身上、对拨内
+  所有身份生效。合并时各身份名下既有的强制 / 冻结 / 组落定 / 整包账本一起迁到
+  主身份（同一开关或同一组冲突时主身份优先，否则取成员名字序最小者）。
+- **拆开以后各算各的**：
+
+  ```bash
+  curl -X DELETE http://localhost:8000/api/identities/merges/1 \
+    -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice"
+  ```
+
+  拆开不删状态：之前合并迁到主身份名下的强制 / 冻结 / 落定仍挂在主身份身上，
+  其余身份回到自己名下独立的状态——从此这几个身份各算各的。
+- **改过就按新的算**：合并 / 拆开 / 重新收都立即生效，相关已发整包换新版本，
+  拿着改前那包来问得到 `valid=false`；历史重放也按「那一刻」的归属还原——合并前
+  各算各的，合并期算同一个人，拆开后又各算各的。
+- 身份合并是**每个环境各自一份**的（与强制 / 冻结 / 互斥组一样），跨环境推送只
+  推开关规则、不推身份归属。`GET /api/identities/merges` 可查看当前每拨人
+  （主身份排在首位）。
+
 ## 互斥组
 
 管理端可把多个开关编入同一互斥组（一个开关最多进一个组）。对同一身份，
@@ -595,6 +639,9 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 | DELETE | `/api/groups/<name>` | 解散组（落定记录一并清除） |
 | PUT | `/api/groups/<name>/flags` | 开关进组，body `{flag}`（已在别组则 409） |
 | DELETE | `/api/groups/<name>/flags` | 开关移出组，body `{flag}`（释放其落定记录） |
+| GET | `/api/identities/merges` | 列出每拨「收成同一个人」的身份（主身份排首位） |
+| POST | `/api/identities/merges` | 把几个身份收成同一个人，body `{identities:[…]}`；至少两个，某个身份已在另一拨则 409 并说明，整拨原样重收为幂等 no-op |
+| DELETE | `/api/identities/merges/<id>` | 拆开这拨人；拆开后这几个身份各算各的 |
 
 > identity 一律放在 JSON body / 查询参数里，不进 URL 路径，
 > 因此含 `/`、空格、`"`、`'` 等字符的身份都能正常设置、查询、移除。

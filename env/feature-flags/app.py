@@ -353,6 +353,10 @@ CREATE TABLE IF NOT EXISTS draft_changes (
 --     group_upsert / group_delete  互斥组建 / 解散
 --     member_add / member_remove   开关进组 / 出组（subject=组名，payload: {flag}）
 --     assignment                    某身份在组内落定（查询写副作用，payload: {flag}）
+--     identity_merge / identity_split  把几个身份收成同一个人 / 拆开
+--                                      （payload: {identities:[…], primary:"…"}，
+--                                      merge 的迁移副作用不单独进流水，重放时按组
+--                                      状态还原「那一刻这几个身份算同一个人」）
 -- 预约生效与发布稿不在这里：重放时直接读 scheduled_changes（到点且未取消）与
 -- drafts（status=published 且 published_at<=时刻），与本流水按时间合并。
 CREATE TABLE IF NOT EXISTS history_events (
@@ -366,6 +370,25 @@ CREATE TABLE IF NOT EXISTS history_events (
 );
 CREATE INDEX IF NOT EXISTS idx_history_time ON history_events(occurred_at, id);
 CREATE INDEX IF NOT EXISTS idx_history_identity ON history_events(identity, occurred_at);
+-- 身份合并（同一个人的几个身份）：一拨人一个 identity_groups 行，成员在
+-- identity_members 里；is_primary=1 的那个身份是这拨人的「主身份」。
+-- 所有按人存的状态（单人强制 / 结果冻结 / 组落定 / 整包账本）与分桶都按主身份
+-- 算，所以来问时用这一拨里任何一个身份，每个开关的开/关都按同一个人算、一字
+-- 不差。identity 上的唯一索引从库层面保证「一个身份最多在一拨人里」——要改谁
+-- 跟谁是同一个人，得先拆开（DELETE 整组，成员行级联删除）再重新收。
+CREATE TABLE IF NOT EXISTS identity_groups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS identity_members (
+    group_id  INTEGER NOT NULL REFERENCES identity_groups(id) ON DELETE CASCADE,
+    identity  TEXT NOT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (group_id, identity)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_member_unique
+    ON identity_members(identity);
 """
 
 LAYERS = ("kill_switch", "freeze", "depends_on", "override", "targeting",
@@ -972,6 +995,166 @@ def flag_to_dict(row, dep_name=None):
     }
 
 
+# ---------------------------------------------------------------- 身份合并（同一个人）
+
+def canonical_identity(db, identity):
+    """把来问的身份归到他所属那拨人的「主身份」。
+
+    没被收进任何一拨人时原样返回；收过之后，用这一拨里任何一个身份来问，
+    都返回同一个主身份——单人强制 / 结果冻结 / 组落定 / 分桶 / 整包账本全部
+    按主身份算，所以「换一个收在一起的身份来问，每个开关的开/关必须一样」。
+    """
+    row = db.execute(
+        "SELECT m2.identity AS primary_identity FROM identity_members m1"
+        " JOIN identity_members m2 ON m2.group_id = m1.group_id AND m2.is_primary=1"
+        " WHERE m1.identity=?",
+        (identity,),
+    ).fetchone()
+    return row["primary_identity"] if row is not None else identity
+
+
+def identity_group_of(db, identity):
+    """身份所属那拨人的 (group_id, [主身份, 其余成员…按名字序])；没收过返回 None。"""
+    row = db.execute(
+        "SELECT group_id FROM identity_members WHERE identity=?", (identity,),
+    ).fetchone()
+    if row is None:
+        return None
+    members = [r["identity"] for r in db.execute(
+        "SELECT identity FROM identity_members WHERE group_id=?"
+        " ORDER BY is_primary DESC, identity", (row["group_id"],))]
+    return row["group_id"], members
+
+
+def list_identity_groups(db):
+    """列出每拨人：主身份排在首位，其余按名字序。"""
+    out = []
+    for g in db.execute("SELECT id, created_by, created_at FROM identity_groups ORDER BY id"):
+        members = [r["identity"] for r in db.execute(
+            "SELECT identity FROM identity_members WHERE group_id=?"
+            " ORDER BY is_primary DESC, identity", (g["id"],))]
+        out.append({"id": g["id"], "primary": members[0] if members else "",
+                    "identities": members,
+                    "created_by": g["created_by"], "created_at": g["created_at"]})
+    return out
+
+
+def _rekey_person_state(db, aliases, primary):
+    """把 aliases 各身份名下「按人存的状态」合并迁到主身份 primary 名下。
+
+    合并后一切求值只看主身份，所以老状态必须跟着人一起搬：
+      - overrides / freezes：同一开关下多个身份都有记录时主身份优先，
+        主身份没有则取成员里名字序最小的那份（确定的次序，与请求书写顺序无关）；
+      - group_assignments：同一个互斥组下同理（只留一个落定，避免主键冲突）；
+      - bundles：同一个 (身份, 属性) 包同样主身份优先、否则取最近一次来拿的。
+    其余别名名下的旧行一律删掉，不留「拆开后复活」的影子状态。
+    返回迁移过程中从 (旧身份, 属性) 归到主身份名下的整包行
+    [(identity, attrs_hash), …]，供路由决定要不要补失效记录。
+    """
+    others = [a for a in aliases if a != primary]
+    if not others:
+        return []
+    members = [primary] + sorted(others)
+
+    def merge_flag_scoped(table, value_cols, conflict_order):
+        """合并「(flag_id, identity)」作用域的表（overrides / freezes）。"""
+        # 先删掉所有别名名下的行，再按 (flag_id) 选出每个开关的唯一赢家写回主身份
+        rows = db.execute(
+            f"SELECT * FROM {table} WHERE identity IN ({','.join('?' * len(members))})",
+            members,
+        ).fetchall()
+        by_flag = {}
+        for r in rows:
+            by_flag.setdefault(r["flag_id"], []).append(r)
+        db.execute(
+            f"DELETE FROM {table} WHERE identity IN ({','.join('?' * len(members))})",
+            members,
+        )
+        for flag_id, rs in by_flag.items():
+            winner = conflict_order(rs)
+            cols = ["flag_id", "identity"] + value_cols
+            placeholders = ",".join("?" * len(cols))
+            db.execute(
+                f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})",
+                [flag_id, primary] + [winner[c] for c in value_cols],
+            )
+
+    def priority_winner(rs):
+        # 主身份优先；主身份没有则按身份名字序最小（members 即此次序）
+        order = {ident: i for i, ident in enumerate(members)}
+        return sorted(rs, key=lambda r: order[r["identity"]])[0]
+
+    merge_flag_scoped(
+        "overrides",
+        ["enabled", "created_at"],
+        priority_winner,
+    )
+    merge_flag_scoped(
+        "freezes",
+        ["frozen_enabled", "frozen_reason", "frozen_config", "frozen_variant",
+         "created_by", "created_at"],
+        priority_winner,
+    )
+
+    # 组落定：作用域是 (group_id, identity)——同一互斥组内这拨人只能占一个开关
+    arows = db.execute(
+        "SELECT * FROM group_assignments WHERE identity IN"
+        f" ({','.join('?' * len(members))})",
+        members,
+    ).fetchall()
+    by_group = {}
+    for r in arows:
+        by_group.setdefault(r["group_id"], []).append(r)
+    db.execute(
+        "DELETE FROM group_assignments WHERE identity IN"
+        f" ({','.join('?' * len(members))})",
+        members,
+    )
+    for group_id, rs in by_group.items():
+        winner = priority_winner(rs)
+        db.execute(
+            "INSERT INTO group_assignments (group_id, identity, flag_id, created_at)"
+            " VALUES (?,?,?,?)",
+            (group_id, primary, winner["flag_id"], winner["created_at"]),
+        )
+
+    # 整包账本：作用域是 (identity, attrs_hash)。主身份名下的包优先；都在别名
+    # 名下时取最近一次来拿的（updated_at 最大）那行，并把同属性的旧别名行删掉。
+    rekeyed = []
+    brows = db.execute(
+        "SELECT * FROM bundles WHERE identity IN"
+        f" ({','.join('?' * len(members))})",
+        members,
+    ).fetchall()
+    by_attrs = {}
+    for r in brows:
+        by_attrs.setdefault(r["attrs_hash"], []).append(r)
+    for attrs_hash, rs in by_attrs.items():
+        primary_rows = [r for r in rs if r["identity"] == primary]
+        if primary_rows:
+            keep = primary_rows[0]
+        else:
+            keep = sorted(rs, key=lambda r: r["updated_at"])[-1]
+        # 删掉这拨人名下该属性的全部旧行，再以主身份写回赢家
+        db.execute(
+            "DELETE FROM bundles WHERE attrs_hash=? AND identity IN"
+            f" ({','.join('?' * len(members))})",
+            [attrs_hash] + members,
+        )
+        for r in rs:
+            if r["identity"] != keep["identity"]:
+                rekeyed.append((r["identity"], attrs_hash))
+        db.execute(
+            "INSERT INTO bundles (identity, attrs_hash, attrs_json, version,"
+            " content_hash, generation, results, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (primary, keep["attrs_hash"], keep["attrs_json"], keep["version"],
+             keep["content_hash"], keep["generation"], keep["results"],
+             keep["updated_at"]),
+        )
+    return rekeyed
+
+
 # ---------------------------------------------------------------- evaluation
 
 def bucket_of(flag_name, identity):
@@ -1518,6 +1701,34 @@ def replay_state(db, identity, at, attrs=None):
 
     ops.sort(key=lambda o: (o[0], o[1], o[2]))
 
+    # 身份合并要按「那一刻」算：先只扫 identity_merge / identity_split，还原
+    # at 时刻还没拆开的合并组。那一刻这几个身份算同一个人，所以他们各自名下的
+    # 单人强制 / 冻结 / 组落定都要算进来；合并之前（或拆开之后）他们各算各的，
+    # 别人的记录不归他。重放不做线上那种行迁移，这里用主身份（合并时名字序最小）
+    # 作桶与落定身份，与「合并那一刻起同一个人」一致。
+    person_groups = {}   # identity -> {"primary": p, "members": set()}
+    for r in db.execute(
+            "SELECT kind, payload FROM history_events"
+            " WHERE kind IN ('identity_merge','identity_split')"
+            " AND occurred_at<=? ORDER BY occurred_at, id", (at,)):
+        payload = json.loads(r["payload"]) if r["payload"] else {}
+        idents = payload.get("identities", [])
+        if r["kind"] == "identity_merge":
+            grp = {"primary": payload.get("primary") or min(idents),
+                   "members": set(idents)}
+            for ident in idents:
+                person_groups[ident] = grp
+        else:  # identity_split：这几个身份从这一刻起各算各的
+            for ident in idents:
+                person_groups.pop(ident, None)
+    grp = person_groups.get(identity)
+    if grp is None:
+        person = identity
+        person_members = {identity}
+    else:
+        person = grp["primary"]
+        person_members = grp["members"]
+
     flags = {}
     overrides = {}
     frozen = {}
@@ -1549,8 +1760,8 @@ def replay_state(db, identity, at, attrs=None):
             flags[subject] = snap
         elif ev_kind == "flag_delete":
             flags.pop(subject, None)
-            overrides.pop((subject, identity), None)
-            frozen.pop((subject, identity), None)
+            overrides.pop((subject, person), None)
+            frozen.pop((subject, person), None)
             # 与线上删除路径一致：别人指向它的依赖边自动解除
             for other in flags.values():
                 if other["depends_on"] == subject:
@@ -1559,18 +1770,20 @@ def replay_state(db, identity, at, attrs=None):
                 members.discard(subject)
                 if assignments.get(gname) == subject:
                     assignments.pop(gname, None)
-        elif ev_kind == "override" and ev_identity == identity:
-            overrides[(subject, identity)] = bool(payload["enabled"])
-        elif ev_kind == "override_delete" and ev_identity == identity:
-            overrides.pop((subject, identity), None)
-        elif ev_kind == "freeze" and ev_identity == identity:
-            frozen[(subject, identity)] = {
+        elif ev_kind == "override" and ev_identity in person_members:
+            overrides[(subject, person)] = bool(payload["enabled"])
+        elif ev_kind == "override_delete" and ev_identity in person_members:
+            overrides.pop((subject, person), None)
+        elif ev_kind == "freeze" and ev_identity in person_members:
+            frozen[(subject, person)] = {
                 "enabled": bool(payload["enabled"]),
                 "config": payload.get("config", ""),
                 "variant": payload.get("variant", ""),
             }
-        elif ev_kind == "freeze_delete" and ev_identity == identity:
-            frozen.pop((subject, identity), None)
+        elif ev_kind == "freeze_delete" and ev_identity in person_members:
+            frozen.pop((subject, person), None)
+        elif ev_kind in ("identity_merge", "identity_split"):
+            continue  # 组成员关系已在循环前按 at 时刻还原
         elif ev_kind == "group_upsert":
             groups.setdefault(subject, set())
         elif ev_kind == "group_delete":
@@ -1582,14 +1795,17 @@ def replay_state(db, identity, at, attrs=None):
             groups.get(subject, set()).discard(payload["flag"])
             if assignments.get(subject) == payload["flag"]:
                 assignments.pop(subject, None)
-        elif ev_kind == "assignment" and ev_identity == identity:
+        elif ev_kind == "assignment" and ev_identity in person_members:
             members = groups.get(subject)
             # 落定只在「组还在、该开关当时仍在组内」时有效
             if members and payload["flag"] in members:
                 assignments.setdefault(subject, payload["flag"])
 
-    return {"flags": flags, "overrides": overrides, "frozen": frozen,
-            "groups": groups, "assignments": assignments}
+    state = {"flags": flags, "overrides": overrides, "frozen": frozen,
+             "groups": groups, "assignments": assignments}
+    state["person"] = person
+    state["person_members"] = person_members
+    return state
 
 
 def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
@@ -1682,20 +1898,24 @@ def evaluate_at(state, name, identity, attrs=None, _memo=None, _chain=None):
 
 
 def compute_history_bundle(db, identity, at, attrs=None):
-    """求该身份在时刻 at 所有「当时存在」的开关结果（按名字序，与线上整包同口径）。"""
+    """求该身份在时刻 at 所有「当时存在」的开关结果（按名字序，与线上整包同口径）。
+
+    合并 / 拆开按 at 那一刻的归属算：那一刻收在一起的身份算同一个人，分桶与
+    落定都用那拨人的主身份。返回 (results, person)。"""
     state = replay_state(db, identity, at, attrs)
+    person = state.get("person", identity)
     results = {}
     memo = {}
     for name in sorted(state["flags"]):
         enabled, reason, config, variant = evaluate_at(
-            state, name, identity, attrs, memo)
+            state, name, person, attrs, memo)
         item = {"enabled": enabled, "reason": reason}
         if config is not None:
             item["config"] = config
         if variant is not None:
             item["variant"] = variant
         results[name] = item
-    return results
+    return results, person
 
 
 @app.get("/api/history")
@@ -1723,7 +1943,7 @@ def history_bundle():
         attrs = parse_attrs(request.args.get("attrs"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    results = compute_history_bundle(get_db(), identity, at, attrs)
+    results, _person = compute_history_bundle(get_db(), identity, at, attrs)
     body = {"identity": identity, "at": at, "flags": results}
     if attrs is not None:
         body["attrs"] = attrs
@@ -1998,7 +2218,8 @@ def check(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
-    enabled, reason, config, variant = evaluate(db, flag, identity, attrs)
+    person = canonical_identity(db, identity)
+    enabled, reason, config, variant = evaluate(db, flag, person, attrs)
     body = {
         "flag": name,
         "identity": identity,
@@ -2035,13 +2256,16 @@ def bundle():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     db = get_db()
-    results, content_hash = compute_bundle(db, identity, attrs)
+    # 收在一起的身份按同一个人算：求值、账本与版本都记在主身份名下，所以这一拨
+    # 里任何一个身份来拿，拿到的是同一个包、同一个版本。
+    person = canonical_identity(db, identity)
+    results, content_hash = compute_bundle(db, person, attrs)
     a_hash = attrs_hash_of(attrs)
     a_json = canonical_json(attrs) if attrs else ""
     row = db.execute(
         "SELECT content_hash, generation FROM bundles"
         " WHERE identity=? AND attrs_hash=?",
-        (identity, a_hash),
+        (person, a_hash),
     ).fetchone()
     if row is None:
         generation = 1
@@ -2061,10 +2285,11 @@ def bundle():
         " version=excluded.version, content_hash=excluded.content_hash,"
         " generation=excluded.generation, results=excluded.results,"
         " updated_at=excluded.updated_at",
-        (identity, a_hash, a_json, version, content_hash, generation,
+        (person, a_hash, a_json, version, content_hash, generation,
          json.dumps(results, ensure_ascii=False), time.time()),
     )
     db.commit()
+    # 响应仍回显调用方来问时写的那个身份（账本内部记主身份）
     body = {"identity": identity, "version": version, "flags": results}
     if attrs is not None:
         body["attrs"] = attrs
@@ -2585,20 +2810,22 @@ def put_override(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
+    person = canonical_identity(db, identity)
     enabled = 1 if body["enabled"] else 0
     now = time.time()
     db.execute(
         "INSERT INTO overrides (flag_id, identity, enabled, created_at) VALUES (?,?,?,?)"
         " ON CONFLICT(flag_id, identity) DO UPDATE SET enabled=excluded.enabled",
-        (flag["id"], identity, enabled, now),
+        (flag["id"], person, enabled, now),
     )
     audit(actor(), name, "override", "set_override",
-          f"identity={identity} enabled={bool(enabled)}")
-    record_history(db, now, "override", subject=name, identity=identity,
+          f"identity={identity} enabled={bool(enabled)}"
+          + (f" person={person}" if person != identity else ""))
+    record_history(db, now, "override", subject=name, identity=person,
                    payload={"enabled": bool(enabled)}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
-                         f"set_override {name} identity={identity}")
+                         f"set_override {name} identity={person}")
     return jsonify({"ok": True})
 
 
@@ -2614,14 +2841,15 @@ def delete_override(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
+    person = canonical_identity(db, identity)
     db.execute("DELETE FROM overrides WHERE flag_id=? AND identity=?",
-               (flag["id"], identity))
+               (flag["id"], person))
     audit(actor(), name, "override", "remove_override", f"identity={identity}")
     record_history(db, time.time(), "override_delete", subject=name,
-                   identity=identity, payload={}, actor_name=actor())
+                   identity=person, payload={}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
-                         f"remove_override {name} identity={identity}")
+                         f"remove_override {name} identity={person}")
     return jsonify({"ok": True})
 
 
@@ -2679,12 +2907,13 @@ def put_freeze(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
-    enabled, reason, config, variant = freeze_result(db, flag, identity)
+    person = canonical_identity(db, identity)
+    enabled, reason, config, variant = freeze_result(db, flag, person)
     now = time.time()
     existing = db.execute(
         "SELECT frozen_enabled, frozen_config, frozen_variant FROM freezes"
         " WHERE flag_id=? AND identity=?",
-        (flag["id"], identity),
+        (flag["id"], person),
     ).fetchone()
     if existing is not None and bool(existing["frozen_enabled"]) == enabled:
         # 冻住的开/关没变就是 no-op：值、理由、配置与档名快照都不刷新（与
@@ -2708,20 +2937,21 @@ def put_freeze(name):
         " frozen_variant=excluded.frozen_variant,"
         " created_by=excluded.created_by,"
         " created_at=excluded.created_at",
-        (flag["id"], identity, 1 if enabled else 0, reason, config_json,
+        (flag["id"], person, 1 if enabled else 0, reason, config_json,
          variant_name, actor(), now),
     )
     audit(actor(), name, "freeze", "freeze_result",
           f"identity={identity} enabled={enabled} reason={reason}"
-          + (f" variant={variant_name}" if variant_name else ""))
-    record_history(db, now, "freeze", subject=name, identity=identity,
+          + (f" variant={variant_name}" if variant_name else "")
+          + (f" person={person}" if person != identity else ""))
+    record_history(db, now, "freeze", subject=name, identity=person,
                    payload={"enabled": bool(enabled), "reason": reason,
                             "config": config_json,
                             "variant": variant_name},
                    actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
-                         f"freeze_result {name} identity={identity} -> {enabled}")
+                         f"freeze_result {name} identity={person} -> {enabled}")
     body = {"ok": True, "changed": True, "enabled": enabled, "reason": reason}
     if config is not None:
         body["config"] = config
@@ -2746,16 +2976,17 @@ def delete_freeze(name):
     flag = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
     if flag is None:
         return jsonify({"error": "flag not found"}), 404
+    person = canonical_identity(db, identity)
     cur = db.execute("DELETE FROM freezes WHERE flag_id=? AND identity=?",
-                     (flag["id"], identity))
+                     (flag["id"], person))
     if cur.rowcount == 0:
         return jsonify({"ok": True, "changed": False})
     audit(actor(), name, "freeze", "unfreeze_result", f"identity={identity}")
     record_history(db, time.time(), "freeze_delete", subject=name,
-                   identity=identity, payload={}, actor_name=actor())
+                   identity=person, payload={}, actor_name=actor())
     db.commit()
     record_invalidations(db, actor(),
-                         f"unfreeze_result {name} identity={identity}")
+                         f"unfreeze_result {name} identity={person}")
     return jsonify({"ok": True, "changed": True})
 
 
@@ -3471,15 +3702,17 @@ def preview():
 
     people = {}
     for ident in identities:
-        current = evaluate_state_bundle(snapshot_current_state(db, ident),
-                                        ident, attrs)
+        # 收在一起的身份按同一个人算：预演也归到主身份，别名之间结果一致
+        person = canonical_identity(db, ident)
+        current = evaluate_state_bundle(snapshot_current_state(db, person),
+                                        person, attrs)
         if publish_error is not None:
             after = current
         else:
-            state = snapshot_current_state(db, ident)
+            state = snapshot_current_state(db, person)
             for fname, pch in staged.items():
                 apply_patch_to_state(state, fname, pch)
-            after = evaluate_state_bundle(state, ident, attrs)
+            after = evaluate_state_bundle(state, person, attrs)
         changed = [n for n in current
                    if current[n]["enabled"] != after[n]["enabled"]
                    or current[n]["reason"] != after[n]["reason"]
@@ -3671,6 +3904,173 @@ def list_bundle_invalidations():
         " FROM bundle_invalidations ORDER BY id DESC LIMIT ?", (limit,),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+# ---------------------------------------------------------------- 身份合并（同一个人）
+
+@app.get("/api/identities/merges")
+@require_admin
+def list_identity_merges():
+    """管理端：列出每拨「收成同一个人」的身份。主身份排在首位。"""
+    return jsonify(list_identity_groups(get_db()))
+
+
+@app.post("/api/identities/merges")
+@require_admin
+def merge_identities():
+    """把几个身份收成同一个人。
+
+    body: {"identities": ["a", "b", "c"]}
+
+    - 至少要写两个身份；少写了、写成非字符串列表、有重复，这次收不成（400）；
+    - 这几个身份里只要有一个**已经在另一拨人里**，这次一个都不收（409），
+      并在错误里说清是哪些身份、分别在哪一拨。想改谁跟谁是同一个人，先拆开
+      （DELETE）再重新收；整拨原封不动再收一次是幂等的 no-op；
+    - 收完之后，用其中任何一个身份来问（单查 / 整包 / 历史 / 预演），每个开关
+      的开/关都按同一个主身份算，结果一字不差；管理端再给这些身份下强制 /
+      冻结也落在同一个人身上。
+    合并把这几个身份名下既有的单人强制 / 冻结 / 组落定 / 整包账本一起迁到主
+    身份（同一开关 / 同一组冲突时主身份优先，否则取成员名字序最小者），随后
+    统一重算已发整包、换新版本。
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be a JSON object"
+                                 ' ({"identities": [...]})'}), 400
+    raw = body.get("identities")
+    if not isinstance(raw, list):
+        return jsonify({"error": "identities is required"
+                                 " (a list of at least two identities)"}), 400
+    if len(raw) < 2:
+        return jsonify({"error": "at least two identities are required"
+                                 " to merge into one person"}), 400
+    for ident in raw:
+        if not isinstance(ident, str) or ident == "":
+            return jsonify({"error": "identities must be non-empty strings"}), 400
+    if len(set(raw)) != len(raw):
+        dup = sorted({x for x in raw if raw.count(x) > 1})
+        return jsonify({"error": f"identities must be unique"
+                                 f" (duplicated: {', '.join(dup)})"}), 400
+
+    db = get_db()
+    idents = list(dict.fromkeys(raw))  # 保序去重（前面已拦重复，这里仅兜底）
+
+    # 每个身份各自所属的拨（group_id -> 成员列表，按主身份在前的次序）
+    grp_of_ident = {}
+    memberships = {}
+    for ident in idents:
+        grp = identity_group_of(db, ident)
+        if grp is not None:
+            grp_of_ident[ident] = grp[0]
+            memberships[grp[0]] = grp[1]
+
+    if len(memberships) > 1:
+        # 横跨两拨或更多：不允许把已有的几拨整拨合并，得先拆开再重新收
+        detail = "；".join(
+            f"{ident} 已在另一拨人里 [{'、'.join(memberships[grp_of_ident[ident]])}]"
+            for ident in idents if ident in grp_of_ident)
+        return jsonify({"error": "one or more identities already belong to another"
+                                 " person group; split them first, nothing was"
+                                 f" merged：{detail}"}), 409
+
+    if len(memberships) == 1:
+        existing_gid, existing_members = next(iter(memberships.items()))
+        if set(existing_members) == set(idents):
+            # 整拨原封不动再收一次：幂等 no-op，什么都不迁、不换版本
+            return jsonify({"ok": True, "changed": False, "id": existing_gid,
+                            "primary": existing_members[0],
+                            "identities": existing_members})
+        # 这一拨里有人，但请求还混进了拨外的新身份——同样收不成（拨不扩编，
+        # 想换人先拆开）
+        conflict = [i for i in idents if i in set(existing_members)]
+        return jsonify({"error": "one or more identities are already merged in"
+                                 " another person group"
+                                 f" [{'、'.join(existing_members)}]; split that"
+                                 " group first if you want to change who is the"
+                                 f" same person（已在拨内：{'、'.join(conflict)}）"}), 409
+
+    # 全新的一拨：主身份取成员里名字序最小者（与请求书写顺序无关，确定且稳定）
+    primary = min(idents)
+    now = time.time()
+    cur = db.execute(
+        "INSERT INTO identity_groups (created_by, created_at) VALUES (?,?)",
+        (actor(), now))
+    gid = cur.lastrowid
+    for ident in sorted(idents):
+        db.execute(
+            "INSERT INTO identity_members (group_id, identity, is_primary)"
+            " VALUES (?,?,?)",
+            (gid, ident, 1 if ident == primary else 0))
+
+    rekeyed = _rekey_person_state(db, idents, primary)
+
+    audit(actor(), primary, "identity", "merge_identities",
+          "identities=" + ",".join(sorted(idents)))
+    record_history(db, now, "identity_merge", subject=primary,
+                   payload={"identities": sorted(idents), "primary": primary},
+                   actor_name=actor())
+    db.commit()
+
+    # 统一重算已发整包：合并是求值输入（身份→主身份）的变化，相关的人都要换
+    # 新版本；随后给从别名迁到主身份名下的旧包补一条失效可见记录。
+    record_invalidations(db, actor(),
+                         "merge_identities " + ",".join(sorted(idents)))
+    _record_rekeyed_invalidations(db, rekeyed, actor(),
+                                  "merge_identities " + ",".join(sorted(idents)),
+                                  primary)
+    db.commit()
+    return jsonify({"ok": True, "changed": True, "id": gid, "primary": primary,
+                    "identities": sorted(idents)}), 201
+
+
+def _record_rekeyed_invalidations(db, rekeyed, actor_name, change, primary):
+    """合并把别名整包行迁到主身份后，给被迁走的旧 (身份, 属性) 补一条失效记录：
+    旧版本 -> 主身份此刻的新版本（让「谁的包因这次合并失效」在失效记录里可见）。"""
+    if not rekeyed:
+        return
+    now = time.time()
+    for old_identity, attrs_hash in rekeyed:
+        new_row = db.execute(
+            "SELECT version FROM bundles WHERE identity=? AND attrs_hash=?",
+            (primary, attrs_hash)).fetchone()
+        if new_row is None:
+            continue
+        db.execute(
+            "INSERT INTO bundle_invalidations"
+            " (actor, change, identity, attrs_hash, old_version, new_version,"
+            " created_at) VALUES (?,?,?,?,?,?,?)",
+            (actor_name, change, old_identity, attrs_hash,
+             "(rekeyed into person)", new_row["version"], now))
+
+
+@app.delete("/api/identities/merges/<int:group_id>")
+@require_admin
+def split_identities(group_id):
+    """拆开一拨人：拆开后这几个身份各算各的（按人存的状态不再共享）。
+
+    拆开不迁移、不删除任何状态：之前合并迁到主身份名下的强制 / 冻结 / 落定 /
+    整包仍挂在主身份身上，其余身份回到「自己名下没有这些状态」的独立状态——
+    与「拆开以后各算各的」一致。整包随后统一重算、换新版本。
+    """
+    db = get_db()
+    row = db.execute("SELECT * FROM identity_groups WHERE id=?",
+                     (group_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": "identity group not found"}), 404
+    members = [r["identity"] for r in db.execute(
+        "SELECT identity FROM identity_members WHERE group_id=?"
+        " ORDER BY is_primary DESC, identity", (group_id,))]
+    now = time.time()
+    db.execute("DELETE FROM identity_groups WHERE id=?", (group_id,))
+    audit(actor(), members[0] if members else "", "identity",
+          "split_identities", "identities=" + ",".join(members))
+    record_history(db, now, "identity_split",
+                   subject=members[0] if members else "",
+                   payload={"identities": members}, actor_name=actor())
+    db.commit()
+    record_invalidations(db, actor(),
+                         "split_identities " + ",".join(members))
+    return jsonify({"ok": True, "changed": True, "identities": members})
 
 
 # ---------------------------------------------------------------- admin page
