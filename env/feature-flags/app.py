@@ -32,6 +32,13 @@ SQLite 库，开关、配置、冻结、强制、互斥组、发布稿、定时�
     8. 默认值（default_enabled）   -> 没定档、没启用放量（比例为 0 且没定规矩），或定了
        放量条件 / 规矩但来问属性一条都没对上时兜底
 
+名额桶（quota bucket）：以上各层算出「开」之后还有最后一道闸门——管理端在
+环境里开的名额桶若盯着这个开关，要对这个人开，得先在这个桶里占到一个名额：
+已占到的（人不换）还是开，不被后来的人挤掉；没占到且桶已满，这些开关只能关
+（reason=quota）；没被盯的开关不走名额。管理端可以让人退出名额、改桶的人数
+或盯的开关，再来问按新的算；名额改少了多出来的人按后占到的先让。占位只在
+真实来问时发生（整包失效扫描等只读重算不替人占位）。
+
 结果冻结（freeze）：管理端可以把某个人对某个开关「此刻」的结果冻住。冻住时
 系统先按当时的全部规则（依赖、强制、属性以不带属性的口径、互斥组、放量、默认）
 完整求一次值，把得到的开/关存下来；此后该人再来问（单查、整包、带不带属性），
@@ -416,10 +423,41 @@ CREATE TABLE IF NOT EXISTS control_group (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+-- 名额桶：管理端在一个环境里开的「限量名额」。桶盯着几个开关——被盯着的开关
+-- 要对这个人开，得先在这个桶里占到一个名额；占满了，后来的人这些开关只能关。
+-- 同一个开关不能同时被两个还开着（status='open'）的桶盯着；关桶（closed）后
+-- 它盯的开关不再走名额，也可以被别的桶盯。名额桶是每个环境各自一份的。
+CREATE TABLE IF NOT EXISTS quota_buckets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL DEFAULT '',   -- 管理端起的名字（可空，空=不具名）
+    capacity    INTEGER NOT NULL,           -- 这个桶有多少个名额
+    status      TEXT NOT NULL DEFAULT 'open',  -- open / closed
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+-- 不具名（''）的桶可以有多个；具名的桶名字在同一环境里唯一
+CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_buckets_name
+    ON quota_buckets(name) WHERE name != '';
+-- 桶盯着哪些开关：一个开关最多被一个还开着的桶盯（由代码校验，关桶后行保留
+-- 作记录但不再生效）；开关删除时盯梢关系随外键级联清掉
+CREATE TABLE IF NOT EXISTS quota_bucket_flags (
+    bucket_id INTEGER NOT NULL REFERENCES quota_buckets(id) ON DELETE CASCADE,
+    flag_id   INTEGER NOT NULL REFERENCES flags(id) ON DELETE CASCADE,
+    PRIMARY KEY (bucket_id, flag_id)
+);
+-- 谁占到了名额：(桶, 主身份) 一行，acquired_at 是占到的时刻——名额改少时
+-- 多出来的人按「后占到的先让」（acquired_at 最晚的先被让出去）
+CREATE TABLE IF NOT EXISTS quota_occupants (
+    bucket_id   INTEGER NOT NULL REFERENCES quota_buckets(id) ON DELETE CASCADE,
+    identity    TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    PRIMARY KEY (bucket_id, identity)
+);
 """
 
 LAYERS = ("kill_switch", "control", "freeze", "depends_on", "override",
-          "targeting", "group", "rollout", "default")
+          "targeting", "group", "rollout", "default", "quota")
 
 
 # ---------------------------------------------------------------- attrs / targeting
@@ -1275,7 +1313,61 @@ def group_of(db, flag_id):
 
 
 def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
-             _skip_freeze_id=None):
+             _skip_freeze_id=None, _acquire=True):
+    """按固定优先级求值，返回 (enabled, reason, config, variant)。
+
+    先由 _evaluate_layers 按各层算出结果，再过名额桶闸门（quota_gate）：
+    被还开着的名额桶盯着的开关，最终要对这个人开，得先在这个桶里占到
+    一个名额——已占到的还是开（不被后来的人挤掉），没占到且桶已满则
+    判关（reason=quota）；没被盯的开关不走名额。_acquire=False（整包
+    失效扫描等只读重算）时闸门不落库，只按「占到 / 此刻还占得到」给结果。
+    依赖链上的结果在单次求值内备忘（记的是过了闸门后的最终开/关）。
+    """
+    enabled, reason, config, variant = _evaluate_layers(
+        db, flag, identity, attrs, _memo, _chain, _skip_freeze_id, _acquire)
+    if enabled:
+        enabled, reason, config, variant = quota_gate(
+            db, flag, identity, enabled, reason, config, variant, _acquire)
+    if _memo is not None:
+        _memo[flag["id"]] = enabled
+    return enabled, reason, config, variant
+
+
+def quota_gate(db, flag, identity, enabled, reason, config, variant, acquire):
+    """名额桶闸门：只拦「开」——被还开着的桶盯着的开关要开，得先占到名额。
+
+    - 没被盯的开关：原样放行，不走这桶的名额；
+    - 已占到名额的人：还是开，不因后来的人来问被挤掉；
+    - 没占到且桶已满：判关（reason=quota），不带配置与档名；
+    - 没占到但桶还有空位：占到一个名额（写库，与互斥组落定同为查询的写
+      副作用）后开；acquire=False（只读重算）时不落库，直接按能占到给开。
+    """
+    bucket = db.execute(
+        "SELECT b.* FROM quota_buckets b"
+        " JOIN quota_bucket_flags bf ON bf.bucket_id = b.id"
+        " WHERE bf.flag_id=? AND b.status='open'", (flag["id"],)).fetchone()
+    if bucket is None:
+        return enabled, reason, config, variant
+    if db.execute(
+            "SELECT 1 FROM quota_occupants WHERE bucket_id=? AND identity=?",
+            (bucket["id"], identity)).fetchone() is not None:
+        return enabled, reason, config, variant
+    n = db.execute(
+        "SELECT COUNT(*) c FROM quota_occupants WHERE bucket_id=?",
+        (bucket["id"],)).fetchone()["c"]
+    if n >= bucket["capacity"]:
+        return False, "quota", None, None
+    if not acquire:
+        return enabled, reason, config, variant
+    db.execute(
+        "INSERT OR IGNORE INTO quota_occupants (bucket_id, identity, acquired_at)"
+        " VALUES (?,?,?)", (bucket["id"], identity, time.time()))
+    db.commit()
+    return enabled, reason, config, variant
+
+
+def _evaluate_layers(db, flag, identity, attrs=None, _memo=None, _chain=None,
+                     _skip_freeze_id=None, _acquire=True):
     """按固定优先级求值，返回 (enabled, reason, config, variant)。
 
     config 是「此人此刻拿得到的开关配置」：只看最终开/关，与由哪一层决定
@@ -1370,7 +1462,8 @@ def evaluate(db, flag, identity, attrs=None, _memo=None, _chain=None,
             else:
                 next_chain = {flag["id"]} if _chain is None else _chain | {flag["id"]}
                 dep_enabled, _, _, _ = evaluate(db, dep_flag, identity, attrs,
-                                                _memo, next_chain)
+                                                _memo, next_chain,
+                                                _acquire=_acquire)
             if not dep_enabled:
                 if _memo is not None:
                     _memo[flag["id"]] = False
@@ -1624,6 +1717,39 @@ def bundle_content_hash(db, identity, attrs=None, results=None):
         if r["name"] not in masked_names and r["variants"]:
             payload["flags"][i] = payload["flags"][i] + [
                 ["variants", json.loads(r["variants"])]]
+    # 名额桶：还开着的桶盯哪些开关、此人占没占到 / 此刻占不占得到，决定被盯
+    # 开关对他是开是关，因此是求值输入。只占「与此人结果有关」的桶：被盯开关
+    # 对此人自然结果都是关时，桶怎么改都不影响他的结果，不进摘要（别人占位、
+    # 退出、改人数都不波及他）。占到位用 in/out 标记：已占到、或没占到但桶
+    # 此刻还有空位（真来问就会占到）都是 in——这样本人占到名额前后摘要不变、
+    # 版本稳定；桶满了占不到才是 out。别人占位 / 退出只影响没占到的人的
+    # in/out，已占到的人摘要不带人数与占用数，不会被挤动版本。
+    open_buckets = db.execute(
+        "SELECT b.id, b.name, b.capacity,"
+        " (SELECT COUNT(*) FROM quota_occupants o WHERE o.bucket_id=b.id) AS occ"
+        " FROM quota_buckets b WHERE b.status='open' ORDER BY b.name, b.id"
+    ).fetchall()
+    if open_buckets:
+        held = {r["bucket_id"] for r in db.execute(
+            "SELECT bucket_id FROM quota_occupants WHERE identity=?",
+            (identity,))}
+        buckets_payload = []
+        for b in open_buckets:
+            watched = [r["name"] for r in db.execute(
+                "SELECT f.name FROM quota_bucket_flags bf"
+                " JOIN flags f ON f.id = bf.flag_id WHERE bf.bucket_id=?"
+                " ORDER BY f.name", (b["id"],))]
+            relevant = results is None or any(
+                results.get(w, {}).get("enabled")
+                or results.get(w, {}).get("reason") == "quota"
+                for w in watched)
+            if not relevant:
+                continue
+            in_bucket = b["id"] in held or b["occ"] < b["capacity"]
+            buckets_payload.append(
+                [b["name"], watched, "in" if in_bucket else "out"])
+        if buckets_payload:
+            payload["buckets"] = buckets_payload
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
@@ -1639,18 +1765,21 @@ def make_version(content_hash, generation):
     ).hexdigest()[:16]
 
 
-def compute_bundle(db, identity, attrs=None):
+def compute_bundle(db, identity, attrs=None, _acquire=True):
     """求出此身份此身属性下所有开关的结果与求值输入摘要。先求值（可能写入
-    组落定记录），再取摘要，保证摘要覆盖本次求值产生的落定记录与本次判开
-    的开关配置——管理端失效扫描与调用方来拿走同一套求值，记下的版本与本人
-    来拿时拿到的才一致。
+    组落定记录；_acquire=True 时也可能写入名额桶占位），再取摘要，保证摘要
+    覆盖本次求值产生的落定记录、名额占位与本次判开的开关配置——管理端失效
+    扫描与调用方来拿走同一套求值，记下的版本与本人来拿时拿到的才一致。
+    _acquire=False（失效扫描等只读重算）时名额桶闸门不落库：名额的先到先得
+    只由真实来问的顺序决定，扫描不替任何人占位。
     整包共用一份依赖备忘：被依赖的开关先算一次，依赖它的开关与单查它时
     拿到的是同一个结果、同一个理由。"""
     flags = db.execute("SELECT * FROM flags ORDER BY name").fetchall()
     results = {}
     memo = {}
     for flag in flags:
-        enabled, reason, config, variant = evaluate(db, flag, identity, attrs, memo)
+        enabled, reason, config, variant = evaluate(
+            db, flag, identity, attrs, memo, _acquire=_acquire)
         item = {"enabled": enabled, "reason": reason}
         if config is not None:
             item["config"] = config
@@ -1680,7 +1809,9 @@ def record_invalidations(db, actor_name, change):
     now = time.time()
     for r in rows:
         attrs = json.loads(r["attrs_json"]) if r["attrs_json"] else None
-        _, content_hash = compute_bundle(db, r["identity"], attrs)
+        # 只读重算（_acquire=False）：名额桶的占位只由真实来问先到先得，
+        # 扫描不替任何人占位（否则「人退出名额」会被扫描立刻替原主占回去）
+        _, content_hash = compute_bundle(db, r["identity"], attrs, _acquire=False)
         if content_hash == r["content_hash"]:
             continue
         new_generation = r["generation"] + 1
@@ -3205,9 +3336,11 @@ def freeze_result(db, flag, identity):
     返回 (enabled, reason, config, variant)。跳过本开关已有的冻结行——重新冻
     同一个人时，冻住的是「假如现在解冻会算出的结果」；被依赖开关的冻结照常
     生效。config 即此人此刻判开时开关挂的配置（冻住后按这份快照下发），
-    判关为 None；variant 同理为此刻落的档名，判关或没定档为 None。"""
+    判关为 None；variant 同理为此刻落的档名，判关或没定档为 None。
+    名额桶闸门按只读口径（_acquire=False）：冻住的是「此刻来问会拿到的
+    开/关」，但不为这次预占名额——真来问时该占还是会占到。"""
     return evaluate(db, flag, identity, None,
-                    _skip_freeze_id=flag["id"])
+                    _skip_freeze_id=flag["id"], _acquire=False)
 
 
 @app.get("/api/flags/<name>/freezes")
@@ -4614,6 +4747,303 @@ def remove_from_control_group():
                          "remove_control_group " + ",".join(removed))
     db.commit()
     return jsonify({"ok": True, "changed": True, "removed": removed})
+
+
+# ---------------------------------------------------------------- 名额桶（quota bucket）
+
+def bucket_to_dict(db, row):
+    """名额桶的对外形态：名额数、盯着的开关、状态与占到名额的人（按占到先后）。"""
+    flags = [r["name"] for r in db.execute(
+        "SELECT f.name FROM quota_bucket_flags bf"
+        " JOIN flags f ON f.id = bf.flag_id WHERE bf.bucket_id=?"
+        " ORDER BY f.name", (row["id"],))]
+    occupants = [
+        {"identity": r["identity"], "acquired_at": r["acquired_at"]}
+        for r in db.execute(
+            "SELECT identity, acquired_at FROM quota_occupants"
+            " WHERE bucket_id=? ORDER BY acquired_at, rowid", (row["id"],))]
+    return {"id": row["id"], "name": row["name"], "capacity": row["capacity"],
+            "status": row["status"], "flags": flags, "occupants": occupants,
+            "created_by": row["created_by"], "created_at": row["created_at"],
+            "updated_at": row["updated_at"]}
+
+
+def _validate_bucket_flag_names(db, raw):
+    """校验「这桶盯着哪些开关」，返回 (开关名单, 错误响应)。
+
+    名单必须是非空的非空字符串列表、不重复，且每个开关都得是本环境里已有
+    的——少写了 / 写错了 / 说了个没有的开关，这次都办不成并说清楚。
+    """
+    if raw is None:
+        return None, (jsonify({"error": "flags is required"
+                                         " (which flags this bucket watches)"}), 400)
+    if not isinstance(raw, list) or not raw:
+        return None, (jsonify({"error": "flags must be a non-empty list"
+                                         " of flag names"}), 400)
+    names = []
+    for f in raw:
+        if not isinstance(f, str) or f == "":
+            return None, (jsonify({"error": "flags must be non-empty strings"
+                                             " (flag names)"}), 400)
+        if f in names:
+            return None, (jsonify({"error": "flags must be unique"
+                                             f" (duplicated: {f})"}), 400)
+        names.append(f)
+    missing = [f for f in names
+               if db.execute("SELECT 1 FROM flags WHERE name=?", (f,)).fetchone()
+               is None]
+    if missing:
+        return None, (jsonify({"error": "flags not found: "
+                                         + ", ".join(missing)}), 404)
+    return names, None
+
+
+def _open_bucket_flag_conflict(db, flag_names, exclude_bucket_id=None):
+    """同一个开关不能同时被两个还开着的桶盯着：有冲突返回错误串，否则 None。"""
+    rows = db.execute(
+        "SELECT f.name AS fname, b.id AS bid, b.name AS bname"
+        " FROM quota_bucket_flags bf"
+        " JOIN flags f ON f.id = bf.flag_id"
+        " JOIN quota_buckets b ON b.id = bf.bucket_id"
+        " WHERE b.status='open'").fetchall()
+    watched = {}
+    for r in rows:
+        if exclude_bucket_id is not None and r["bid"] == exclude_bucket_id:
+            continue
+        watched.setdefault(r["fname"], r)
+    for f in flag_names:
+        if f in watched:
+            r = watched[f]
+            who = r["bname"] or f"#{r['bid']}"
+            return (f"flag '{f}' is already watched by open quota bucket"
+                    f" '{who}' (a flag can be watched by only one open bucket)")
+    return None
+
+
+def _validate_bucket_capacity(raw):
+    """校验「这个桶有多少个名额」：非负整数（0 合法，谁也占不到）。非法返回错误串。"""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return "capacity must be a non-negative integer"
+    return None
+
+
+@app.post("/api/quota-buckets")
+@require_admin
+def create_quota_bucket():
+    """管理端：在本环境里开一个名额桶。
+
+    body: {"capacity": N, "flags": ["f1", …], "name": "可选名字"}
+
+    少写了名额或开关、说了个没有的开关、开关已被另一个还开着的桶盯着，
+    这次开不成并说清楚（400/404/409），什么都不写库。环境走
+    ?environment= / X-Environment（漏带 400、环境不存在 404）。
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be a JSON object"
+                                 ' ({"capacity": N, "flags": [...]})'}), 400
+    if body.get("capacity") is None:
+        return jsonify({"error": "capacity is required"
+                                 " (how many seats this bucket has)"}), 400
+    capacity = body["capacity"]
+    err = _validate_bucket_capacity(capacity)
+    if err:
+        return jsonify({"error": err}), 400
+    db = get_db()
+    names, err_resp = _validate_bucket_flag_names(db, body.get("flags"))
+    if err_resp:
+        return err_resp
+    name = body.get("name") or ""
+    if not isinstance(name, str):
+        return jsonify({"error": "name must be a string"}), 400
+    conflict = _open_bucket_flag_conflict(db, names)
+    if conflict:
+        return jsonify({"error": conflict}), 409
+    if name and db.execute(
+            "SELECT 1 FROM quota_buckets WHERE name=?", (name,)).fetchone():
+        return jsonify({"error": f"quota bucket already exists: {name}"}), 409
+    now = time.time()
+    cur = db.execute(
+        "INSERT INTO quota_buckets (name, capacity, status, created_by,"
+        " created_at, updated_at) VALUES (?,?, 'open', ?, ?, ?)",
+        (name, capacity, actor(), now, now))
+    bid = cur.lastrowid
+    for f in names:
+        fid = db.execute("SELECT id FROM flags WHERE name=?", (f,)).fetchone()["id"]
+        db.execute("INSERT INTO quota_bucket_flags (bucket_id, flag_id)"
+                   " VALUES (?,?)", (bid, fid))
+    audit(actor(), name or f"quota-bucket:{bid}", "quota", "create_bucket",
+          f"capacity={capacity} flags={','.join(names)}")
+    db.commit()
+    record_invalidations(db, actor(),
+                         f"create_quota_bucket {name or bid}"
+                         f" flags={','.join(names)}")
+    row = db.execute("SELECT * FROM quota_buckets WHERE id=?", (bid,)).fetchone()
+    return jsonify(dict(bucket_to_dict(db, row), ok=True)), 201
+
+
+@app.get("/api/quota-buckets")
+@require_admin
+def list_quota_buckets():
+    """管理端：列出本环境所有名额桶（含已关的），带占到名额的人。"""
+    db = get_db()
+    rows = db.execute("SELECT * FROM quota_buckets ORDER BY id").fetchall()
+    return jsonify([bucket_to_dict(db, r) for r in rows])
+
+
+@app.get("/api/quota-buckets/<int:bid>")
+@require_admin
+def get_quota_bucket(bid):
+    """管理端：看一个名额桶（名额数、盯的开关、谁占着名额）。"""
+    db = get_db()
+    row = db.execute("SELECT * FROM quota_buckets WHERE id=?", (bid,)).fetchone()
+    if row is None:
+        return jsonify({"error": "quota bucket not found"}), 404
+    return jsonify(bucket_to_dict(db, row))
+
+
+@app.patch("/api/quota-buckets/<int:bid>")
+@require_admin
+def update_quota_bucket(bid):
+    """管理端：改这个桶的人数（capacity）或盯着哪些开关（flags），再来问按新的。
+
+    - 名额改少了、已经占着的人比新人数多：多出来的按「后占到的先让」
+      （acquired_at 最晚的先被让出去），被让出去的人再来问这些开关是关；
+    - 改盯的开关：新名单里每个开关都不能已被别的还开着的桶盯着（409），
+      说了个没有的开关这次改不成（404）；不再被盯的开关立即不走名额；
+    - 已关的桶不能再改（409）。
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be a JSON object"
+                                 ' ({"capacity": N} and/or {"flags": [...]})'}), 400
+    db = get_db()
+    bucket = db.execute("SELECT * FROM quota_buckets WHERE id=?", (bid,)).fetchone()
+    if bucket is None:
+        return jsonify({"error": "quota bucket not found"}), 404
+    if bucket["status"] != "open":
+        return jsonify({"error": f"quota bucket is {bucket['status']},"
+                                 " closed buckets cannot be changed"}), 409
+    if "capacity" not in body and "flags" not in body:
+        return jsonify({"error": "nothing to update"
+                                 " (give capacity and/or flags)"}), 400
+    new_capacity = bucket["capacity"]
+    if "capacity" in body:
+        err = _validate_bucket_capacity(body["capacity"])
+        if err:
+            return jsonify({"error": err}), 400
+        new_capacity = body["capacity"]
+    new_flags = None
+    if "flags" in body:
+        new_flags, err_resp = _validate_bucket_flag_names(db, body["flags"])
+        if err_resp:
+            return err_resp
+        conflict = _open_bucket_flag_conflict(db, new_flags,
+                                              exclude_bucket_id=bid)
+        if conflict:
+            return jsonify({"error": conflict}), 409
+
+    now = time.time()
+    evicted = []
+    old_flags = sorted(r["name"] for r in db.execute(
+        "SELECT f.name FROM quota_bucket_flags bf JOIN flags f ON f.id=bf.flag_id"
+        " WHERE bf.bucket_id=?", (bid,)))
+    try:
+        if new_flags is not None and sorted(new_flags) != old_flags:
+            db.execute("DELETE FROM quota_bucket_flags WHERE bucket_id=?", (bid,))
+            for f in new_flags:
+                fid = db.execute("SELECT id FROM flags WHERE name=?",
+                                 (f,)).fetchone()["id"]
+                db.execute("INSERT INTO quota_bucket_flags (bucket_id, flag_id)"
+                           " VALUES (?,?)", (bid, fid))
+        if new_capacity != bucket["capacity"]:
+            db.execute("UPDATE quota_buckets SET capacity=? WHERE id=?",
+                       (new_capacity, bid))
+        # 名额改少了、已经占着的人比新人数多：多出来的按后占到的先让
+        excess = db.execute(
+            "SELECT COUNT(*) c FROM quota_occupants WHERE bucket_id=?",
+            (bid,)).fetchone()["c"] - new_capacity
+        if excess > 0:
+            late = db.execute(
+                "SELECT identity FROM quota_occupants WHERE bucket_id=?"
+                " ORDER BY acquired_at DESC, rowid DESC LIMIT ?",
+                (bid, excess)).fetchall()
+            evicted = sorted(r["identity"] for r in late)
+            db.execute(
+                "DELETE FROM quota_occupants WHERE bucket_id=? AND identity IN"
+                f" ({','.join('?' * len(evicted))})", [bid] + evicted)
+        db.execute("UPDATE quota_buckets SET updated_at=? WHERE id=?", (now, bid))
+        audit(actor(), bucket["name"] or f"quota-bucket:{bid}", "quota",
+              "update_bucket",
+              f"capacity: {bucket['capacity']} -> {new_capacity}"
+              + (f" flags: {','.join(old_flags)} -> {','.join(sorted(new_flags))}"
+                 if new_flags is not None and sorted(new_flags) != old_flags else "")
+              + (f" evicted={','.join(evicted)}" if evicted else ""))
+    except Exception:
+        db.rollback()
+        raise
+    db.commit()
+    record_invalidations(db, actor(), f"update_quota_bucket {bid}")
+    fresh = db.execute("SELECT * FROM quota_buckets WHERE id=?", (bid,)).fetchone()
+    return jsonify(dict(bucket_to_dict(db, fresh), ok=True, evicted=evicted))
+
+
+@app.delete("/api/quota-buckets/<int:bid>/occupants")
+@require_admin
+def exit_quota_bucket(bid):
+    """管理端：让某个人退出这个桶的名额，再来问按新的（没占到的人的状态）算。
+
+    body: {"identity": "..."}；少写了要退的人，这次退不成并说清楚（400）。
+    退一个没占着的人是 no-op（changed=false）。
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be a JSON object"
+                                 ' ({"identity": ...})'}), 400
+    identity = body.get("identity")
+    if not isinstance(identity, str) or identity == "":
+        return jsonify({"error": "identity is required"
+                                 " (the person to remove from this bucket)"}), 400
+    db = get_db()
+    bucket = db.execute("SELECT * FROM quota_buckets WHERE id=?", (bid,)).fetchone()
+    if bucket is None:
+        return jsonify({"error": "quota bucket not found"}), 404
+    if bucket["status"] != "open":
+        return jsonify({"error": f"quota bucket is {bucket['status']}"}), 409
+    person = canonical_identity(db, identity)
+    cur = db.execute("DELETE FROM quota_occupants WHERE bucket_id=? AND identity=?",
+                     (bid, person))
+    if cur.rowcount == 0:
+        return jsonify({"ok": True, "changed": False})
+    audit(actor(), bucket["name"] or f"quota-bucket:{bid}", "quota",
+          "exit_occupant", f"identity={identity}"
+          + (f" person={person}" if person != identity else ""))
+    db.commit()
+    record_invalidations(db, actor(),
+                         f"exit_quota_bucket {bid} identity={person}")
+    return jsonify({"ok": True, "changed": True})
+
+
+@app.post("/api/quota-buckets/<int:bid>/close")
+@require_admin
+def close_quota_bucket(bid):
+    """管理端：关掉这个桶。关桶后它盯的开关不再走名额（来问按各开关原来的
+    规则算），这些开关也可以被别的桶盯；占到名额的人一并释放。已关再关是
+    幂等 no-op（changed=false）。"""
+    db = get_db()
+    bucket = db.execute("SELECT * FROM quota_buckets WHERE id=?", (bid,)).fetchone()
+    if bucket is None:
+        return jsonify({"error": "quota bucket not found"}), 404
+    if bucket["status"] == "closed":
+        return jsonify({"ok": True, "changed": False})
+    now = time.time()
+    db.execute("UPDATE quota_buckets SET status='closed', updated_at=? WHERE id=?",
+               (now, bid))
+    db.execute("DELETE FROM quota_occupants WHERE bucket_id=?", (bid,))
+    audit(actor(), bucket["name"] or f"quota-bucket:{bid}", "quota", "close_bucket")
+    db.commit()
+    record_invalidations(db, actor(), f"close_quota_bucket {bid}")
+    return jsonify({"ok": True, "changed": True})
 
 
 # ---------------------------------------------------------------- admin page

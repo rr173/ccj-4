@@ -49,6 +49,9 @@ curl -H "X-Environment: staging" \
 全关(kill_switch) > 对照组(control) > 结果冻结(freeze) > 开关依赖(depends_on) > 单人强制(override) > 属性打开条件(targeting) > 互斥组(group) > 比例放量(rollout，含定档 variants) > 默认值(default)
 ```
 
+以上各层算出「开」之后还有最后一道闸门：**名额桶（quota）**——被还开着的
+名额桶盯着的开关，要对这个人开，得先在桶里占到一个名额（见「名额桶」一节）。
+
 - **全关**：打开后所有身份一律为关，覆盖一切，**包括冻住的结果与对照组**。
 - **对照组**：见下节。被管理端点进对照组的人，每个开关只走它自己的默认开或关，
   冻结 / 依赖 / 强制 / 属性 / 组 / 放量 / 定档一概不看（不落档、不写组落定），
@@ -156,8 +159,74 @@ curl -X DELETE http://localhost:8000/api/control-group \
 - 对照组是**每个环境各自一份**的（与强制 / 冻结 / 互斥组一样），跨环境推送只推
   开关规则、不推对照名单。`GET /api/control-group` 可查看当前名单。
 
-## 开关依赖（depends_on）
+## 名额桶（quota bucket：限量名额，先到先得）
 
+管理端能在一个环境里**开一个名额桶**：开的时候写下这个桶有多少个名额
+（`capacity`），再写下这桶盯着哪些开关（`flags`）。被盯着的开关要对这个人
+开，得先在这个环境里占到一个名额；占满了，后来的人这些开关只能关。
+
+```bash
+# 开一个桶：2 个名额，盯着 new-checkout（环境走 X-Environment / ?environment=）
+curl -X POST http://localhost:8000/api/quota-buckets \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "X-Environment: prod" \
+  -H "Content-Type: application/json" \
+  -d '{"capacity": 2, "flags": ["new-checkout"], "name": "beta-seats"}'
+# => {"ok":true,"id":1,"name":"beta-seats","capacity":2,"flags":["new-checkout"],
+#     "status":"open","occupants":[], ...}
+
+# 来问：前两个人占到名额（开），第三个起只能关（reason=quota）
+curl "http://localhost:8000/api/flags/new-checkout/check?environment=prod&identity=u1"
+# => {"enabled":true,"reason":"default", ...}   （占到名额，按本开关原来的层给出理由）
+curl "http://localhost:8000/api/flags/new-checkout/check?environment=prod&identity=u3"
+# => {"enabled":false,"reason":"quota"}          （桶满了）
+
+# 看桶（谁占着名额、按占到先后列出）
+curl -H "X-Admin-Token: $TOKEN" -H "X-Environment: prod" \
+  http://localhost:8000/api/quota-buckets/1
+
+# 让某个人退出名额（少写了要退的人，这次退不成 400 并说清楚）
+curl -X DELETE http://localhost:8000/api/quota-buckets/1/occupants \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "X-Environment: prod" \
+  -H "Content-Type: application/json" -d '{"identity": "u1"}'
+
+# 改这个桶的人数或盯着哪些开关，再来问按新的算
+curl -X PATCH http://localhost:8000/api/quota-buckets/1 \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "X-Environment: prod" \
+  -H "Content-Type: application/json" -d '{"capacity": 1}'
+# 名额改少了、已经占着的人比新人数多：多出来的按「后占到的先让」，
+# 响应里 evicted 列出被让出去的人；他们再来问这些开关是关（reason=quota）
+
+# 关桶：盯的开关不再走名额，这些开关也可以被别的桶盯
+curl -X POST http://localhost:8000/api/quota-buckets/1/close \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "X-Environment: prod"
+```
+
+- **少写了开不成**：`capacity` / `flags` 缺一、名额不是非负整数、开关名单
+  为空 / 有重复 / 不是开关名列表，这次开不成（400）并说清楚，什么都不写库；
+  说了个没有的开关同样开不成（404 列出缺的）；环境漏带 400、环境不存在
+  404（与其他接口同一口径）。
+- **同一个开关不能同时被两个还开着的桶盯着**：撞上时这次开不成 / 改不成
+  （409 并指明是哪个开关、被哪个桶盯着）；关掉的桶不再占着盯梢。
+- **占位先到先得**：来问（单查或整包）时开关按原来的全部层算出「开」，且
+  桶盯着它，才看名额——已占到的还是开；没占到但桶还有空位，就占到一个
+  （写库，与互斥组落定同为查询的写副作用）再开；桶满了只能关
+  （`reason=quota`）。开关自然结果就是关的人不占名额。
+- **占到就挤不掉**：同一个人已经占到的，只要人、身上属性和环境没变，多次
+  来问还是开，不会因为后来的人来问被挤掉。名额按主身份记（与强制 / 冻结
+  同口径），收成同一个人的几个身份共用一个名额。
+- **没被盯的开关不走这桶的名额**：完全按原规则求值。
+- **退出 / 改桶立即按新的算**：人退出名额、改人数、改盯的开关都立即生效，
+  相关已发整包换新版本；退出只是空出名额——桶还有空位时本人再来问会重新
+  占到，想让给别人就让别人先来问。改盯的开关不清占位（名额是桶的，不是
+  开关的）；名额改少时的让出按「后占到的先让」。
+- 名额桶是**每个环境各自一份**的（与互斥组 / 对照组一样），跨环境推送只推
+  开关规则、不推桶；历史重放与预演不含名额桶闸门（按当时 / 假想配置算，
+  不占名额）。
+
+> 注意：对被盯开关的 `check` / 整包查询可能在首次判开时写入占位记录
+> （GET 有写副作用），这是「占到就挤不掉」的实现基础。
+
+## 开关依赖（depends_on）
 管理端可以指定本开关**先看另一个开关**。来问时（单查或整包），系统会用
 **同一个身份、同一身属性**把被依赖的开关完整求值一遍：
 
@@ -690,7 +759,8 @@ docker run -d -p 8000:8000 -e ADMIN_TOKEN=你的强随机串 \
 ```bash
 GET '/api/flags/<name>/check?identity=<用户身份>[&attrs=<URL编码的JSON属性>]'
 # => {"flag":"new-checkout","identity":"u123","enabled":true,"reason":"rollout"}
-#    reason ∈ kill_switch | control | freeze | depends_on | override | targeting | group | rollout | variants | default，表示结果由哪一层决定
+#    reason ∈ kill_switch | control | freeze | depends_on | override | targeting | group | rollout | variants | default | quota，表示结果由哪一层决定
+#    （quota = 开关被还开着的名额桶盯着，而此人没占到名额）
 #    定了档且最终为开时还带 "variant":"<档名>"；没定档的开关永远没有 variant 键
 #    identity / attrs 需 URL 编码；identity 允许包含斜杠、空格、引号等任意字符
 #    attrs 必须是扁平 JSON 对象，值为标量（字符串/数字/布尔/null）；非法返回 400
@@ -735,6 +805,12 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 | GET | `/api/control-group` | 查看对照组现在点着哪些人（主身份，名字序） |
 | PUT | `/api/control-group` | 点名一拨人进对照组（整拨替换为新名单），body `{identities:[…]}`；至少一个，少写/空串/重复 400 并说明，一个人都不写库；进了的人来问每个开关只走它自己的默认开或关（`reason=control`，全关仍压过）；同名重复点为幂等 no-op |
 | DELETE | `/api/control-group` | 移出，body `{identities:[…]}`（只移点名的，没在名单里的不报错）；不带 body 或 `identities` 为空 = 清空整拨；移出后立即按各开关原来的算法算 |
+| GET | `/api/quota-buckets` | 列出本环境所有名额桶（含已关的；名额数、盯的开关、谁占着名额） |
+| POST | `/api/quota-buckets` | 开名额桶 `{capacity, flags, name?}`；少写名额/开关 400，说了个没有的开关 404，开关已被别的开着的桶盯着 409，都开不成并说明 |
+| GET | `/api/quota-buckets/<id>` | 看一个名额桶（含占到名额的人，按占到先后） |
+| PATCH | `/api/quota-buckets/<id>` | 改这个桶的人数（`capacity`）或盯着哪些开关（`flags`），再来问按新的；名额改少了多出来的人按后占到的先让（响应 `evicted` 列出），被让出的人再来问这些开关是关 |
+| DELETE | `/api/quota-buckets/<id>/occupants` | 让某人退出名额，body `{identity}`；少写了要退的人 400 并说明；退没占着的人是 no-op |
+| POST | `/api/quota-buckets/<id>/close` | 关桶：盯的开关不再走名额、可被别的桶盯，占位一并释放；已关再关为幂等 no-op |
 
 > identity 一律放在 JSON body / 查询参数里，不进 URL 路径，
 > 因此含 `/`、空格、`"`、`'` 等字符的身份都能正常设置、查询、移除。
