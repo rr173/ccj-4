@@ -629,6 +629,45 @@ curl "http://localhost:8000/api/history?identity=u123&at=1789000000&attrs=%7B%22
 - 老库升级时会把升级那刻的存量状态（开关 / 强制 / 冻结 / 组 / 落定）铺一条基线，
   升级前的中间改动无法追溯，升级后的每次改动都可重放。
 
+## 整份规矩还原（换成某一刻当时已生效的那份）
+
+管理端可以把一个环境里**此刻已经生效的整份开关规矩**，一次性换成**过去某一刻
+当时已经生效的那份**：
+
+```bash
+curl -X POST http://localhost:8000/api/restore \
+  -H "X-Admin-Token: $TOKEN" -H "X-Actor: alice" -H "X-Environment: prod" \
+  -H "Content-Type: application/json" -d '{"at": 1789000000}'
+# => {"ok":true,"restored":true,"at":1789000000.0,
+#     "flags":["new-checkout","promo-pay",…],     # 换完后这个环境里剩下的开关
+#     "created":[…],"updated":[…],"unchanged":[…],"deleted":[…],
+#     "cancelled_scheduled":2}
+```
+
+- **换的是哪份**：与「问某个过去的时刻」完全同一口径——只取 `at` 那一刻**存在且
+  已生效**的开关规则（默认值 / 全关 / 放量比例 / 放量条件 / 放量规矩 / 定档 /
+  属性打开条件 / 挂的配置 / 依赖）。**约了还没到点的改动不算、没发布的稿不算**；
+  到了点（哪怕还没被请求惰性触发）的预约、已发布且 `published_at <= at` 的稿都算
+  在那份里。描述（`description`）不参与求值，保留现网不动。
+- **当时还没有的开关，换完就没有了**：`at` 之后才建的开关、或 `at` 那一刻已删除的
+  开关，这次整个删掉（它的单人强制 / 冻结 / 组成员关系随之一并清掉），**不会再按
+  现在的规矩混在来问的结果里**；当时存在、后来被删的开关按那一刻的规矩重新建出。
+- **约了没到点的改动一并取消**：换之前所有 `pending` 的定时变更都置为取消，到点也
+  不会再生效（否则它们会在未来偷偷改掉刚换好的那份）。没发布的稿**原样保留**在
+  稿里——它们本来就不算进那份，之后发不发布仍是管理端自己的事。
+- **换完后来问按换过去的那份**：单查、整包都按还原后的规矩算；这次还原是该环境上
+  的一次原子变更，已发整包统一换新版本，拿着换之前的包来问得到 `valid=false`，
+  失效记录与审计里能查到这次还原。同一份时刻原样再换一次是幂等的
+  （规矩没变的开关不动库、不换版本）。
+- **只换开关规矩，不动按人 / 按组的状态**：单人强制、结果冻结、互斥组与落定、
+  对照组名单、身份合并都是环境自己的状态，这次不抄也不清（与跨环境推送同口径）。
+  例如冻住的人仍按冻住的值算；被删开关上的冻结 / 强制随开关一并删除。
+- **少写了换不成**：环境仍走 `?environment=` / `X-Environment`（漏带 400、环境
+  不存在 404）；body 里少写 `at`、`at` 不是数字、是布尔、或是未来时刻，都返回
+  `400` 并说清楚，一个字段都不动。
+- 历史流水是 append-only 的：还原不删改旧事件，而是把换完后的整份规矩记成「此刻」
+  的一批新事件，所以 `at` 之前的历史重放照旧、还原之后的时刻按新规矩重放。
+
 ## 快速开始
 
 ```bash
@@ -674,6 +713,7 @@ GET '/api/history?identity=<用户身份>&at=<unix秒>[&attrs=<URL编码的JSON�
 | GET | `/api/environments` | 列出所有环境 |
 | POST | `/api/environments` | 创建环境 `{name}` |
 | POST | `/api/push` | 跨环境推送 `{source, target, flags}`（也接受 `from`/`to`）：把源环境此刻的规则推到目标；少写/环境没有/会成环都推不成并说明，源全程只读 |
+| POST | `/api/restore` | 整份规矩还原 `{at}`：把本环境此刻已生效的整份开关规矩换成 `at`（unix 秒）当时已生效的那份；当时没有的开关整个删掉，约了没到点的改动不算并全部取消，没发布的稿不算（原样保留）；少写环境/时刻、环境没有、`at` 非法或在未来都换不成并说明 |
 | GET | `/api/flags` | 列出所有开关 |
 | POST | `/api/flags` | 新建 `{name, description, default_enabled, targeting, rollout_condition, rollout_rules, variants}` |
 | PATCH | `/api/flags/<name>` | 改 `{default_enabled, rollout_percent, rollout_condition, rollout_rules, variants, kill_switch, targeting, depends_on, description}`；`targeting` 为属性打开条件 JSON（`{}`/`null` 清除）；`rollout_condition` 为放量条件 JSON（`{}`/`null` 清除）；`rollout_rules` 为有序放量规矩列表（`[]`/`null` 清除）；`variants` 为定档列表 `[{"name","percent"}]`（档名非空不重复、比例 0-100、和必须恰好 100；`[]`/`null` 清除）；`depends_on` 为被依赖开关名（`""`/`null` 清除，自依赖/成环 400）；带 `effective_at`（unix 秒）则约到该时刻生效 |

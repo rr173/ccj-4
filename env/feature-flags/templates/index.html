@@ -116,6 +116,11 @@
       <div class="row"><input id="pushFlags" type="text" placeholder="推哪几个开关，逗号分隔，如 alpha, beta"></div>
       <div class="row"><button class="primary" onclick="runPush()">推送</button></div>
     </div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>整份规矩还原 <span class="muted" style="font-weight:normal">把<strong>当前环境</strong>此刻已生效的整份开关规矩，换成过去某一刻当时已生效的那份；当时还没有的开关会整个删掉，约了没到点的改动全部取消，没发布的稿不算</span></h2>
+      <div class="row"><input id="restoreAt" type="text" placeholder="还原到哪个时刻（unix 秒），如 1789000000"></div>
+      <div class="row"><button class="danger" onclick="runRestore()">还原当前环境</button></div>
+    </div>
     <div class="card">
       <h2>开关列表 <button style="float:right" onclick="loadAll()">刷新</button></h2>
       <div id="flagList"><span class="muted">加载中…</span></div>
@@ -1007,6 +1012,29 @@ async function runPush() {
           + (data.created.length ? `（新建 ${data.created.length} 个）` : ''));
   } catch (e) { return toast('推不成：' + e.message, true); }
   if (currentEnv === source || currentEnv === target) await loadAll();
+}
+
+async function runRestore() {
+  const raw = $('restoreAt').value.trim();
+  const at = Number(raw);
+  if (!raw || !Number.isFinite(at))
+    return toast('要写明还原到哪个时刻（unix 秒）', true);
+  if (at > Date.now() / 1000)
+    return toast('那个时刻在未来，只能还原到过去的时刻', true);
+  if (!currentEnv)
+    return toast('先在顶部选定当前环境', true);
+  if (!confirm(`确定把环境 ${currentEnv} 的整份开关规矩还原到 ${raw}？\n`
+      + '当时还没有的开关会整个删掉；约了没到点的改动全部取消；'
+      + '未发布的稿不算（原样保留）；已发整包会全部换新版本。')) return;
+  try {
+    const r = await api('/api/restore', { method: 'POST', body: JSON.stringify({ at }) });
+    toast(`已还原到 ${raw}：保留 ${r.flags.length} 个`
+          + (r.created.length ? `、重建 ${r.created.length}` : '')
+          + (r.updated.length ? `、改 ${r.updated.length}` : '')
+          + (r.deleted.length ? `、删 ${r.deleted.length}` : '')
+          + (r.cancelled_scheduled ? `、取消预约 ${r.cancelled_scheduled}` : ''));
+  } catch (e) { return toast('换不成：' + e.message, true); }
+  await loadAll();
 }
 
 async function publishDraft(id) {

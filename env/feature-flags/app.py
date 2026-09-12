@@ -164,6 +164,16 @@ scheduled_changes 表里，不参与求值）；到点之后，第一个进来�
 规则并说明。推送是目标环境上的一次原子变更：记审计与历史流水、目标已发整包
 统一换新版本；目标本地的单人强制、冻结、互斥组、定时变更与发布稿都是目标
 自己的状态，推送不抄也不清。
+
+整份规矩还原（restore，POST /api/restore，body {"at": unix 秒}）：把本环境
+此刻「已生效」的整份开关规矩，一次性换成过去某一刻当时已生效的那份，口径与
+/api/history 一致——只取 at 那一刻存在且生效的开关规则（描述不参与求值，保留
+现网）；当时还没有或已删除的开关整个删掉，当时存在后来被删的按那一刻规矩重建。
+约了没到点的改动、没发布的稿不算进那份：前者随这次还原全部取消（到点也不再
+生效），后者原样保留。单人强制 / 冻结 / 互斥组与落定 / 对照名单 / 身份合并等
+按人按组的状态不抄也不清。还原是该环境上的一次原子变更：记审计与历史流水
+（append-only，只补「此刻」的新事件），已发整包统一换新版本；原样再还原一次
+是幂等 no-op。少写环境 / at、环境不存在、at 非数字或在未来都换不成（400/404）。
 """
 
 import hashlib
@@ -1740,25 +1750,18 @@ def _normalize_replay_patch(changes):
     return patch
 
 
-def replay_state(db, identity, at, attrs=None):
-    """重放身份 identity 在时刻 at 的完整求值状态（纯函数，不写库）。
+def _replay_ops(db, at):
+    """收集时刻 at 之前「已经生效」的全部变更，按固定先后排好序（纯读，不写库）。
 
-    数据源：
+    数据源（与 /api/history 同一口径）：
     - history_events：管理端每一次「已生效」变更的 append-only 流水；
-    - scheduled_changes：status='applied' 或 pending 但 effective_at<=at，
-      且开关已删除时被取消的（cancelled/failed 一律不算）——预约到了点，
-      哪怕还没有任何请求惰性触发它，那一刻来问也必须按到点后算；
+    - scheduled_changes：status='applied' 或 pending 但 effective_at<=at
+      （到点了哪怕还没被任何请求惰性触发也算；cancelled/failed 一律不算）；
     - drafts：status='published' 且 published_at<=at 的稿（没发布的稿不算）。
-
-    返回 dict：
-      flags:  name -> {default_enabled, rollout_percent, rollout_condition(串),
-                       rollout_rules(串), variants(串), kill_switch, targeting(串),
-                       config(串), depends_on(名字串)}
-      overrides/frozen: (flag_name, identity) -> ...
-      groups: name -> set(成员 flag)；assignments: 组名 -> 落定 flag
+    返回 [(occurred_at, rank, 次序, 类型, 内容), …]，类型为
+    "event"/"sched"/"draft"。同一时刻的确定性先后：立即改动 < 预约 < 发布稿。
     """
-    ops = []  # (occurred_at, rank, 次序, 类型, 内容)
-
+    ops = []
     for r in db.execute(
             "SELECT * FROM history_events WHERE occurred_at<=?"
             " ORDER BY occurred_at, id", (at,)):
@@ -1788,6 +1791,73 @@ def replay_state(db, identity, at, attrs=None):
                         (cr["flag_name"], json.loads(cr["changes"]))))
 
     ops.sort(key=lambda o: (o[0], o[1], o[2]))
+    return ops
+
+
+def replay_flag_state(db, at):
+    """重放环境在时刻 at 的**整份开关规矩**（与身份无关，纯读，不写库）。
+
+    只还原开关自身的求值规则，返回 name ->
+    {default_enabled, rollout_percent, rollout_condition(串),
+     rollout_rules(串), variants(串), kill_switch, targeting(串),
+     config(串), depends_on(名字串)}。
+
+    口径与 /api/history 一字不差：
+    - 当时还没建、或已删除的开关不在结果里——约了还没到点的改动、没发布的稿
+      都不算（到点未触发的预约、已发布的稿照算）；
+    - 被依赖开关在那一刻已删除时，依赖边按解除处理（与重放求值同口径）。
+    单人强制 / 冻结 / 互斥组 / 对照名单等「按人 / 按组」的状态不在这里。
+    """
+    flags = {}
+    for _, _, _, kind, body in _replay_ops(db, at):
+        if kind in ("sched", "draft"):
+            name, changes = body
+            if name not in flags:
+                # 开关当时还没建（或已删）：这条预约/稿对那一刻不生效
+                continue
+            patch = _normalize_replay_patch(changes)
+            dep = patch.get("depends_on")
+            if dep and dep not in flags:
+                # 到点应用时被依赖开关已删除：线上写不出这条边（按解除处理）；
+                # 发布稿在目标缺失时整稿拒绝，但这里只兜已发布稿的极端情形
+                patch["depends_on"] = ""
+            flags[name].update(patch)
+            continue
+
+        ev_kind, subject, _ev_identity, payload = body
+        if ev_kind == "flag_upsert":
+            snap = dict(_FLAG_DEFAULT)
+            if subject in flags:
+                snap.update(flags[subject])
+            snap.update({k: payload[k] for k in _FLAG_DEFAULT if k in payload})
+            flags[subject] = snap
+        elif ev_kind == "flag_delete":
+            flags.pop(subject, None)
+            # 与线上删除路径一致：别人指向它的依赖边自动解除
+            for other in flags.values():
+                if other["depends_on"] == subject:
+                    other["depends_on"] = ""
+    return flags
+
+
+def replay_state(db, identity, at, attrs=None):
+    """重放身份 identity 在时刻 at 的完整求值状态（纯函数，不写库）。
+
+    数据源：
+    - history_events：管理端每一次「已生效」变更的 append-only 流水；
+    - scheduled_changes：status='applied' 或 pending 但 effective_at<=at，
+      且开关已删除时被取消的（cancelled/failed 一律不算）——预约到了点，
+      哪怕还没有任何请求惰性触发它，那一刻来问也必须按到点后算；
+    - drafts：status='published' 且 published_at<=at 的稿（没发布的稿不算）。
+
+    返回 dict：
+      flags:  name -> {default_enabled, rollout_percent, rollout_condition(串),
+                       rollout_rules(串), variants(串), kill_switch, targeting(串),
+                       config(串), depends_on(名字串)}
+      overrides/frozen: (flag_name, identity) -> ...
+      groups: name -> set(成员 flag)；assignments: 组名 -> 落定 flag
+    """
+    ops = _replay_ops(db, at)
 
     # 身份合并要按「那一刻」算：先只扫 identity_merge / identity_split，还原
     # at 时刻还没拆开的合并组。那一刻这几个身份算同一个人，所以他们各自名下的
@@ -2299,6 +2369,174 @@ def push_flags():
     return jsonify({"ok": True, "source": source, "target": target,
                     "pushed": sorted(staged), "created": created,
                     "updated": updated})
+
+
+# ---------------------------------------------------------------- 整份规矩还原
+
+@app.post("/api/restore")
+@require_admin
+def restore_flags():
+    """管理端：把本环境此刻「已经生效」的整份开关规矩，换成过去某一刻当时
+    已经生效的那份。
+
+    POST /api/restore  {"at": <unix 秒>}（环境仍走 ?environment= / X-Environment）
+
+    - 少写了环境 / 时刻、环境不存在、at 不是数字或在未来：这次换不成（400/404），
+      一个字段都不动；
+    - 还原的那份与 /api/history 同一口径：只取 at 那一刻存在且已生效的开关规则
+      （默认值 / 全关 / 放量比例 / 放量条件 / 放量规矩 / 定档 / 属性打开条件 /
+      挂的配置 / 依赖，描述不参与求值，保留现网不动）；当时还没有（或已删除）的
+      开关这次整个删掉，不会再按现在的规矩混在来问的结果里；
+    - 约了还没到点的改动不算进那份，且会随这次还原全部取消——到点也不会再生效；
+      没发布的稿本来就不算（原样保留在稿里，不发布就一字不生效，已发布且
+      published_at<=at 的稿已经算在那份里）；
+    - 单人强制 / 结果冻结 / 互斥组与落定 / 对照名单 / 身份合并是环境自己的
+      「按人 / 按组」状态，不是开关规矩，这次不抄也不清（与跨环境推送同口径）；
+    - 还原是该环境上的一次原子变更：一个事务写入，记审计与历史流水，已发整包
+      统一重算、换新版本（拿旧包来问得到 valid=false）。此后这个环境里来问，
+      一律按换过去的那份规矩算。
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be a JSON object ({\"at\": <unix seconds>})"}), 400
+    raw_at = body.get("at")
+    if raw_at is None or raw_at == "":
+        return jsonify({"error": "at is required (unix timestamp in seconds)"}), 400
+    if isinstance(raw_at, bool) or not isinstance(raw_at, (int, float, str)):
+        return jsonify({"error": "at must be a unix timestamp in seconds"}), 400
+    try:
+        at = float(raw_at)
+    except (TypeError, ValueError):
+        return jsonify({"error": "at must be a unix timestamp in seconds"}), 400
+    if not math.isfinite(at):
+        return jsonify({"error": "at must be a unix timestamp in seconds"}), 400
+    now = time.time()
+    if at > now:
+        return jsonify({"error": "at must be a past unix timestamp (not in the future)"}), 400
+
+    # 与任何写操作一样：先把此刻已到点的预约应用掉，「现在」与 at 都是确定状态
+    db = get_db()
+    # 那一刻整份已生效的开关规矩（与 /api/history 同一口径的纯读重放）
+    wanted = replay_flag_state(db, at)
+    current = db.execute("SELECT * FROM flags").fetchall()
+    cur_by_name = {r["name"]: r for r in current}
+    name_of_dep_id = {r["id"]: r["name"] for r in current}
+
+    def current_rule_tuple(r):
+        dep = name_of_dep_id.get(r["depends_on_flag_id"], "") \
+            if r["depends_on_flag_id"] is not None else ""
+        return (1 if r["default_enabled"] else 0, r["rollout_percent"],
+                r["rollout_condition"], r["rollout_rules"], r["variants"],
+                r["kill_switch"], r["targeting_rule"], r["flag_config"], dep)
+
+    def wanted_rule_tuple(snap):
+        return (1 if snap["default_enabled"] else 0, snap["rollout_percent"],
+                snap["rollout_condition"], snap["rollout_rules"],
+                snap["variants"], 1 if snap["kill_switch"] else 0,
+                snap["targeting"], snap["config"], snap["depends_on"])
+
+    created, updated, unchanged, deleted = [], [], [], []
+    at_str = f"{at:g}"
+    try:
+        # 还活着的开关：规矩与那一刻不同才整份换（描述不参与求值，保留现网）；
+        # 一字不差的不动库、不记历史、不进审计（幂等再还原一次是 no-op）。
+        for name in sorted(wanted):
+            snap = wanted[name]
+            cur = cur_by_name.get(name)
+            if cur is not None:
+                if current_rule_tuple(cur) == wanted_rule_tuple(snap):
+                    unchanged.append(name)
+                    continue
+                db.execute(
+                    "UPDATE flags SET default_enabled=?, rollout_percent=?,"
+                    " rollout_condition=?, rollout_rules=?, variants=?,"
+                    " kill_switch=?, targeting_rule=?, flag_config=?, updated_at=?"
+                    " WHERE name=?",
+                    (1 if snap["default_enabled"] else 0, snap["rollout_percent"],
+                     snap["rollout_condition"], snap["rollout_rules"],
+                     snap["variants"], 1 if snap["kill_switch"] else 0,
+                     snap["targeting"], snap["config"], now, name))
+                updated.append(name)
+            else:
+                # 那一刻有、现在没有的开关：按那一刻的规矩重新建出来
+                db.execute(
+                    "INSERT INTO flags (name, description, default_enabled,"
+                    " rollout_percent, rollout_condition, rollout_rules, variants,"
+                    " kill_switch, targeting_rule, flag_config, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (name, "", 1 if snap["default_enabled"] else 0,
+                     snap["rollout_percent"], snap["rollout_condition"],
+                     snap["rollout_rules"], snap["variants"],
+                     1 if snap["kill_switch"] else 0,
+                     snap["targeting"], snap["config"], now, now))
+                created.append(name)
+
+        # 依赖边按名字整体重落（那一刻不存在的被依赖者：快照里已是 ''，落 NULL）。
+        # 只重落这次规矩变了或新建的；没变的开关边也必然没变，一字不动。
+        for name in sorted(set(created) | set(updated)):
+            dep = wanted[name]["depends_on"]
+            dep_id = None
+            if dep:
+                row = db.execute("SELECT id FROM flags WHERE name=?", (dep,)).fetchone()
+                dep_id = row["id"] if row else None
+            db.execute("UPDATE flags SET depends_on_flag_id=? WHERE name=?",
+                       (dep_id, name))
+
+        # 那一刻还没有（或后来被删）的开关整个删掉：先解除别人对它的依赖，
+        # 再取消它未生效的预约并删除（强制 / 冻结 / 组成员关系随外键级联清掉）。
+        for name in sorted(cur_by_name):
+            if name in wanted:
+                continue
+            fid = cur_by_name[name]["id"]
+            db.execute("UPDATE flags SET depends_on_flag_id=NULL"
+                       " WHERE depends_on_flag_id=?", (fid,))
+            db.execute("UPDATE scheduled_changes SET status='cancelled'"
+                       " WHERE flag_id=? AND status='pending'", (fid,))
+            db.execute("DELETE FROM flags WHERE id=?", (fid,))
+            deleted.append(name)
+
+        # 约了还没到点的改动不算进那份：全部取消，到点也不会再改规矩
+        cancelled = db.execute(
+            "UPDATE scheduled_changes SET status='cancelled' WHERE status='pending'"
+        ).rowcount
+
+        # 历史流水（append-only）：只把这次**真变了**的开关记成「此刻」的一批
+        # 变更——更新的记全量快照、删除的记 flag_delete；没变的不补事件
+        # （幂等再还原一次不产生流水）。
+        for name in sorted(set(created) | set(updated)):
+            fresh = db.execute("SELECT * FROM flags WHERE name=?", (name,)).fetchone()
+            record_history(db, now, "flag_upsert", subject=name,
+                           payload=flag_snapshot_payload(fresh), actor_name=actor())
+        for name in deleted:
+            record_history(db, now, "flag_delete", subject=name,
+                           actor_name=actor())
+
+        for name in created:
+            audit_to(db, actor(), name, "restore", "restore_flag",
+                     f"restored as of {at_str} (recreated)")
+        for name in updated:
+            audit_to(db, actor(), name, "restore", "restore_flag",
+                     f"restored as of {at_str}")
+        for name in deleted:
+            audit_to(db, actor(), name, "restore", "restore_delete",
+                     f"absent as of {at_str}")
+        audit_to(db, actor(), f"restore@{at_str}", "restore", "restore_flags",
+                 f"created={len(created)} updated={len(updated)}"
+                 f" unchanged={len(unchanged)} deleted={len(deleted)}"
+                 f" cancelled_scheduled={cancelled}")
+    except Exception:
+        db.rollback()
+        raise
+    db.commit()
+    record_invalidations(db, actor(),
+                         f"restore_flags as of {at_str}: "
+                         f"created={len(created)},updated={len(updated)},"
+                         f"deleted={len(deleted)}")
+    return jsonify({"ok": True, "restored": True, "at": at,
+                    "flags": sorted(wanted),
+                    "created": created, "updated": updated,
+                    "unchanged": unchanged, "deleted": deleted,
+                    "cancelled_scheduled": cancelled})
 
 
 # ---------------------------------------------------------------- public API
